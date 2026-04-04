@@ -40,6 +40,9 @@ winnow = "0.6"
 # Parallelism
 rayon = "1.10"
 
+# SIMD
+wide = "0.7"
+
 # Testing utilities
 approx = "0.5"
 

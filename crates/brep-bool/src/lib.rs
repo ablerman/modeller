@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use brep_algo::{
     bvh::Bvh,
     query::{point_in_solid, PointLocation},
@@ -153,7 +155,8 @@ fn collect_pieces(
 ) -> Result<Vec<Piece>, KernelError> {
     let solid  = store.solid(solid_id)?;
     let shell  = store.shell(solid.outer_shell)?;
-    let tess_opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
+    // Coarse tolerance: boolean classification only needs rough geometry.
+    let tess_opts = TessellationOptions { chord_tolerance: 0.15, min_segments: 6 };
     let mut pieces = Vec::new();
 
     for &fid in &shell.faces {
@@ -207,11 +210,11 @@ fn split_and_classify(
 ) -> Result<Vec<(Piece, PointLocation)>, KernelError> {
     let other_shell = other_store.shell(other_store.solid(other_solid)?.outer_shell)?;
 
-    let tess_opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
+    let tess_opts = TessellationOptions { chord_tolerance: 0.15, min_segments: 6 };
 
     // Precompute planes of all other-solid faces (outward normal, offset d).
-    // Curved and degenerate-topology faces are tessellated so we get one plane
-    // per triangle — this gives valid cutting planes for the Sutherland-Hodgman step.
+    // Curved faces contribute one plane per tessellation triangle; planar faces
+    // contribute one plane total.  Stored as (fid, normal, d) for BVH filtering.
     let mut other_planes: Vec<(FaceId, Vec3, f64)> = Vec::new();
     for &fid in &other_shell.faces {
         let face = other_store.face(fid)?;
@@ -237,45 +240,50 @@ fn split_and_classify(
         }
     }
 
-    let mut result = Vec::new();
+    // Each piece is independent — process in parallel.
+    let result: Vec<(Piece, PointLocation)> = pieces
+        .into_par_iter()
+        .map(|piece| -> Result<Vec<(Piece, PointLocation)>, KernelError> {
+            // Use AABB to find which other-solid faces are nearby.
+            let piece_aabb = piece.aabb().expand_by(tol * 10.0);
+            // Use a HashSet so the per-plane fid lookup below is O(1) not O(n).
+            let candidates: std::collections::HashSet<FaceId> = other_bvh
+                .intersect_aabb(&piece_aabb)
+                .into_iter()
+                .collect();
 
-    for piece in pieces {
-        // Use AABB to find which other-solid faces are nearby.
-        let piece_aabb = piece.aabb().expand_by(tol * 10.0);
-        let candidates: Vec<FaceId> = other_bvh.intersect_aabb(&piece_aabb);
-
-        // Collect the cutting planes: planes from other solid that bisect this piece.
-        let mut cutting: Vec<(Vec3, f64)> = Vec::new();
-        for &(fid, n_b, d_b) in &other_planes {
-            if !candidates.contains(&fid) {
-                continue;
+            // Collect the cutting planes: planes from other solid that bisect this piece.
+            let mut cutting: Vec<(Vec3, f64)> = Vec::new();
+            for &(fid, n_b, d_b) in &other_planes {
+                if !candidates.contains(&fid) {
+                    continue;
+                }
+                // SIMD: check whether this plane bisects the piece (4 verts per iteration).
+                let (min_s, max_s) = bisect_min_max(&piece.verts, n_b, d_b);
+                if min_s < -tol && max_s > tol {
+                    cutting.push((n_b, d_b));
+                }
             }
-            // Check if this plane actually bisects the piece:
-            let (min_s, max_s) = piece
-                .verts
-                .iter()
-                .fold((f64::MAX, f64::MIN), |(lo, hi), p| {
-                    let s = n_b.dot(&p.coords) - d_b;
-                    (lo.min(s), hi.max(s))
-                });
-            if min_s < -tol && max_s > tol {
-                cutting.push((n_b, d_b));
-            }
-        }
 
-        // Split the piece by each cutting plane.
-        let sub_pieces = split_piece(piece, &cutting, tol);
+            // Split the piece by each cutting plane.
+            let sub_pieces = split_piece(piece, &cutting, tol);
 
-        // Classify each sub-piece.
-        for sub in sub_pieces {
-            if sub.verts.len() < 3 {
-                continue;
+            // Classify each sub-piece.
+            let mut local: Vec<(Piece, PointLocation)> = Vec::new();
+            for sub in sub_pieces {
+                if sub.verts.len() < 3 {
+                    continue;
+                }
+                let centroid = sub.centroid();
+                let loc = point_in_solid(other_store, other_bvh, other_solid, &centroid, tol)?;
+                local.push((sub, loc));
             }
-            let centroid = sub.centroid();
-            let loc = point_in_solid(other_store, other_bvh, other_solid, &centroid, tol)?;
-            result.push((sub, loc));
-        }
-    }
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     Ok(result)
 }
@@ -496,6 +504,39 @@ fn build_result_store(pieces: Vec<Piece>, tol: f64) -> Result<ShapeStore, Kernel
 }
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
+
+/// SIMD min/max signed-distance scan: returns (min, max) of n·p − d over all
+/// vertices, processing 4 vertices per iteration with `f64x4`.
+fn bisect_min_max(verts: &[Point3], n: Vec3, d: f64) -> (f64, f64) {
+    use wide::f64x4;
+    if verts.is_empty() {
+        return (f64::MAX, f64::MIN);
+    }
+    let nx = f64x4::splat(n.x);
+    let ny = f64x4::splat(n.y);
+    let nz = f64x4::splat(n.z);
+    let dd = f64x4::splat(d);
+    let mut vmin = f64x4::splat(f64::MAX);
+    let mut vmax = f64x4::splat(f64::MIN);
+    let last = *verts.last().unwrap();
+    for chunk in verts.chunks(4) {
+        let p0 = chunk[0];
+        let p1 = if chunk.len() > 1 { chunk[1] } else { last };
+        let p2 = if chunk.len() > 2 { chunk[2] } else { last };
+        let p3 = if chunk.len() > 3 { chunk[3] } else { last };
+        let px = f64x4::from([p0.x, p1.x, p2.x, p3.x]);
+        let py = f64x4::from([p0.y, p1.y, p2.y, p3.y]);
+        let pz = f64x4::from([p0.z, p1.z, p2.z, p3.z]);
+        let dot = nx * px + ny * py + nz * pz - dd;
+        vmin = vmin.min(dot);
+        vmax = vmax.max(dot);
+    }
+    let min_arr = vmin.to_array();
+    let max_arr = vmax.to_array();
+    let min_s = min_arr.iter().copied().fold(f64::MAX, |a, b| a.min(b));
+    let max_s = max_arr.iter().copied().fold(f64::MIN, |a, b| a.max(b));
+    (min_s, max_s)
+}
 
 /// Newell's method for a robust polygon normal.
 fn newell_normal(pts: &[Point3]) -> Vec3 {

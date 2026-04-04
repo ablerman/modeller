@@ -223,8 +223,10 @@ dependencies = [
  "brep-mesh",
  "brep-topo",
  "nalgebra",
+ "rayon",
  "smallvec",
  "thiserror 2.0.18",
+ "wide",
 ]
 
 [[package]]

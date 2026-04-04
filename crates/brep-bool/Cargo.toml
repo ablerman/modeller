@@ -13,6 +13,8 @@ brep-mesh.workspace = true
 nalgebra.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
+wide.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
