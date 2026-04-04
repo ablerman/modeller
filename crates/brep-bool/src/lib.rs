@@ -364,19 +364,36 @@ fn build_result_store(pieces: Vec<Piece>, tol: f64) -> Result<ShapeStore, Kernel
     let _solid_id = make_result.solid_id;
     let shell_id = make_result.shell_id;
 
-    // ── 7a. Deduplicate vertices ──────────────────────────────────────────────
-    let mut vertex_map: Vec<(Point3, VertexId)> = Vec::new();
+    // ── 7a. Deduplicate vertices — O(n) spatial hash ─────────────────────────
+    // Cell size = merge distance so any two mergeable vertices are in the same
+    // or adjacent cells; checking 27 neighbours suffices.
+    let merge_dist = tol * 10.0;
+    let cell = merge_dist;
+    let mut vertex_grid: HashMap<(i64, i64, i64), Vec<VertexId>> = HashMap::new();
 
-    let mut get_or_create_vertex = |store: &mut ShapeStore,
-                                     pos: Point3|
-     -> VertexId {
-        for &(existing, vid) in &vertex_map {
-            if (existing - pos).norm() < tol * 10.0 {
-                return vid;
+    let quantize = |x: f64| -> i64 { (x / cell).floor() as i64 };
+
+    let mut get_or_create_vertex = |store: &mut ShapeStore, pos: Point3| -> VertexId {
+        let qx = quantize(pos.x);
+        let qy = quantize(pos.y);
+        let qz = quantize(pos.z);
+        for dx in -1i64..=1 {
+            for dy in -1i64..=1 {
+                for dz in -1i64..=1 {
+                    if let Some(ids) = vertex_grid.get(&(qx + dx, qy + dy, qz + dz)) {
+                        for &vid in ids {
+                            if let Ok(v) = store.vertex(vid) {
+                                if (v.position - pos).norm() < merge_dist {
+                                    return vid;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         let vid = store.insert_vertex(Vertex::new(pos, store.tolerance.linear));
-        vertex_map.push((pos, vid));
+        vertex_grid.entry((qx, qy, qz)).or_default().push(vid);
         vid
     };
 

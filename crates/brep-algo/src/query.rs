@@ -1,7 +1,6 @@
 //! Geometric queries on [`ShapeStore`]s: point-in-solid, closest face, etc.
 
 use brep_core::{KernelError, Point3, Vec3};
-use brep_mesh::{tessellate_face, TessellationOptions};
 use brep_topo::entity::{FaceId, SolidId};
 use brep_topo::store::ShapeStore;
 
@@ -42,23 +41,18 @@ pub fn point_in_solid(
     let candidate_faces = bvh.intersect_ray(&ray);
     let mut crossings = 0usize;
 
-    let tess_opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
-
     for fid in candidate_faces {
         // Only count faces belonging to this solid's shell.
         if !shell.faces.contains(&fid) { continue; }
 
         let face = store.face(fid)?;
 
-        // For periodic (curved) surfaces, use tessellation for accurate crossing tests.
+        // For periodic (curved) surfaces, use the per-face triangle BVH cached
+        // in the Bvh (computed once at build time).  O(log N) traversal.
         if face.surface.surface.is_u_periodic() {
-            if let Ok(fm) = tessellate_face(store, fid, &tess_opts) {
-                for tri in &fm.triangles {
-                    let pts = &tri.positions;
-                    if ray_polygon_crosses(&ray, pts, &tri.normal) {
-                        crossings += 1;
-                        break; // count at most once per face
-                    }
+            if let Some(mesh) = bvh.face_mesh(fid) {
+                if mesh.ray_crosses(&ray) {
+                    crossings += 1;
                 }
             }
             continue;
@@ -110,6 +104,10 @@ fn face_plane_normal(pts: &[Point3]) -> Vec3 {
 }
 
 /// Test whether `ray` crosses a planar polygon (fan-tested triangles).
+pub(crate) fn ray_polygon_crosses_pub(ray: &Ray, pts: &[Point3], normal: &Vec3) -> bool {
+    ray_polygon_crosses(ray, pts, normal)
+}
+
 fn ray_polygon_crosses(ray: &Ray, pts: &[Point3], normal: &Vec3) -> bool {
     let n = pts.len();
     // Ray–plane intersection.

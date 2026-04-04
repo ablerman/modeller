@@ -11,6 +11,8 @@
 //! - [`Bvh::intersect_aabb`] — find all faces overlapping a query AABB.
 //! - [`Bvh::nearest_face`] — face whose centroid is closest to a point.
 
+use std::collections::HashMap;
+
 use brep_core::{Aabb, Point3, Vec3};
 use brep_mesh::{tessellate_face, TessellationOptions};
 use brep_topo::entity::FaceId;
@@ -41,57 +43,170 @@ impl Ray {
     }
 }
 
+/// Precomputed tessellation for a single curved face: triangle positions + normal.
+pub type FaceTri = ([Point3; 3], Vec3);
+
+// ── Per-face triangle BVH ─────────────────────────────────────────────────────
+
+/// A small BVH over a face's tessellated triangles for O(log N) ray crossing
+/// tests inside `point_in_solid`.
+pub struct TriMesh {
+    tris:  Vec<FaceTri>,
+    nodes: Vec<TriNode>,
+}
+
+struct TriNode {
+    bounds: Aabb,
+    /// Positive = leaf (start index into `tris`), negative = inner left child index.
+    /// We encode leaf as `(start << 1) | 1` and inner as `(left << 1) | 0`.
+    left_or_start: u32,
+    right_or_count: u32,
+    is_leaf: bool,
+}
+
+const TRI_LEAF: usize = 4;
+
+impl TriMesh {
+    pub fn build(tris: Vec<FaceTri>) -> Self {
+        if tris.is_empty() {
+            return Self { tris, nodes: Vec::new() };
+        }
+        // Build (tri_idx, aabb) pairs.
+        let mut items: Vec<(usize, Aabb)> = tris.iter().enumerate().map(|(i, &(pos, _))| {
+            let mut a = Aabb::empty();
+            for p in &pos { a.include_point(p); }
+            (i, a)
+        }).collect();
+
+        let mut nodes: Vec<TriNode> = Vec::new();
+        let mut order: Vec<usize> = Vec::new();
+        tri_build_recursive(&mut items, &mut order, &mut nodes);
+
+        // Reorder tris to match leaf order.
+        let sorted: Vec<FaceTri> = order.iter().map(|&i| tris[i]).collect();
+        Self { tris: sorted, nodes }
+    }
+
+    /// Returns `true` if the ray crosses at least one triangle (front or back).
+    pub fn ray_crosses(&self, ray: &Ray) -> bool {
+        if self.nodes.is_empty() { return false; }
+        let inv = Vec3::new(1.0 / ray.direction.x, 1.0 / ray.direction.y, 1.0 / ray.direction.z);
+        self.tri_ray_recursive(0, ray, &inv)
+    }
+
+    fn tri_ray_recursive(&self, idx: usize, ray: &Ray, inv: &Vec3) -> bool {
+        let node = &self.nodes[idx];
+        if !ray_aabb(&node.bounds, ray, inv) { return false; }
+        if node.is_leaf {
+            let start = node.left_or_start as usize;
+            let count = node.right_or_count as usize;
+            for &(positions, normal) in &self.tris[start..start + count] {
+                if crate::query::ray_polygon_crosses_pub(ray, &positions, &normal) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            self.tri_ray_recursive(node.left_or_start as usize, ray, inv)
+                || self.tri_ray_recursive(node.right_or_count as usize, ray, inv)
+        }
+    }
+}
+
+fn tri_build_recursive(
+    items: &mut [(usize, Aabb)],
+    order: &mut Vec<usize>,
+    nodes: &mut Vec<TriNode>,
+) -> usize {
+    let mut bounds = Aabb::empty();
+    for (_, a) in items.iter() { bounds = bounds.union(a); }
+    let node_idx = nodes.len();
+
+    if items.len() <= TRI_LEAF {
+        let start = order.len();
+        for (i, _) in items.iter() { order.push(*i); }
+        nodes.push(TriNode { bounds, left_or_start: start as u32, right_or_count: items.len() as u32, is_leaf: true });
+        return node_idx;
+    }
+
+    // Split on longest axis at median.
+    let ext = bounds.max - bounds.min;
+    let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+    items.sort_unstable_by(|(_, a), (_, b)| a.center()[axis].partial_cmp(&b.center()[axis]).unwrap());
+    let mid = items.len() / 2;
+    let (left_items, right_items) = items.split_at_mut(mid);
+
+    // Reserve placeholder.
+    nodes.push(TriNode { bounds, left_or_start: 0, right_or_count: 0, is_leaf: false });
+    let left  = tri_build_recursive(left_items,  order, nodes);
+    let right = tri_build_recursive(right_items, order, nodes);
+    nodes[node_idx].left_or_start  = left  as u32;
+    nodes[node_idx].right_or_count = right as u32;
+    node_idx
+}
+
 /// A built BVH over the faces of a single [`ShapeStore`].
 pub struct Bvh {
     nodes: Vec<BvhNode>,
     /// Face IDs stored in leaf order (indices into this vec are stored in leaves).
     face_ids: Vec<FaceId>,
+    /// Per-face triangle BVH for periodic (curved) faces.
+    /// Populated once at build time; reused by `point_in_solid`.
+    face_meshes: HashMap<FaceId, TriMesh>,
 }
 
 impl Bvh {
     /// Build a BVH from all faces in `store`.
     pub fn build(store: &ShapeStore) -> Self {
+        // Fine tessellation: tight AABBs + accurate pis crossing tests.
+        // A per-face triangle BVH (TriMesh) keeps pis O(log N) per face.
+        let opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
+        let mut face_meshes: HashMap<FaceId, TriMesh> = HashMap::new();
+
         let mut items: Vec<(FaceId, Aabb)> = store
             .face_ids()
             .filter_map(|fid| {
                 let face = store.face(fid).ok()?;
-                let aabb = face.surface.surface.bounding_box();
-                if aabb.is_empty() {
-                    // Curved/infinite-parameter surfaces return empty AABBs.
-                    // For periodic (curved) faces tessellate to get tight bounds;
-                    // for planar faces fall back to vertex positions.
-                    let a = if face.surface.surface.is_u_periodic() {
-                        let opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
-                        if let Ok(fm) = tessellate_face(store, fid, &opts) {
-                            let mut a = Aabb::empty();
-                            for tri in &fm.triangles {
-                                for p in &tri.positions { a.include_point(p); }
-                            }
-                            a
-                        } else {
-                            Aabb::empty()
-                        }
-                    } else {
-                        let verts = store.face_vertices(fid).ok()?;
-                        let mut a = Aabb::empty();
-                        for vid in verts {
-                            if let Ok(v) = store.vertex(vid) {
-                                a.include_point(&v.position);
-                            }
-                        }
-                        a
-                    };
-                    Some((fid, a))
-                } else {
-                    Some((fid, aabb))
+                // Always tessellate periodic (curved) faces so their triangle BVH
+                // is cached for use by point_in_solid.
+                if face.surface.surface.is_u_periodic() {
+                    if let Ok(fm) = tessellate_face(store, fid, &opts) {
+                        let mut aabb = Aabb::empty();
+                        let tris: Vec<FaceTri> = fm.triangles.iter().map(|t| {
+                            for p in &t.positions { aabb.include_point(p); }
+                            (t.positions, t.normal)
+                        }).collect();
+                        face_meshes.insert(fid, TriMesh::build(tris));
+                        if aabb.is_empty() { return None; }
+                        return Some((fid, aabb));
+                    }
+                    return None;
                 }
+                // Non-periodic face: use analytical bounds if available, else vertices.
+                let aabb = face.surface.surface.bounding_box();
+                let a = if !aabb.is_empty() {
+                    aabb
+                } else {
+                    let verts = store.face_vertices(fid).ok()?;
+                    let mut a = Aabb::empty();
+                    for vid in verts {
+                        if let Ok(v) = store.vertex(vid) { a.include_point(&v.position); }
+                    }
+                    a
+                };
+                if a.is_empty() { None } else { Some((fid, a)) }
             })
             .collect();
 
         let mut face_ids: Vec<FaceId> = Vec::new();
         let mut nodes: Vec<BvhNode> = Vec::new();
         build_recursive(&mut items, &mut face_ids, &mut nodes);
-        Bvh { nodes, face_ids }
+        Bvh { nodes, face_ids, face_meshes }
+    }
+
+    /// Triangle BVH for a periodic face — `None` for planar faces.
+    pub fn face_mesh(&self, fid: FaceId) -> Option<&TriMesh> {
+        self.face_meshes.get(&fid)
     }
 
     /// All faces whose AABB overlaps `query`.
