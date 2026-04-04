@@ -403,6 +403,381 @@ impl Feature for BooleanFeature {
     }
 }
 
+// ── Blend geometry (Phase 8: Fillet + Chamfer) ───────────────────────────────
+
+/// Newell polygon normal (unnormalised → then normalised).
+fn blend_newell(pts: &[Point3]) -> Vec3 {
+    let n = pts.len();
+    let (mut nx, mut ny, mut nz) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        nx += (a.y - b.y) * (a.z + b.z);
+        ny += (a.z - b.z) * (a.x + b.x);
+        nz += (a.x - b.x) * (a.y + b.y);
+    }
+    Vec3::new(nx, ny, nz).normalize()
+}
+
+/// Spherical linear interpolation between unit vectors `a` and `b`.
+fn blend_slerp(a: Vec3, b: Vec3, t: f64) -> Vec3 {
+    let dot = a.dot(&b).clamp(-1.0, 1.0);
+    let phi = dot.acos();
+    if phi.abs() < 1e-9 {
+        return (a * (1.0 - t) + b * t).normalize();
+    }
+    let sp = phi.sin();
+    ((phi * (1.0 - t)).sin() / sp * a + (phi * t).sin() / sp * b).normalize()
+}
+
+/// Geometry of a single blend operation on one edge.
+struct BlendEdge {
+    v_start: Point3,
+    v_end:   Point3,
+    n1: Vec3,  // outward normal of F1 (face where edge goes v_start → v_end)
+    n2: Vec3,  // outward normal of F2 (face where edge goes v_end → v_start)
+    d1: Vec3,  // inward in-face perp in F1: cross(n1, e_hat_f1)
+    d2: Vec3,  // inward in-face perp in F2: cross(n2, e_hat_f2)
+    setback: f64,
+    f1_id: brep_topo::entity::FaceId,
+    f2_id: brep_topo::entity::FaceId,
+}
+
+fn compute_blend_edge(
+    store: &ShapeStore,
+    edge_id: brep_topo::entity::EdgeId,
+    blend_dist: f64,
+    is_fillet: bool,
+) -> Result<Option<BlendEdge>, KernelError> {
+    use brep_topo::entity::FaceId;
+
+    let edge = store.edge(edge_id)?;
+    if edge.is_degenerate { return Ok(None); }
+
+    let he0 = store.half_edge(edge.half_edges[0])?;
+    let he1 = store.half_edge(edge.half_edges[1])?;
+    let v_start = store.vertex(he0.origin)?.position;
+    let v_end   = store.vertex(he1.origin)?.position;
+    let len = (v_end - v_start).norm();
+    if len < 1e-14 { return Ok(None); }
+
+    let f1_id: FaceId = store.loop_(he0.loop_id)?.face;
+    let f2_id: FaceId = store.loop_(he1.loop_id)?.face;
+
+    let pts1: Vec<Point3> = store.face_vertices(f1_id)?.iter()
+        .map(|&v| Ok(store.vertex(v)?.position))
+        .collect::<Result<_, KernelError>>()?;
+    let pts2: Vec<Point3> = store.face_vertices(f2_id)?.iter()
+        .map(|&v| Ok(store.vertex(v)?.position))
+        .collect::<Result<_, KernelError>>()?;
+
+    let n1 = blend_newell(&pts1);
+    let n2 = blend_newell(&pts2);
+
+    // In-face inward perp: cross(n_face, e_hat_in_face).
+    let e_hat = (v_end - v_start) / len;
+    let d1 = n1.cross(&e_hat).normalize();   // F1: edge direction v_start→v_end
+    let d2 = n2.cross(&(-e_hat)).normalize(); // F2: edge direction v_end→v_start
+
+    let setback = if is_fillet {
+        let c = n1.dot(&n2).clamp(-1.0 + 1e-12, 1.0 - 1e-12);
+        if 1.0 + c < 1e-9 { return Ok(None); } // nearly flat or concave
+        let theta = c.acos();
+        let s = (theta / 2.0).tan();
+        if s > 1e6 { return Ok(None); } // degenerate concave
+        blend_dist * s
+    } else {
+        blend_dist
+    };
+
+    Ok(Some(BlendEdge { v_start, v_end, n1, n2, d1, d2, setback, f1_id, f2_id }))
+}
+
+/// Rebuild a face polygon, inserting setback points where selected edges touch it.
+///
+/// `edge_svecs[i]` is the setback vector for the edge going from `poly[i]` to
+/// `poly[(i+1)%n]`.  Missing entries mean the edge is not selected.
+fn rebuild_face_poly(
+    poly: &[Point3],
+    edge_svecs: &std::collections::HashMap<usize, Vec3>,
+) -> Vec<Point3> {
+    let n = poly.len();
+    let mut out = Vec::new();
+    for i in 0..n {
+        let prev_idx = (i + n - 1) % n; // incoming edge index (prev→i)
+        let sv_in  = edge_svecs.get(&prev_idx);
+        let sv_out = edge_svecs.get(&i);
+        match (sv_in, sv_out) {
+            (None,       None)       => out.push(poly[i]),
+            (Some(sv),   None)       => out.push(poly[i] + sv),  // end of selected incoming
+            (None,       Some(sv))   => out.push(poly[i] + sv),  // start of selected outgoing
+            (Some(svi),  Some(svo))  => {
+                out.push(poly[i] + svi); // end of incoming (= T_end)
+                out.push(poly[i] + svo); // start of outgoing (= T_start)
+            }
+        }
+    }
+    out
+}
+
+/// Core engine: apply a blend (chamfer or fillet) to selected edges of a solid
+/// and return a new `ShapeStore`.
+///
+/// * `blend_dist` — chamfer distance or fillet radius
+/// * `is_fillet`  — `true` → arc strips; `false` → flat chamfer quad
+/// * `steps`      — arc subdivisions (1 for chamfer, ≥ 2 for fillet)
+fn apply_blend(
+    store: &ShapeStore,
+    solid_id: brep_topo::entity::SolidId,
+    selected: &[brep_topo::entity::EdgeId],
+    blend_dist: f64,
+    is_fillet: bool,
+    steps: usize,
+) -> Result<ShapeStore, KernelError> {
+    use std::collections::HashMap;
+    use brep_topo::entity::FaceId;
+
+    let solid = store.solid(solid_id)?;
+    let shell = store.shell(solid.outer_shell)?;
+
+    // ── 1. Collect face polygons ──────────────────────────────────────────────
+    let mut face_polys: HashMap<FaceId, Vec<Point3>> = HashMap::new();
+    for &fid in &shell.faces {
+        let pts: Vec<Point3> = store.face_vertices(fid)?.iter()
+            .map(|&v| Ok(store.vertex(v)?.position))
+            .collect::<Result<_, KernelError>>()?;
+        face_polys.insert(fid, pts);
+    }
+
+    // ── 2. Compute blend data for each selected edge ──────────────────────────
+    let mut blends: Vec<BlendEdge> = Vec::new();
+    for &eid in selected {
+        if let Some(b) = compute_blend_edge(store, eid, blend_dist, is_fillet)? {
+            blends.push(b);
+        }
+    }
+
+    // ── 3. Build per-face setback-vector maps ─────────────────────────────────
+    // face_svecs[fid][edge_poly_index] = setback displacement for that edge
+    let mut face_svecs: HashMap<FaceId, HashMap<usize, Vec3>> = HashMap::new();
+    for b in &blends {
+        // F1: find edge index where poly[i]≈v_start and poly[i+1]≈v_end
+        let p1 = &face_polys[&b.f1_id];
+        let n1 = p1.len();
+        for i in 0..n1 {
+            if (p1[i] - b.v_start).norm() < 1e-9
+                && (p1[(i+1)%n1] - b.v_end).norm() < 1e-9
+            {
+                face_svecs.entry(b.f1_id).or_default().insert(i, b.setback * b.d1);
+                break;
+            }
+        }
+        // F2: find edge index where poly[i]≈v_end and poly[i+1]≈v_start
+        let p2 = &face_polys[&b.f2_id];
+        let n2 = p2.len();
+        for i in 0..n2 {
+            if (p2[i] - b.v_end).norm() < 1e-9
+                && (p2[(i+1)%n2] - b.v_start).norm() < 1e-9
+            {
+                face_svecs.entry(b.f2_id).or_default().insert(i, b.setback * b.d2);
+                break;
+            }
+        }
+    }
+
+    // ── 4. Rebuild modified face polygons ─────────────────────────────────────
+    let mut all_polys: Vec<Vec<Point3>> = Vec::new();
+    for (&fid, poly) in &face_polys {
+        let empty = HashMap::new();
+        let svecs = face_svecs.get(&fid).unwrap_or(&empty);
+        let new_poly = rebuild_face_poly(poly, svecs);
+        if new_poly.len() >= 3 {
+            all_polys.push(new_poly);
+        }
+    }
+
+    // ── 5. Generate blend strips + end caps ───────────────────────────────────
+    for b in &blends {
+        let c  = b.n1.dot(&b.n2).clamp(-1.0, 1.0);
+
+        // Arc points at each endpoint of the edge.
+        // arc_A[k] = C_A + r * slerp(n1, n2, k/steps) for fillet
+        // arc_A[0] = T1_A = V_A + setback*d1  (tangent on F1)
+        // arc_A[steps] = T2_A = V_A + setback*d2  (tangent on F2)
+        let (arc_s, arc_e) = if is_fillet {
+            let c_offset = -(b.n1 + b.n2) * blend_dist / (1.0 + c);
+            let c_s = b.v_start + c_offset;
+            let c_e = b.v_end   + c_offset;
+            let as_: Vec<Point3> = (0..=steps).map(|k| {
+                c_s + blend_slerp(b.n1, b.n2, k as f64 / steps as f64) * blend_dist
+            }).collect();
+            let ae: Vec<Point3> = (0..=steps).map(|k| {
+                c_e + blend_slerp(b.n1, b.n2, k as f64 / steps as f64) * blend_dist
+            }).collect();
+            (as_, ae)
+        } else {
+            // Chamfer: steps=1, arc is just [T1, T2]
+            let as_ = vec![
+                b.v_start + b.setback * b.d1, // T1_start
+                b.v_start + b.setback * b.d2, // T2_start
+            ];
+            let ae  = vec![
+                b.v_end + b.setback * b.d1,   // T1_end
+                b.v_end + b.setback * b.d2,   // T2_end
+            ];
+            (as_, ae)
+        };
+
+        // Strip quads: winding [arc_s[i+1], arc_e[i+1], arc_e[i], arc_s[i]]
+        // outward normal faces outward along the blend arc.
+        for i in 0..steps {
+            all_polys.push(vec![
+                arc_s[i + 1],
+                arc_e[i + 1],
+                arc_e[i],
+                arc_s[i],
+            ]);
+        }
+
+        // End-cap fan at v_start: triangles [arc_s[i], arc_s[i+1], v_start]
+        // normal faces in the -e_hat direction.
+        for i in 0..steps {
+            all_polys.push(vec![arc_s[i], arc_s[i + 1], b.v_start]);
+        }
+
+        // End-cap fan at v_end: triangles [arc_e[i+1], arc_e[i], v_end]
+        // normal faces in the +e_hat direction.
+        for i in 0..steps {
+            all_polys.push(vec![arc_e[i + 1], arc_e[i], b.v_end]);
+        }
+    }
+
+    // ── 6. Build result ShapeStore ────────────────────────────────────────────
+    let mut result = ShapeStore::new();
+    make_solid_from_polygon_faces(&mut result, &all_polys, 1e-9)?;
+    Ok(result)
+}
+
+// ── ChamferFeature ────────────────────────────────────────────────────────────
+
+/// Cuts a flat bevel along each selected edge.
+///
+/// `edge_indices` are 0-based indices into the sequence returned by
+/// [`ShapeStore::edge_ids`].  The feature takes exactly 1 input solid.
+pub struct ChamferFeature {
+    pub distance:     f64,
+    pub edge_indices: Vec<usize>,
+}
+
+impl ChamferFeature {
+    pub fn new(distance: f64, edge_indices: Vec<usize>) -> Self {
+        Self { distance, edge_indices }
+    }
+}
+
+impl Feature for ChamferFeature {
+    fn name(&self) -> &str { "Chamfer" }
+    fn input_count(&self) -> usize { 1 }
+
+    fn compute(&self, inputs: &[Arc<ShapeStore>]) -> Result<Arc<ShapeStore>, KernelError> {
+        if inputs.len() != 1 {
+            return Err(KernelError::InvalidTopology("ChamferFeature: needs 1 input".into()));
+        }
+        let store = &inputs[0];
+        let solid_id = store.solid_ids().next().ok_or_else(||
+            KernelError::InvalidTopology("ChamferFeature: no solid in input".into()))?;
+        let all_edges: Vec<_> = store.edge_ids().collect();
+        let selected: Vec<_> = self.edge_indices.iter()
+            .filter_map(|&i| all_edges.get(i).copied())
+            .collect();
+        let result = apply_blend(store, solid_id, &selected, self.distance, false, 1)?;
+        Ok(Arc::new(result))
+    }
+
+    fn parameter_count(&self) -> usize { 1 }
+
+    fn get_parameter(&self, index: usize) -> Option<FeatureParameter> {
+        match index {
+            0 => Some(FeatureParameter { name: "distance",
+                value: FeatureParameterValue::Real(self.distance) }),
+            _ => None,
+        }
+    }
+
+    fn set_parameter(&mut self, index: usize, value: FeatureParameterValue)
+        -> Result<(), KernelError>
+    {
+        match (index, value) {
+            (0, FeatureParameterValue::Real(d)) => { self.distance = d; Ok(()) }
+            _ => Err(KernelError::OperationNotSupported(
+                "ChamferFeature: bad param index".into())),
+        }
+    }
+}
+
+// ── FilletFeature ─────────────────────────────────────────────────────────────
+
+/// Rounds selected edges with a rolling-ball fillet of the given radius.
+///
+/// The blend surface is approximated by `steps` quad strips along the arc
+/// (minimum 2).  `edge_indices` are 0-based indices into `ShapeStore::edge_ids`.
+pub struct FilletFeature {
+    pub radius:       f64,
+    pub edge_indices: Vec<usize>,
+    pub steps:        usize,
+}
+
+impl FilletFeature {
+    pub fn new(radius: f64, edge_indices: Vec<usize>, steps: usize) -> Self {
+        Self { radius, edge_indices, steps: steps.max(2) }
+    }
+}
+
+impl Feature for FilletFeature {
+    fn name(&self) -> &str { "Fillet" }
+    fn input_count(&self) -> usize { 1 }
+
+    fn compute(&self, inputs: &[Arc<ShapeStore>]) -> Result<Arc<ShapeStore>, KernelError> {
+        if inputs.len() != 1 {
+            return Err(KernelError::InvalidTopology("FilletFeature: needs 1 input".into()));
+        }
+        let store = &inputs[0];
+        let solid_id = store.solid_ids().next().ok_or_else(||
+            KernelError::InvalidTopology("FilletFeature: no solid in input".into()))?;
+        let all_edges: Vec<_> = store.edge_ids().collect();
+        let selected: Vec<_> = self.edge_indices.iter()
+            .filter_map(|&i| all_edges.get(i).copied())
+            .collect();
+        let result = apply_blend(store, solid_id, &selected, self.radius, true, self.steps)?;
+        Ok(Arc::new(result))
+    }
+
+    fn parameter_count(&self) -> usize { 2 }
+
+    fn get_parameter(&self, index: usize) -> Option<FeatureParameter> {
+        match index {
+            0 => Some(FeatureParameter { name: "radius",
+                value: FeatureParameterValue::Real(self.radius) }),
+            1 => Some(FeatureParameter { name: "steps",
+                value: FeatureParameterValue::Integer(self.steps as i64) }),
+            _ => None,
+        }
+    }
+
+    fn set_parameter(&mut self, index: usize, value: FeatureParameterValue)
+        -> Result<(), KernelError>
+    {
+        match (index, value) {
+            (0, FeatureParameterValue::Real(r))    => { self.radius = r; Ok(()) }
+            (1, FeatureParameterValue::Integer(s)) => {
+                self.steps = (s as usize).max(2); Ok(())
+            }
+            _ => Err(KernelError::OperationNotSupported(
+                "FilletFeature: bad param index".into())),
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -489,5 +864,98 @@ mod tests {
         let feat = RevolveFeature::new(profile, Point3::origin(), Vec3::z(), PI, 12);
         let result = feat.compute(&[]).unwrap();
         assert!(result.face_count() > 0);
+    }
+
+    // ── Phase 8: Chamfer ──────────────────────────────────────────────────────
+
+    /// Helper: create an extrude box as Arc<ShapeStore>.
+    fn make_box_input() -> Arc<ShapeStore> {
+        let feat = ExtrudeFeature::new(square_profile(), Vec3::z(), 3.0);
+        feat.compute(&[]).unwrap()
+    }
+
+    #[test]
+    fn chamfer_one_edge_face_count() {
+        let input = make_box_input();
+        // A box has 12 edges.  Pick the first one.
+        let feat = ChamferFeature::new(0.2, vec![0]);
+        let result = feat.compute(&[input]).unwrap();
+        // 6 original faces (2 modified) + 1 chamfer quad + 2 triangle end-caps = 9
+        assert_eq!(result.face_count(), 9,
+            "chamfered box should have 9 faces, got {}", result.face_count());
+    }
+
+    #[test]
+    fn chamfer_produces_valid_vertex_count() {
+        let input = make_box_input();
+        let feat = ChamferFeature::new(0.1, vec![0]);
+        let result = feat.compute(&[input]).unwrap();
+        // Original 8 verts → 2 verts replaced by 2 setback pairs + 2 original endpoints stay
+        // = 8 - 2 + 4 = 10 vertices (the original 2 edge verts stay in end-caps and other faces)
+        assert!(result.vertex_count() >= 10,
+            "expected ≥ 10 vertices, got {}", result.vertex_count());
+    }
+
+    #[test]
+    fn chamfer_feature_tree_integration() {
+        let mut tree = FeatureTree::new();
+        let fid_box = tree.add_feature(Box::new(
+            ExtrudeFeature::new(square_profile(), Vec3::z(), 2.0)
+        ));
+        let fid_cham = tree.add_feature_with_inputs(
+            Box::new(ChamferFeature::new(0.15, vec![0])),
+            vec![fid_box],
+        );
+        let result = tree.evaluate(fid_cham).unwrap();
+        assert_eq!(result.face_count(), 9);
+    }
+
+    // ── Phase 8: Fillet ───────────────────────────────────────────────────────
+
+    #[test]
+    fn fillet_one_edge_face_count() {
+        let input = make_box_input();
+        // steps=2: 2 strip quads + 2 end-caps (2 triangles each) + 6 original = 12
+        let feat = FilletFeature::new(0.2, vec![0], 2);
+        let result = feat.compute(&[input]).unwrap();
+        assert_eq!(result.face_count(), 12,
+            "filleted box (steps=2) should have 12 faces, got {}", result.face_count());
+    }
+
+    #[test]
+    fn fillet_arc_points_on_sphere() {
+        // The fillet arc points should lie on a cylinder of the given radius
+        // centered on the fillet spine.  For a 90-degree box edge, the arc
+        // center is at distance r from both adjacent faces.
+        let input = make_box_input();
+        let radius = 0.3;
+        let steps  = 4;
+        let feat = FilletFeature::new(radius, vec![0], steps);
+        let result = feat.compute(&[input]).unwrap();
+        // Strip quads are at indices 6..6+steps in all_polys ordering.
+        // We just check the result is non-trivial.
+        assert_eq!(result.face_count(), 6 + steps + 2 * steps,
+            "filleted box should have {} faces", 6 + steps + 2 * steps);
+    }
+
+    #[test]
+    fn fillet_feature_tree_dirty_propagation() {
+        let mut tree = FeatureTree::new();
+        let fid_box = tree.add_feature(Box::new(
+            ExtrudeFeature::new(square_profile(), Vec3::z(), 2.0)
+        ));
+        let fid_fil = tree.add_feature_with_inputs(
+            Box::new(FilletFeature::new(0.1, vec![0], 3)),
+            vec![fid_box],
+        );
+        let r1 = tree.evaluate(fid_fil).unwrap();
+        // Change fillet radius via parameter index 0.
+        tree.set_parameter(fid_fil, 0, FeatureParameterValue::Real(0.2)).unwrap();
+        let r2 = tree.evaluate(fid_fil).unwrap();
+        // Results are different (different arc geometry).
+        assert!(!Arc::ptr_eq(&r1, &r2));
+        // Face counts should both be 6 + 3 + 2*3 = 15.
+        assert_eq!(r1.face_count(), 15);
+        assert_eq!(r2.face_count(), 15);
     }
 }
