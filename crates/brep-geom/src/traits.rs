@@ -4,6 +4,8 @@
 //! All evaluation, differentiation, and bounding-box queries go through
 //! these traits.  Concrete implementations live in sibling modules.
 
+use std::any::Any;
+
 use brep_core::{Aabb, KernelError, Iso3, Point2, Point3, Vec2, Vec3};
 
 // ── 3-D parametric curve ──────────────────────────────────────────────────────
@@ -109,6 +111,9 @@ pub trait Curve3d: Send + Sync {
 
     /// Return a new curve transformed by `iso`.
     fn transformed(&self, iso: &Iso3) -> Box<dyn Curve3d>;
+
+    /// Cast to `Any` for downcasting in I/O modules.
+    fn as_any(&self) -> &dyn Any;
 }
 
 // ── 2-D parametric curve (pcurve on a surface) ────────────────────────────────
@@ -136,6 +141,9 @@ pub trait Curve2d: Send + Sync {
 
     /// Return a new curve with reversed parameterisation.
     fn reversed(&self) -> Box<dyn Curve2d>;
+
+    /// Cast to `Any` for downcasting in I/O modules.
+    fn as_any(&self) -> &dyn Any;
 }
 
 // ── Parametric surface ────────────────────────────────────────────────────────
@@ -279,6 +287,9 @@ pub trait Surface: Send + Sync {
 
     /// Return a new surface transformed by `iso`.
     fn transformed(&self, iso: &Iso3) -> Box<dyn Surface>;
+
+    /// Cast to `Any` for downcasting in I/O modules.
+    fn as_any(&self) -> &dyn Any;
 }
 
 // ── Gauss-Legendre quadrature (8-point) ──────────────────────────────────────

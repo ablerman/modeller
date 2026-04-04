@@ -106,6 +106,8 @@ impl Surface for Plane {
             iso.transform_vector(&self.v_axis),
         ))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── Cylindrical surface ───────────────────────────────────────────────────────
@@ -198,6 +200,8 @@ impl Surface for CylindricalSurface {
             y_axis: iso.transform_vector(&self.y_axis),
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── Spherical surface ─────────────────────────────────────────────────────────
@@ -292,6 +296,8 @@ impl Surface for SphericalSurface {
             z_axis: iso.transform_vector(&self.z_axis),
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── Conical surface ───────────────────────────────────────────────────────────
@@ -400,6 +406,8 @@ impl Surface for ConicalSurface {
             y_axis:     iso.transform_vector(&self.y_axis),
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── B-spline surface ──────────────────────────────────────────────────────────
@@ -540,6 +548,8 @@ impl Surface for BsplineSurface {
             weights: self.weights.clone(),
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -84,6 +84,8 @@ impl Curve3d for LineCurve {
             iso.transform_vector(&self.direction),
         ))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── Circle ───────────────────────────────────────────────────────────────────
@@ -179,6 +181,8 @@ impl Curve3d for CircleCurve {
             iso.transform_vector(&self.y_axis),
         ))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── TrimmedCurve ──────────────────────────────────────────────────────────────
@@ -235,6 +239,8 @@ impl Curve3d for TrimmedCurve {
     fn transformed(&self, iso: &Iso3) -> Box<dyn Curve3d> {
         Box::new(TrimmedCurve::new(self.basis.transformed(iso), self.t0, self.t1))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── B-spline curve ────────────────────────────────────────────────────────────
@@ -402,6 +408,8 @@ impl Curve3d for BsplineCurve {
             weights: self.weights.clone(),
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 // ── Line2d ────────────────────────────────────────────────────────────────────
@@ -442,6 +450,8 @@ impl Curve2d for Line2d {
     fn reversed(&self) -> Box<dyn Curve2d> {
         Box::new(Line2d::new(self.origin, -self.direction))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 /// Arc in 2-D parameter space (e.g. for seam edges on cylindrical surfaces).
@@ -488,6 +498,8 @@ impl Curve2d for Circle2d {
             self.radius,
         ))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 #[cfg(test)]
