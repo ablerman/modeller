@@ -223,8 +223,8 @@ impl GpuRenderer {
         base_color: [f32; 3],
     ) -> GpuMesh {
         let opts = TessellationOptions {
-            chord_tolerance: 0.005,
-            min_segments: 16,
+            chord_tolerance: 0.02,
+            min_segments: 12,
         };
         let face_meshes = tessellate(store, &opts).unwrap_or_default();
 
