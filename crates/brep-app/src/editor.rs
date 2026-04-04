@@ -48,6 +48,8 @@ pub struct SceneObject {
     pub solid_id: SolidId,
     pub name: String,
     pub history: ObjectHistory,
+    /// Stable identity for GPU mesh caching — never reused.
+    pub id: u64,
 }
 
 // ── Camera ────────────────────────────────────────────────────────────────────
@@ -271,6 +273,8 @@ pub struct EditorState {
     pub history: History,
     /// Tracks how many objects have been created (for unique naming).
     name_counter: u32,
+    /// Monotonically increasing counter for assigning stable object IDs.
+    next_object_id: u64,
     /// Set to `true` whenever objects change, so meshes can be re-uploaded.
     pub scene_dirty: bool,
     /// In-progress camera snap animation, if any.
@@ -285,6 +289,7 @@ impl EditorState {
             camera: ViewportCamera::default(),
             history: History::new(),
             name_counter: 0,
+            next_object_id: 0,
             scene_dirty: true,
             camera_anim: None,
         };
@@ -356,11 +361,13 @@ impl EditorState {
                             left:  Box::new(left_hist),
                             right: Box::new(right_hist),
                         };
+                        let id = self.alloc_id();
                         self.objects.push(SceneObject {
                             store: new_store,
                             solid_id: new_solid,
                             name,
                             history,
+                            id,
                         });
                         self.selection.clear();
                         self.selection.insert(self.objects.len() - 1);
@@ -450,6 +457,12 @@ impl EditorState {
         self.name_counter
     }
 
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_object_id;
+        self.next_object_id += 1;
+        id
+    }
+
     fn add_primitive(&mut self, kind: PrimitiveKind) {
         let mut store = ShapeStore::new();
         let result = match kind {
@@ -461,7 +474,8 @@ impl EditorState {
         if let Ok(solid_id) = result {
             let name = format!("{:?}-{}", kind, self.next_name());
             let history = ObjectHistory::Primitive(kind);
-            self.objects.push(SceneObject { store, solid_id, name, history });
+            let id = self.alloc_id();
+            self.objects.push(SceneObject { store, solid_id, name, history, id });
         }
     }
 

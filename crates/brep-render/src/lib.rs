@@ -29,6 +29,114 @@
 #[cfg(feature = "window")]
 pub mod gpu;
 
+// ── CPU mesh preparation (no GPU required) ────────────────────────────────────
+
+/// Given flat-shaded triangle soup `(position, flat_normal)`, compute smooth
+/// per-vertex normals using a spatial hash + crease-angle test.
+/// Returns one smooth normal per input vertex.
+/// No GPU types — safe to call and test without the `window` feature.
+pub fn compute_smooth_normals(
+    positions: &[[f32; 3]],
+    flat_normals: &[[f32; 3]],
+) -> Vec<[f32; 3]> {
+    assert_eq!(positions.len(), flat_normals.len());
+    const CREASE_COS: f32 = 0.766; // cos(40°)
+
+    // The tessellator produces identical f32 bit patterns for shared vertices
+    // (same (u,v) grid point evaluated on the same face).  We exploit this by
+    // keying the spatial hash on the exact bit representation — one lookup per
+    // vertex instead of the previous 27-cell neighbourhood scan.
+    type PosKey = (u32, u32, u32);
+    let pos_key = |p: &[f32; 3]| -> PosKey {
+        (p[0].to_bits(), p[1].to_bits(), p[2].to_bits())
+    };
+
+    let mut grid: std::collections::HashMap<PosKey, Vec<usize>> =
+        std::collections::HashMap::with_capacity(positions.len());
+    for (i, pos) in positions.iter().enumerate() {
+        grid.entry(pos_key(pos)).or_default().push(i);
+    }
+
+    positions.iter().zip(flat_normals.iter()).map(|(pos, flat_n)| {
+        let mut sum = *flat_n;
+        if let Some(bucket) = grid.get(&pos_key(pos)) {
+            for &j in bucket {
+                let dot = flat_n[0]*flat_normals[j][0]
+                        + flat_n[1]*flat_normals[j][1]
+                        + flat_n[2]*flat_normals[j][2];
+                if dot >= CREASE_COS {
+                    sum[0] += flat_normals[j][0];
+                    sum[1] += flat_normals[j][1];
+                    sum[2] += flat_normals[j][2];
+                }
+            }
+        }
+        let len = (sum[0]*sum[0]+sum[1]*sum[1]+sum[2]*sum[2]).sqrt().max(1e-12);
+        [sum[0]/len, sum[1]/len, sum[2]/len]
+    }).collect()
+}
+
+/// Tessellate `store` and compute smooth per-vertex normals.
+/// Returns `(positions, smooth_normals)` — no GPU types required.
+pub fn prepare_mesh_cpu(store: &ShapeStore) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    let opts = TessellationOptions { chord_tolerance: 0.02, min_segments: 12 };
+    let face_meshes = tessellate(store, &opts).unwrap_or_default();
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut flat_normals: Vec<[f32; 3]> = Vec::new();
+    for fm in &face_meshes {
+        for tri in &fm.triangles {
+            let nf = [tri.normal.x as f32, tri.normal.y as f32, tri.normal.z as f32];
+            for i in 0..3 {
+                let p = tri.positions[i];
+                positions.push([p.x as f32, p.y as f32, p.z as f32]);
+                flat_normals.push(nf);
+            }
+        }
+    }
+    let smooth = compute_smooth_normals(&positions, &flat_normals);
+    (positions, smooth)
+}
+
+/// Combine pre-computed positions and smooth normals with a colour into GPU vertices.
+/// No tessellation — use this with a cached `prepare_mesh_cpu` result.
+#[cfg(feature = "window")]
+pub fn apply_color(
+    positions: &[[f32; 3]],
+    normals:   &[[f32; 3]],
+    base_color: [f32; 3],
+) -> Vec<gpu::GpuVertex> {
+    positions.iter().zip(normals.iter()).map(|(pos, sn)| gpu::GpuVertex {
+        position: *pos, _pad0: 0.0,
+        normal:   *sn,  _pad1: 0.0,
+        color:    base_color, _pad2: 0.0,
+    }).collect()
+}
+
+#[cfg(feature = "window")]
+pub fn prepare_vertices(store: &ShapeStore, base_color: [f32; 3]) -> Vec<gpu::GpuVertex> {
+    let opts = TessellationOptions { chord_tolerance: 0.02, min_segments: 12 };
+    let face_meshes = tessellate(store, &opts).unwrap_or_default();
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut flat_normals: Vec<[f32; 3]> = Vec::new();
+    for fm in &face_meshes {
+        for tri in &fm.triangles {
+            let nf = [tri.normal.x as f32, tri.normal.y as f32, tri.normal.z as f32];
+            for i in 0..3 {
+                let p = tri.positions[i];
+                positions.push([p.x as f32, p.y as f32, p.z as f32]);
+                flat_normals.push(nf);
+            }
+        }
+    }
+    let smooth = compute_smooth_normals(&positions, &flat_normals);
+    positions.iter().zip(smooth.iter()).map(|(pos, sn)| gpu::GpuVertex {
+        position: *pos, _pad0: 0.0,
+        normal:   *sn,  _pad1: 0.0,
+        color:    base_color, _pad2: 0.0,
+    }).collect()
+}
+
 use std::io::Cursor;
 
 use brep_core::{Point3, Vec3};
@@ -391,7 +499,56 @@ fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Result<Vec<u8>, RenderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brep_topo::primitives::{make_box, make_cylinder, make_cone, make_sphere};
+    use brep_topo::{primitives::{make_box, make_cylinder, make_cone, make_sphere}, store::ShapeStore};
+    use std::time::Instant;
+
+    fn bench_primitive(label: &str, store: &ShapeStore) {
+        let t0 = Instant::now();
+        let opts = TessellationOptions { chord_tolerance: 0.02, min_segments: 12 };
+        let face_meshes = tessellate(store, &opts).unwrap_or_default();
+        let t_tess = t0.elapsed();
+        let n_verts: usize = face_meshes.iter().map(|fm| fm.triangles.len() * 3).sum();
+
+        let t1 = Instant::now();
+        let (_, _) = prepare_mesh_cpu(store);
+        let t_smooth = t1.elapsed();
+
+        eprintln!(
+            "[{label}] faces={} verts={}  tess={:.1}ms  smooth={:.1}ms  total={:.1}ms",
+            store.face_count(), n_verts,
+            t_tess.as_secs_f64() * 1000.0,
+            t_smooth.as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+
+    #[test]
+    fn bench_prepare_sphere() {
+        let mut store = ShapeStore::new();
+        make_sphere(&mut store, 0.5).unwrap();
+        bench_primitive("sphere r=0.5", &store);
+    }
+
+    #[test]
+    fn bench_prepare_cone() {
+        let mut store = ShapeStore::new();
+        make_cone(&mut store, 0.5, 1.0).unwrap();
+        bench_primitive("cone r=0.5 h=1", &store);
+    }
+
+    #[test]
+    fn bench_prepare_cylinder() {
+        let mut store = ShapeStore::new();
+        make_cylinder(&mut store, 0.5, 1.0).unwrap();
+        bench_primitive("cylinder r=0.5 h=1", &store);
+    }
+
+    #[test]
+    fn bench_prepare_box() {
+        let mut store = ShapeStore::new();
+        make_box(&mut store, 1.0, 1.0, 1.0).unwrap();
+        bench_primitive("box 1x1x1", &store);
+    }
 
     fn small_opts() -> RenderOptions {
         RenderOptions { width: 64, height: 64, chord_tolerance: 0.02, ..Default::default() }

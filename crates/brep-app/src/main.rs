@@ -44,6 +44,9 @@ struct AppState {
     // 3-D renderer
     gpu_renderer: GpuRenderer,
     gpu_meshes: Vec<GpuMeshEntry>,
+    /// Cached tessellated (positions, normals) per object ID.
+    /// Avoids re-tessellating unchanged objects when the scene is dirtied.
+    tess_cache: std::collections::HashMap<u64, (Vec<[f32; 3]>, Vec<[f32; 3]>)>,
 
     // egui
     egui_ctx: egui::Context,
@@ -142,6 +145,7 @@ impl AppState {
             queue,
             gpu_renderer,
             gpu_meshes: Vec::new(),
+            tess_cache: std::collections::HashMap::new(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -163,11 +167,20 @@ impl AppState {
     }
 
     /// Re-upload GPU meshes whenever the scene changes.
+    ///
+    /// Tessellation results are cached per object ID so that adding or selecting
+    /// one object does not re-tessellate all others.
     fn sync_meshes(&mut self) {
         if !self.editor.scene_dirty {
             return;
         }
         self.editor.scene_dirty = false;
+
+        // Evict cache entries that no longer correspond to any live object.
+        let live_ids: std::collections::HashSet<u64> =
+            self.editor.objects.iter().map(|o| o.id).collect();
+        self.tess_cache.retain(|id, _| live_ids.contains(id));
+
         self.gpu_meshes.clear();
         for (i, obj) in self.editor.objects.iter().enumerate() {
             let selected = self.editor.selection.contains(&i);
@@ -176,7 +189,12 @@ impl AppState {
             } else {
                 [0.38, 0.62, 0.90f32]
             };
-            let mesh = self.gpu_renderer.upload_store(&self.device, &obj.store, base_color);
+            // Use cached tessellation if available; otherwise compute and cache.
+            let cached = self.tess_cache.entry(obj.id).or_insert_with(|| {
+                brep_render::prepare_mesh_cpu(&obj.store)
+            });
+            let verts = brep_render::apply_color(&cached.0, &cached.1, base_color);
+            let mesh = self.gpu_renderer.upload_vertices(&self.device, &verts);
             self.gpu_meshes.push(GpuMeshEntry { mesh, selected });
         }
     }

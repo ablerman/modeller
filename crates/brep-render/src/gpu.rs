@@ -4,16 +4,17 @@
 //! Renders with a Blinn-Phong WGSL shader matching the CPU rasterizer's lighting.
 //!
 //! # Usage
-//! ```no_run
+//! ```ignore
 //! // Inside a wgpu application:
-//! let renderer = GpuRenderer::new(&device, &queue, surface_format, depth_format, width, height);
-//! let meshes = renderer.upload_store(&device, &store, [0.38, 0.62, 0.90]);
+//! let renderer = GpuRenderer::new(&device, surface_format, depth_format, width, height);
+//! let (positions, normals) = brep_render::prepare_mesh_cpu(&store);
+//! let verts = brep_render::apply_color(&positions, &normals, [0.38, 0.62, 0.90]);
+//! let mesh = renderer.upload_vertices(&device, &verts);
 //! // In each frame:
-//! renderer.render(&mut pass, &meshes, eye, target, up, fov_y_deg, width, height);
+//! renderer.render(&mut pass, &[&mesh], &queue, eye, target, up, fov_y_deg);
 //! ```
 
 use brep_core::{Point3, Vec3};
-use brep_mesh::{tessellate, TessellationOptions};
 use brep_topo::store::ShapeStore;
 use bytemuck::{Pod, Zeroable};
 use nalgebra::Matrix4;
@@ -213,6 +214,25 @@ impl GpuRenderer {
         }
     }
 
+    /// Upload pre-built GPU vertices to a vertex buffer.
+    ///
+    /// Use this with [`crate::apply_color`] + a cached [`crate::prepare_mesh_cpu`] result
+    /// to avoid re-tessellating objects whose geometry hasn't changed.
+    pub fn upload_vertices(&self, device: &wgpu::Device, verts: &[GpuVertex]) -> GpuMesh {
+        let vertex_count = verts.len() as u32;
+        let data: &[u8] = if verts.is_empty() {
+            &[0u8; std::mem::size_of::<GpuVertex>()]
+        } else {
+            bytemuck::cast_slice(verts)
+        };
+        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh vbo"),
+            contents: data,
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        GpuMesh { vertex_buf, vertex_count }
+    }
+
     /// Tessellate `store` and upload all triangles to a GPU vertex buffer.
     ///
     /// `base_color` is the diffuse RGB colour (linear, 0–1) for all faces.
@@ -222,94 +242,7 @@ impl GpuRenderer {
         store: &ShapeStore,
         base_color: [f32; 3],
     ) -> GpuMesh {
-        let opts = TessellationOptions {
-            chord_tolerance: 0.02,
-            min_segments: 12,
-        };
-        let face_meshes = tessellate(store, &opts).unwrap_or_default();
-
-        // ── Collect flat triangle soup ────────────────────────────────────────
-        struct RawVert { pos: [f32; 3], flat_n: [f32; 3] }
-        let mut raw: Vec<RawVert> = Vec::new();
-        for fm in &face_meshes {
-            for tri in &fm.triangles {
-                let n = tri.normal;
-                let nf = [n.x as f32, n.y as f32, n.z as f32];
-                for i in 0..3 {
-                    let p = tri.positions[i];
-                    raw.push(RawVert {
-                        pos: [p.x as f32, p.y as f32, p.z as f32],
-                        flat_n: nf,
-                    });
-                }
-            }
-        }
-
-        // ── Compute smooth per-vertex normals with crease-angle ───────────────
-        // cos(40°) ≈ 0.766 — hard edges sharper than 40° stay crisp.
-        const CREASE_COS: f32 = 0.766;
-        // Grid cell size: coarser than the weld distance so neighbours always
-        // land in at most 2^3 = 8 adjacent cells.
-        const CELL: f32 = 0.01;
-
-        // Build a spatial hash: cell key → list of vertex indices.
-        let cell_key = |pos: &[f32; 3]| -> (i32, i32, i32) {
-            (
-                (pos[0] / CELL).floor() as i32,
-                (pos[1] / CELL).floor() as i32,
-                (pos[2] / CELL).floor() as i32,
-            )
-        };
-        let mut grid: std::collections::HashMap<(i32,i32,i32), Vec<usize>> =
-            std::collections::HashMap::with_capacity(raw.len());
-        for (i, rv) in raw.iter().enumerate() {
-            grid.entry(cell_key(&rv.pos)).or_default().push(i);
-        }
-
-        let smooth_normals: Vec<[f32; 3]> = raw
-            .iter()
-            .map(|v| {
-                let (cx, cy, cz) = cell_key(&v.pos);
-                let mut sum = v.flat_n;
-                // Check the 3×3×3 neighbourhood of cells.
-                for dx in -1i32..=1 {
-                for dy in -1i32..=1 {
-                for dz in -1i32..=1 {
-                    let Some(bucket) = grid.get(&(cx+dx, cy+dy, cz+dz)) else { continue };
-                    for &j in bucket {
-                        let other = &raw[j];
-                        // Same position?
-                        let ex = v.pos[0] - other.pos[0];
-                        let ey = v.pos[1] - other.pos[1];
-                        let ez = v.pos[2] - other.pos[2];
-                        if ex*ex + ey*ey + ez*ez > CELL * CELL * 0.01 { continue; }
-                        // Within crease angle?
-                        let dot = v.flat_n[0]*other.flat_n[0]
-                                + v.flat_n[1]*other.flat_n[1]
-                                + v.flat_n[2]*other.flat_n[2];
-                        if dot < CREASE_COS { continue; }
-                        sum[0] += other.flat_n[0];
-                        sum[1] += other.flat_n[1];
-                        sum[2] += other.flat_n[2];
-                    }
-                }}}
-                let len = (sum[0]*sum[0] + sum[1]*sum[1] + sum[2]*sum[2]).sqrt().max(1e-12);
-                [sum[0]/len, sum[1]/len, sum[2]/len]
-            })
-            .collect();
-
-        let mut verts: Vec<GpuVertex> = Vec::with_capacity(raw.len());
-        for (rv, sn) in raw.iter().zip(smooth_normals.iter()) {
-            verts.push(GpuVertex {
-                position: rv.pos,
-                _pad0: 0.0,
-                normal: *sn,
-                _pad1: 0.0,
-                color: base_color,
-                _pad2: 0.0,
-            });
-        }
-
+        let verts = crate::prepare_vertices(store, base_color);
         let vertex_count = verts.len() as u32;
         // Create a non-empty buffer even if there are no vertices (wgpu requires non-zero size).
         let data: &[u8] = if verts.is_empty() {
@@ -490,3 +423,4 @@ fn fs_main(in: Vout) -> @location(0) vec4<f32> {
     return vec4<f32>(srgb(r), srgb(g), srgb(b), 1.0);
 }
 "#;
+
