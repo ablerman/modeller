@@ -778,6 +778,286 @@ impl Feature for FilletFeature {
     }
 }
 
+// ── Shell / Face-Offset geometry (Phase 10) ──────────────────────────────────
+
+/// Solve the minimum-norm displacement `d` such that `d·n_i = -thickness`
+/// for each normal `n_i`.  Uses the normal equations `(N^T N) d = N^T b`.
+fn shell_offset_displacement(normals: &[Vec3], thickness: f64) -> Vec3 {
+    use nalgebra::{Matrix3, Vector3};
+
+    if normals.is_empty() { return Vec3::zeros(); }
+    if normals.len() == 1 { return -normals[0].normalize() * thickness; }
+
+    // Accumulate N^T N and N^T b.
+    let mut ata = Matrix3::<f64>::zeros();
+    let mut atb = Vector3::<f64>::zeros();
+    for &ni in normals {
+        let v = Vector3::new(ni.x, ni.y, ni.z);
+        ata += v * v.transpose();
+        atb += v * (-thickness);
+    }
+    match ata.try_inverse() {
+        Some(inv) => {
+            let d = inv * atb;
+            Vec3::new(d.x, d.y, d.z)
+        }
+        None => {
+            // Degenerate (co-planar normals): fall back to average outward direction.
+            let avg = normals.iter().fold(Vec3::zeros(), |a, &n| a + n).normalize();
+            avg * (-thickness)
+        }
+    }
+}
+
+/// Build a hollow solid from `store` by offsetting all faces inward by
+/// `thickness`.  `open_face_ids` lists faces that are left open (no outer or
+/// inner face, but replaced by a rim wall).
+fn apply_shell(
+    store: &ShapeStore,
+    solid_id: brep_topo::entity::SolidId,
+    open_face_ids: &[brep_topo::entity::FaceId],
+    thickness: f64,
+) -> Result<ShapeStore, KernelError> {
+    use std::collections::HashMap;
+    use brep_topo::entity::{FaceId, VertexId};
+
+    let solid = store.solid(solid_id)?;
+    let shell = store.shell(solid.outer_shell)?;
+    let open_set: HashSet<FaceId> = open_face_ids.iter().copied().collect();
+
+    // ── 1. Collect face normals ───────────────────────────────────────────────
+    let mut face_normal: HashMap<FaceId, Vec3> = HashMap::new();
+    let mut face_vids:   HashMap<FaceId, Vec<VertexId>> = HashMap::new();
+    for &fid in &shell.faces {
+        let vids = store.face_vertices(fid)?;
+        let pts: Vec<Point3> = vids.iter()
+            .map(|&v| Ok(store.vertex(v)?.position))
+            .collect::<Result<_, KernelError>>()?;
+        face_normal.insert(fid, blend_newell(&pts));
+        face_vids.insert(fid, vids);
+    }
+
+    // ── 2. Compute per-vertex offset position ─────────────────────────────────
+    // Build vertex → adjacent face IDs from the polygon data, since
+    // `Vertex::outgoing_half_edges` is not always populated.
+    let mut vert_faces: HashMap<VertexId, Vec<FaceId>> = HashMap::new();
+    for (&fid, vids) in &face_vids {
+        for &vid in vids {
+            vert_faces.entry(vid).or_default().push(fid);
+        }
+    }
+    // Solve d·n_i = -thickness for each vertex from its adjacent face normals.
+    let mut offset_pos: HashMap<VertexId, Point3> = HashMap::new();
+    for (&vid, adj_fids) in &vert_faces {
+        let normals: Vec<Vec3> = adj_fids.iter()
+            .filter_map(|&fid| face_normal.get(&fid).copied())
+            .collect();
+        let d = shell_offset_displacement(&normals, thickness);
+        offset_pos.insert(vid, store.vertex(vid)?.position + d);
+    }
+
+    // ── 3. Build face polygons ────────────────────────────────────────────────
+    let mut all_polys: Vec<Vec<Point3>> = Vec::new();
+
+    for &fid in &shell.faces {
+        if open_set.contains(&fid) { continue; }
+        let vids = &face_vids[&fid];
+
+        // Outer face: original winding.
+        let outer: Vec<Point3> = vids.iter()
+            .map(|&v| Ok(store.vertex(v)?.position))
+            .collect::<Result<_, KernelError>>()?;
+        all_polys.push(outer);
+
+        // Inner face: reversed winding + offset vertices.
+        // Reversed winding makes its outward normal point toward the cavity.
+        let inner: Vec<Point3> = vids.iter().rev()
+            .map(|&v| Ok(offset_pos[&v]))
+            .collect::<Result<_, KernelError>>()?;
+        all_polys.push(inner);
+    }
+
+    // ── 4. Wall quads at the opening rim ─────────────────────────────────────
+    // For each half-edge in a non-open face whose twin is in an open face,
+    // the half-edge is a boundary edge of the opening.  Connect the outer edge
+    // to the inner edge with a quad: [V_b, V_b', V_a', V_a] — winding that
+    // gives an outward normal pointing into the opening.
+    for &fid in &shell.faces {
+        if open_set.contains(&fid) { continue; }
+        let face = store.face(fid)?;
+        for he_id in store.loop_half_edges(face.outer_loop)? {
+            let he_id = he_id?;
+            let he  = store.half_edge(he_id)?;
+            let twin = store.half_edge(he.twin)?;
+            let twin_fid = store.loop_(twin.loop_id)?.face;
+            if !open_set.contains(&twin_fid) { continue; }
+
+            // V_a → V_b is the boundary edge direction in the non-open face.
+            let v_a = store.vertex(he.origin)?.position;
+            let v_b = store.vertex(store.half_edge(he.next)?.origin)?.position;
+            let v_a_off = offset_pos[&he.origin];
+            let v_b_off = offset_pos[&store.half_edge(he.next)?.origin];
+
+            // [V_b, V_b', V_a', V_a] — outward normal points into the opening.
+            all_polys.push(vec![v_b, v_b_off, v_a_off, v_a]);
+        }
+    }
+
+    // ── 5. Build result ───────────────────────────────────────────────────────
+    let mut result = ShapeStore::new();
+    make_solid_from_polygon_faces(&mut result, &all_polys, 1e-9)?;
+    Ok(result)
+}
+
+// ── ShellFeature ──────────────────────────────────────────────────────────────
+
+/// Hollows out a solid, leaving walls of uniform `thickness`.
+///
+/// `open_face_indices` are 0-based indices into [`ShapeStore::face_ids`].
+/// Those faces are removed (creating an open mouth in the shell).  Pass an
+/// empty slice to create a fully closed hollow solid.
+pub struct ShellFeature {
+    pub thickness:          f64,
+    pub open_face_indices:  Vec<usize>,
+}
+
+impl ShellFeature {
+    pub fn new(thickness: f64, open_face_indices: Vec<usize>) -> Self {
+        Self { thickness, open_face_indices }
+    }
+}
+
+impl Feature for ShellFeature {
+    fn name(&self) -> &str { "Shell" }
+    fn input_count(&self) -> usize { 1 }
+
+    fn compute(&self, inputs: &[Arc<ShapeStore>]) -> Result<Arc<ShapeStore>, KernelError> {
+        if inputs.len() != 1 {
+            return Err(KernelError::InvalidTopology("ShellFeature: needs 1 input".into()));
+        }
+        let store = &inputs[0];
+        let solid_id = store.solid_ids().next().ok_or_else(||
+            KernelError::InvalidTopology("ShellFeature: no solid in input".into()))?;
+        let all_faces: Vec<_> = store.face_ids().collect();
+        let open: Vec<_> = self.open_face_indices.iter()
+            .filter_map(|&i| all_faces.get(i).copied())
+            .collect();
+        let result = apply_shell(store, solid_id, &open, self.thickness)?;
+        Ok(Arc::new(result))
+    }
+
+    fn parameter_count(&self) -> usize { 1 }
+
+    fn get_parameter(&self, index: usize) -> Option<FeatureParameter> {
+        match index {
+            0 => Some(FeatureParameter { name: "thickness",
+                value: FeatureParameterValue::Real(self.thickness) }),
+            _ => None,
+        }
+    }
+
+    fn set_parameter(&mut self, index: usize, value: FeatureParameterValue)
+        -> Result<(), KernelError>
+    {
+        match (index, value) {
+            (0, FeatureParameterValue::Real(t)) => { self.thickness = t; Ok(()) }
+            _ => Err(KernelError::OperationNotSupported(
+                "ShellFeature: bad param index".into())),
+        }
+    }
+}
+
+// ── OffsetFaceFeature ─────────────────────────────────────────────────────────
+
+/// Pushes or pulls a single face along its outward normal by `distance`.
+///
+/// All vertices belonging to the selected face are translated by
+/// `distance × n_face`.  Adjacent faces are automatically deformed because
+/// they share those vertices.  Positive `distance` moves the face outward
+/// (enlarges the solid on that side); negative moves it inward.
+///
+/// `face_index` is a 0-based index into [`ShapeStore::face_ids`].
+pub struct OffsetFaceFeature {
+    pub distance:   f64,
+    pub face_index: usize,
+}
+
+impl OffsetFaceFeature {
+    pub fn new(distance: f64, face_index: usize) -> Self {
+        Self { distance, face_index }
+    }
+}
+
+impl Feature for OffsetFaceFeature {
+    fn name(&self) -> &str { "OffsetFace" }
+    fn input_count(&self) -> usize { 1 }
+
+    fn compute(&self, inputs: &[Arc<ShapeStore>]) -> Result<Arc<ShapeStore>, KernelError> {
+        use brep_topo::entity::{FaceId, VertexId};
+
+        if inputs.len() != 1 {
+            return Err(KernelError::InvalidTopology("OffsetFaceFeature: needs 1 input".into()));
+        }
+        let store = &inputs[0];
+        let solid_id = store.solid_ids().next().ok_or_else(||
+            KernelError::InvalidTopology("OffsetFaceFeature: no solid in input".into()))?;
+
+        let all_faces: Vec<_> = store.face_ids().collect();
+        let fid: FaceId = *all_faces.get(self.face_index).ok_or_else(||
+            KernelError::InvalidTopology("OffsetFaceFeature: face index out of range".into()))?;
+
+        // Compute the face normal and the per-vertex displacement.
+        let verts = store.face_vertices(fid)?;
+        let pts: Vec<Point3> = verts.iter()
+            .map(|&v| Ok(store.vertex(v)?.position))
+            .collect::<Result<_, KernelError>>()?;
+        let n_face = blend_newell(&pts);
+        let offset = n_face * self.distance;
+
+        // The set of vertices belonging to the selected face.
+        let face_vids: HashSet<VertexId> = verts.into_iter().collect();
+
+        // Rebuild all face polygons, translating face-vertex positions.
+        let solid = store.solid(solid_id)?;
+        let shell = store.shell(solid.outer_shell)?;
+        let mut all_polys: Vec<Vec<Point3>> = Vec::new();
+        for &fid in &shell.faces {
+            let vids = store.face_vertices(fid)?;
+            let poly: Vec<Point3> = vids.iter()
+                .map(|&vid| {
+                    let p = store.vertex(vid)?.position;
+                    Ok(if face_vids.contains(&vid) { p + offset } else { p })
+                })
+                .collect::<Result<_, KernelError>>()?;
+            all_polys.push(poly);
+        }
+
+        let mut result = ShapeStore::new();
+        make_solid_from_polygon_faces(&mut result, &all_polys, 1e-9)?;
+        Ok(Arc::new(result))
+    }
+
+    fn parameter_count(&self) -> usize { 1 }
+
+    fn get_parameter(&self, index: usize) -> Option<FeatureParameter> {
+        match index {
+            0 => Some(FeatureParameter { name: "distance",
+                value: FeatureParameterValue::Real(self.distance) }),
+            _ => None,
+        }
+    }
+
+    fn set_parameter(&mut self, index: usize, value: FeatureParameterValue)
+        -> Result<(), KernelError>
+    {
+        match (index, value) {
+            (0, FeatureParameterValue::Real(d)) => { self.distance = d; Ok(()) }
+            _ => Err(KernelError::OperationNotSupported(
+                "OffsetFaceFeature: bad param index".into())),
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -936,6 +1216,117 @@ mod tests {
         // We just check the result is non-trivial.
         assert_eq!(result.face_count(), 6 + steps + 2 * steps,
             "filleted box should have {} faces", 6 + steps + 2 * steps);
+    }
+
+    // ── Phase 10: Shell ───────────────────────────────────────────────────────
+
+    #[test]
+    fn shell_open_top_face_count() {
+        // Box has 6 faces.  Shell with the 0-th face as the opening:
+        //   5 outer + 5 inner + 4 wall quads (one per boundary edge) = 14 faces.
+        let input = make_box_input();
+        let feat = ShellFeature::new(0.1, vec![0]);
+        let result = feat.compute(&[input]).unwrap();
+        assert_eq!(result.face_count(), 14,
+            "shell(1 open) should have 14 faces, got {}", result.face_count());
+    }
+
+    #[test]
+    fn shell_wall_thickness_approx() {
+        // Inner vertices are at distance ≈ t from each adjacent face plane.
+        // For an 8-vertex outer box + 8 offset inner vertices = 16 total.
+        let input = make_box_input();
+        let t = 0.2;
+        let feat = ShellFeature::new(t, vec![0]);
+        let result = feat.compute(&[input]).unwrap();
+        assert!(result.vertex_count() >= 12,
+            "shell should have at least 12 unique vertices, got {}", result.vertex_count());
+    }
+
+    #[test]
+    fn shell_feature_tree_integration() {
+        let mut tree = FeatureTree::new();
+        let fid_box = tree.add_feature(Box::new(
+            ExtrudeFeature::new(square_profile(), Vec3::z(), 4.0)
+        ));
+        let fid_shell = tree.add_feature_with_inputs(
+            Box::new(ShellFeature::new(0.3, vec![0])),
+            vec![fid_box],
+        );
+        let result = tree.evaluate(fid_shell).unwrap();
+        assert_eq!(result.face_count(), 14);
+    }
+
+    #[test]
+    fn shell_dirty_propagation() {
+        let mut tree = FeatureTree::new();
+        let fid_box = tree.add_feature(Box::new(
+            ExtrudeFeature::new(square_profile(), Vec3::z(), 2.0)
+        ));
+        let fid_shell = tree.add_feature_with_inputs(
+            Box::new(ShellFeature::new(0.1, vec![0])),
+            vec![fid_box],
+        );
+        let r1 = tree.evaluate(fid_shell).unwrap();
+        tree.set_parameter(fid_shell, 0, FeatureParameterValue::Real(0.3)).unwrap();
+        let r2 = tree.evaluate(fid_shell).unwrap();
+        assert!(!Arc::ptr_eq(&r1, &r2));
+        // Face count unchanged (14 regardless of thickness).
+        assert_eq!(r1.face_count(), 14);
+        assert_eq!(r2.face_count(), 14);
+    }
+
+    // ── Phase 10: OffsetFace ──────────────────────────────────────────────────
+
+    #[test]
+    fn offset_face_increases_vertex_z() {
+        let input = make_box_input();
+        // Find the face with maximum z (the top face).  For a box extruded 3 units
+        // up, face index 0 should be the bottom cap (z=0) per ExtrudeFeature ordering.
+        // Just pick the face that moves vertices outward along +z.
+        let d = 1.0;
+        let feat = OffsetFaceFeature::new(d, 1); // face index 1 = top cap
+        let result = feat.compute(&[input]).unwrap();
+        // The top face was moved up by d=1.  Max z should now be 3+1=4.
+        let z_max = result.vertex_ids()
+            .map(|v| result.vertex(v).unwrap().position.z)
+            .fold(f64::MIN, f64::max);
+        assert!((z_max - 4.0).abs() < 1e-9,
+            "expected z_max=4 after offset, got {}", z_max);
+    }
+
+    #[test]
+    fn offset_face_preserves_face_count() {
+        let input = make_box_input();
+        let feat = OffsetFaceFeature::new(0.5, 1);
+        let result = feat.compute(&[input]).unwrap();
+        // Moving a face doesn't change the face count.
+        assert_eq!(result.face_count(), 6);
+    }
+
+    #[test]
+    fn offset_face_feature_tree() {
+        let mut tree = FeatureTree::new();
+        let fid_box = tree.add_feature(Box::new(
+            ExtrudeFeature::new(square_profile(), Vec3::z(), 2.0)
+        ));
+        let fid_off = tree.add_feature_with_inputs(
+            Box::new(OffsetFaceFeature::new(1.0, 1)),
+            vec![fid_box],
+        );
+        let r1 = tree.evaluate(fid_off).unwrap();
+        tree.set_parameter(fid_off, 0, FeatureParameterValue::Real(2.0)).unwrap();
+        let r2 = tree.evaluate(fid_off).unwrap();
+        assert!(!Arc::ptr_eq(&r1, &r2));
+        // r1: top at z=3, r2: top at z=4
+        let z_max_r1 = r1.vertex_ids()
+            .map(|v| r1.vertex(v).unwrap().position.z)
+            .fold(f64::MIN, f64::max);
+        let z_max_r2 = r2.vertex_ids()
+            .map(|v| r2.vertex(v).unwrap().position.z)
+            .fold(f64::MIN, f64::max);
+        assert_abs_diff_eq!(z_max_r1, 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(z_max_r2, 4.0, epsilon = 1e-9);
     }
 
     #[test]
