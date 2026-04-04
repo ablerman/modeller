@@ -55,6 +55,7 @@ pub fn from_id_pub<K: slotmap::Key>(id: brep_core::EntityId<impl Sized>) -> K {
 ///
 /// All entities live here; handles (`EntityId<T>`) are valid only within the
 /// `ShapeStore` they were allocated from.  There is no global arena.
+#[derive(Clone)]
 pub struct ShapeStore {
     pub(crate) vertices:   SlotMap<VKey, Vertex>,
     pub(crate) half_edges: SlotMap<HeKey, HalfEdge>,
@@ -102,6 +103,12 @@ impl ShapeStore {
     }
     pub fn vertex_ids(&self) -> impl Iterator<Item = VertexId> + '_ {
         self.vertices.iter().map(|(k, _)| to_id(k))
+    }
+    pub fn solid_ids(&self) -> impl Iterator<Item = SolidId> + '_ {
+        self.solids.iter().map(|(k, _)| to_id(k))
+    }
+    pub fn shell_ids(&self) -> impl Iterator<Item = ShellId> + '_ {
+        self.shells.iter().map(|(k, _)| to_id(k))
     }
 
     // ── Counts ────────────────────────────────────────────────────────────────

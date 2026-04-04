@@ -245,6 +245,156 @@ pub fn make_box(store: &mut ShapeStore, dx: f64, dy: f64, dz: f64)
     Ok(solid_id)
 }
 
+// ── Generic polygon-soup builder ──────────────────────────────────────────────
+
+/// Build a closed solid from a list of planar polygon faces.
+///
+/// Each entry in `faces` is a slice of vertices in **counter-clockwise order
+/// when viewed from outside** (the outward-normal side).  Faces are assumed to
+/// form a closed, consistently-oriented manifold.  Adjacent faces share edges
+/// identified by matching vertex positions within `tol`.
+///
+/// This is the lowest-level builder used by the parametric feature system and
+/// by the boolean result assembler.
+pub fn make_solid_from_polygon_faces(
+    store: &mut ShapeStore,
+    faces: &[Vec<Point3>],
+    tol: f64,
+) -> Result<SolidId, KernelError> {
+    use std::collections::HashMap;
+
+    let crate::euler::MakeSolidShellResult { solid_id, shell_id } = make_solid_shell(store);
+
+    let sentinel_he: HalfEdgeId = EntityId::from_raw(0, 0);
+    let sentinel_e:  EdgeId     = EntityId::from_raw(0, 0);
+    let sentinel_l:  LoopId     = EntityId::from_raw(0, 0);
+
+    // ── Deduplicate vertices ────────────────────────────────────────────────
+    let mut vertex_map: Vec<(Point3, VertexId)> = Vec::new();
+    let mut get_or_insert = |s: &mut ShapeStore, p: Point3| -> VertexId {
+        for &(q, vid) in &vertex_map {
+            if (q - p).norm() < tol {
+                return vid;
+            }
+        }
+        let vid = s.insert_vertex(Vertex::new(p, s.tolerance.linear));
+        vertex_map.push((p, vid));
+        vid
+    };
+
+    // ── Create faces, loops, and half-edges ─────────────────────────────────
+    let mut all_hes: Vec<(HalfEdgeId, VertexId, VertexId)> = Vec::new();
+
+    for face_verts in faces {
+        let n = face_verts.len();
+        if n < 3 { continue; }
+
+        let vids: Vec<VertexId> = face_verts
+            .iter()
+            .map(|&p| get_or_insert(store, p))
+            .collect();
+
+        // Compute face normal (Newell).
+        let normal = newell_normal_prims(face_verts);
+        let u_axis = (face_verts[1] - face_verts[0]).normalize();
+        let v_axis = normal.cross(&u_axis).normalize();
+
+        let surf = SurfaceBinding::new(
+            Arc::new(Plane::new(face_verts[0], u_axis, v_axis)),
+            true,
+        );
+
+        let face_id = store.insert_face(Face {
+            outer_loop:  sentinel_l,
+            inner_loops: smallvec::SmallVec::new(),
+            surface:     surf,
+            orientation: Orientation::Same,
+            shell:       shell_id,
+            tolerance:   store.tolerance.linear,
+        });
+
+        let loop_id = store.insert_loop(Loop {
+            first_half_edge: sentinel_he,
+            loop_kind: LoopKind::Outer,
+            face: face_id,
+        });
+        store.face_mut(face_id)?.outer_loop = loop_id;
+
+        let mut he_ids: Vec<HalfEdgeId> = Vec::with_capacity(n);
+        for i in 0..n {
+            let he_id = store.insert_half_edge(HalfEdge {
+                origin:  vids[i],
+                twin:    sentinel_he,
+                next:    sentinel_he,
+                prev:    sentinel_he,
+                loop_id,
+                edge:    sentinel_e,
+                pcurve:  None,
+            });
+            he_ids.push(he_id);
+        }
+        for i in 0..n {
+            store.half_edge_mut(he_ids[i])?.next = he_ids[(i + 1) % n];
+            store.half_edge_mut(he_ids[i])?.prev = he_ids[(i + n - 1) % n];
+        }
+        store.loop_mut(loop_id)?.first_half_edge = he_ids[0];
+        store.shell_mut(shell_id)?.faces.push(face_id);
+
+        for i in 0..n {
+            all_hes.push((he_ids[i], vids[i], vids[(i + 1) % n]));
+        }
+    }
+
+    // ── Sew: match twins ────────────────────────────────────────────────────
+    let vid_key = |v: VertexId| -> u64 {
+        (v.index() as u64) << 32 | v.generation() as u64
+    };
+    let mut by_endpoints: HashMap<(u64, u64), HalfEdgeId> = HashMap::new();
+    for &(he_id, origin, dest) in &all_hes {
+        by_endpoints.insert((vid_key(origin), vid_key(dest)), he_id);
+    }
+
+    for &(he_id, origin, dest) in &all_hes {
+        let he = store.half_edge(he_id)?;
+        if he.twin != sentinel_he { continue; }
+        let twin_key = (vid_key(dest), vid_key(origin));
+        if let Some(&twin_id) = by_endpoints.get(&twin_key) {
+            if twin_id != he_id {
+                let edge_id = store.insert_edge(Edge {
+                    half_edges: [he_id, twin_id],
+                    curve: None,
+                    tolerance: store.tolerance.linear,
+                    is_degenerate: false,
+                });
+                store.half_edge_mut(he_id)?.twin  = twin_id;
+                store.half_edge_mut(twin_id)?.twin = he_id;
+                store.half_edge_mut(he_id)?.edge   = edge_id;
+                store.half_edge_mut(twin_id)?.edge  = edge_id;
+                let from = store.vertex(origin)?.position;
+                let to   = store.vertex(dest)?.position;
+                attach_line_curve(store, edge_id, from, to)?;
+            }
+        }
+    }
+
+    store.shell_mut(shell_id)?.is_closed = true;
+    Ok(solid_id)
+}
+
+fn newell_normal_prims(pts: &[Point3]) -> Vec3 {
+    let n = pts.len();
+    let (mut nx, mut ny, mut nz) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let a = &pts[i];
+        let b = &pts[(i + 1) % n];
+        nx += (a.y - b.y) * (a.z + b.z);
+        ny += (a.z - b.z) * (a.x + b.x);
+        nz += (a.x - b.x) * (a.y + b.y);
+    }
+    let v = Vec3::new(nx, ny, nz);
+    if v.norm() > 1e-14 { v.normalize() } else { Vec3::z() }
+}
+
 // ── Helpers for curved-surface primitives ────────────────────────────────────
 
 /// Insert a face + outer loop in `shell_id`, returning both ids.
