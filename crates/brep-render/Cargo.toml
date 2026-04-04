@@ -18,7 +18,7 @@ thiserror.workspace = true
 png = "0.17"
 # These are declared directly (not via workspace) because workspace deps
 # cannot be marked optional at the workspace level.
-wgpu = { version = "22", optional = true }
+wgpu = { version = "23", optional = true }
 winit = { version = "0.30", optional = true }
 bytemuck = { version = "1.19", features = ["derive"], optional = true }
 

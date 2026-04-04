@@ -26,6 +26,9 @@
 //! std::fs::write("/tmp/box.png", png).unwrap();
 //! ```
 
+#[cfg(feature = "window")]
+pub mod gpu;
+
 use std::io::Cursor;
 
 use brep_core::{Point3, Vec3};

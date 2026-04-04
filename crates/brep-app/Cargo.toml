@@ -1,0 +1,29 @@
+[package]
+name = "brep-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "brep-app"
+path = "src/main.rs"
+
+[dependencies]
+brep-core.workspace = true
+brep-topo.workspace = true
+brep-algo.workspace = true
+brep-bool.workspace = true
+brep-mesh.workspace = true
+brep-render = { path = "../brep-render", features = ["window"] }
+nalgebra.workspace = true
+
+# Window + GPU
+wgpu = "23"
+winit = "0.30"
+bytemuck = { version = "1.19", features = ["derive"] }
+pollster = "0.3"
+
+# GUI
+egui = "0.30"
+egui-wgpu = "0.30"
+egui-winit = "0.30"

@@ -9,6 +9,7 @@ members = [
     "crates/brep-io",
     "crates/brep-mesh",
     "crates/brep-render",
+    "crates/brep-app",
 ]
 resolver = "2"
 
