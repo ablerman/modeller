@@ -12,6 +12,7 @@
 //! - [`Bvh::nearest_face`] — face whose centroid is closest to a point.
 
 use brep_core::{Aabb, Point3, Vec3};
+use brep_mesh::{tessellate_face, TessellationOptions};
 use brep_topo::entity::FaceId;
 use brep_topo::store::ShapeStore;
 
@@ -56,15 +57,30 @@ impl Bvh {
                 let face = store.face(fid).ok()?;
                 let aabb = face.surface.surface.bounding_box();
                 if aabb.is_empty() {
-                    // Infinite-plane surfaces return empty AABBs; fall back to
-                    // vertex positions.
-                    let verts = store.face_vertices(fid).ok()?;
-                    let mut a = Aabb::empty();
-                    for vid in verts {
-                        if let Ok(v) = store.vertex(vid) {
-                            a.include_point(&v.position);
+                    // Curved/infinite-parameter surfaces return empty AABBs.
+                    // For periodic (curved) faces tessellate to get tight bounds;
+                    // for planar faces fall back to vertex positions.
+                    let a = if face.surface.surface.is_u_periodic() {
+                        let opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
+                        if let Ok(fm) = tessellate_face(store, fid, &opts) {
+                            let mut a = Aabb::empty();
+                            for tri in &fm.triangles {
+                                for p in &tri.positions { a.include_point(p); }
+                            }
+                            a
+                        } else {
+                            Aabb::empty()
                         }
-                    }
+                    } else {
+                        let verts = store.face_vertices(fid).ok()?;
+                        let mut a = Aabb::empty();
+                        for vid in verts {
+                            if let Ok(v) = store.vertex(vid) {
+                                a.include_point(&v.position);
+                            }
+                        }
+                        a
+                    };
                     Some((fid, a))
                 } else {
                     Some((fid, aabb))

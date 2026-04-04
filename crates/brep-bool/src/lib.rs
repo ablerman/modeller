@@ -16,6 +16,7 @@ use brep_algo::{
     bvh::Bvh,
     query::{point_in_solid, PointLocation},
 };
+use brep_mesh::{tessellate_face, TessellationOptions};
 use brep_core::{Aabb, EntityId, KernelError, Point3, Vec3};
 use brep_geom::{
     curve::LineCurve,
@@ -152,17 +153,42 @@ fn collect_pieces(
 ) -> Result<Vec<Piece>, KernelError> {
     let solid  = store.solid(solid_id)?;
     let shell  = store.shell(solid.outer_shell)?;
+    let tess_opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
     let mut pieces = Vec::new();
 
     for &fid in &shell.faces {
-        let verts = store.face_vertices(fid)?;
-        if verts.len() < 3 {
+        let face = store.face(fid)?;
+
+        // Curved (periodic) faces: tessellate into triangles for the boolean pipeline.
+        if face.surface.surface.is_u_periodic() {
+            if let Ok(fm) = tessellate_face(store, fid, &tess_opts) {
+                for tri in fm.triangles {
+                    pieces.push(Piece {
+                        verts: tri.positions.to_vec(),
+                        normal: tri.normal,
+                    });
+                }
+            }
             continue;
         }
+
+        let verts = store.face_vertices(fid)?;
         let positions: Vec<Point3> = verts
             .iter()
             .map(|&vid| store.vertex(vid).map(|v| v.position))
             .collect::<Result<_, _>>()?;
+
+        if positions.len() < 3 {
+            // Degenerate topology (e.g. circular cap with a single seam vertex):
+            // fall back to tessellation.
+            if let Ok(fm) = tessellate_face(store, fid, &tess_opts) {
+                for tri in fm.triangles {
+                    pieces.push(Piece { verts: tri.positions.to_vec(), normal: tri.normal });
+                }
+            }
+            continue;
+        }
+
         let normal = newell_normal(&positions);
         pieces.push(Piece { verts: positions, normal });
     }
@@ -181,27 +207,35 @@ fn split_and_classify(
 ) -> Result<Vec<(Piece, PointLocation)>, KernelError> {
     let other_shell = other_store.shell(other_store.solid(other_solid)?.outer_shell)?;
 
+    let tess_opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
+
     // Precompute planes of all other-solid faces (outward normal, offset d).
-    let other_planes: Vec<(FaceId, Vec3, f64)> = other_shell
-        .faces
-        .iter()
-        .map(|&fid| {
-            let verts = other_store.face_vertices(fid)?;
-            let pos: Vec<Point3> = verts
-                .iter()
-                .map(|&vid| other_store.vertex(vid).map(|v| v.position))
-                .collect::<Result<_, _>>()?;
-            if pos.len() < 3 {
-                return Ok(None);
+    // Curved and degenerate-topology faces are tessellated so we get one plane
+    // per triangle — this gives valid cutting planes for the Sutherland-Hodgman step.
+    let mut other_planes: Vec<(FaceId, Vec3, f64)> = Vec::new();
+    for &fid in &other_shell.faces {
+        let face = other_store.face(fid)?;
+        let verts = other_store.face_vertices(fid)?;
+        let pos: Vec<Point3> = verts
+            .iter()
+            .map(|&vid| other_store.vertex(vid).map(|v| v.position))
+            .collect::<Result<_, _>>()?;
+
+        let needs_tess = face.surface.surface.is_u_periodic() || pos.len() < 3;
+        if needs_tess {
+            if let Ok(fm) = tessellate_face(other_store, fid, &tess_opts) {
+                for tri in &fm.triangles {
+                    let n = tri.normal;
+                    let d = n.dot(&tri.positions[0].coords);
+                    other_planes.push((fid, n, d));
+                }
             }
+        } else {
             let n = newell_normal(&pos);
             let d = n.dot(&pos[0].coords);
-            Ok(Some((fid, n, d)))
-        })
-        .collect::<Result<Vec<_>, KernelError>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+            other_planes.push((fid, n, d));
+        }
+    }
 
     let mut result = Vec::new();
 

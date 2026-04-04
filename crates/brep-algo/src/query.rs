@@ -1,6 +1,7 @@
 //! Geometric queries on [`ShapeStore`]s: point-in-solid, closest face, etc.
 
 use brep_core::{KernelError, Point3, Vec3};
+use brep_mesh::{tessellate_face, TessellationOptions};
 use brep_topo::entity::{FaceId, SolidId};
 use brep_topo::store::ShapeStore;
 
@@ -41,11 +42,28 @@ pub fn point_in_solid(
     let candidate_faces = bvh.intersect_ray(&ray);
     let mut crossings = 0usize;
 
+    let tess_opts = TessellationOptions { chord_tolerance: 0.05, min_segments: 8 };
+
     for fid in candidate_faces {
         // Only count faces belonging to this solid's shell.
         if !shell.faces.contains(&fid) { continue; }
 
-        let _face = store.face(fid)?;
+        let face = store.face(fid)?;
+
+        // For periodic (curved) surfaces, use tessellation for accurate crossing tests.
+        if face.surface.surface.is_u_periodic() {
+            if let Ok(fm) = tessellate_face(store, fid, &tess_opts) {
+                for tri in &fm.triangles {
+                    let pts = &tri.positions;
+                    if ray_polygon_crosses(&ray, pts, &tri.normal) {
+                        crossings += 1;
+                        break; // count at most once per face
+                    }
+                }
+            }
+            continue;
+        }
+
         let verts = store.face_vertices(fid)?;
         if verts.len() < 3 { continue; }
 

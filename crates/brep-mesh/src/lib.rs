@@ -64,7 +64,7 @@ pub fn tessellate(
 
 // ── Face tessellation dispatch ────────────────────────────────────────────────
 
-fn tessellate_face(
+pub fn tessellate_face(
     store: &ShapeStore,
     face_id: FaceId,
     opts: &TessellationOptions,
@@ -214,13 +214,17 @@ fn tessellate_periodic(
     let r_u = surface.du(0.0, v_mid).norm().max(1e-12);
     let n_u = segments_for_chord(r_u, opts.chord_tolerance, opts.min_segments) as usize;
 
-    // N_v: at least 1; scale by v extent relative to chord_tolerance, but cap to keep mesh reasonable.
+    // N_v: segments for an arc of radius r_v subtending v_extent radians.
+    // N ≥ v_extent / (2 arcsin(chord_tol / (2 r_v))).
+    // (segments_for_chord computes this for a full circle, i.e. v_extent = 2π;
+    //  here v_extent may be a partial arc so we use the arc formula directly.)
     let v_extent = (v_max - v_min).abs();
     let r_v = surface.dv(0.0, v_mid).norm().max(1e-12);
     let n_v = if v_extent < 1e-10 {
         1
     } else {
-        segments_for_chord(r_v * (v_extent / 1.0), opts.chord_tolerance, 1) as usize
+        let half_sin = (opts.chord_tolerance / (2.0 * r_v)).min(1.0);
+        ((v_extent / (2.0 * half_sin.asin())).ceil() as u32).max(1) as usize
     }.max(1);
 
     // Build the (n_u × n_v) grid.

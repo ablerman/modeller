@@ -506,7 +506,7 @@ pub fn make_cylinder(store: &mut ShapeStore, radius: f64, height: f64)
     let (_, lat_loop) = insert_face_with_loop(store, shell_id, lat_surf, Orientation::Same)?;
 
     let bot_surf = SurfaceBinding::new(Arc::new(Plane::new(Point3::origin(), Vec3::x(), Vec3::y())), false);
-    let (_, bot_loop) = insert_face_with_loop(store, shell_id, bot_surf, Orientation::Reversed)?;
+    let (_, bot_loop) = insert_face_with_loop(store, shell_id, bot_surf, Orientation::Same)?;
 
     let top_surf = SurfaceBinding::new(Arc::new(Plane::new(Point3::new(0.,0.,height), Vec3::x(), Vec3::y())), true);
     let (_, top_loop) = insert_face_with_loop(store, shell_id, top_surf, Orientation::Same)?;
@@ -616,7 +616,7 @@ pub fn make_cone(store: &mut ShapeStore, radius: f64, height: f64) -> Result<Sol
     let (_, lat_loop) = insert_face_with_loop(store, shell_id, lat_surf, Orientation::Same)?;
 
     let base_surf = SurfaceBinding::new(Arc::new(Plane::new(Point3::origin(), Vec3::x(), Vec3::y())), false);
-    let (_, base_loop) = insert_face_with_loop(store, shell_id, base_surf, Orientation::Reversed)?;
+    let (_, base_loop) = insert_face_with_loop(store, shell_id, base_surf, Orientation::Same)?;
 
     // Five half-edges.
     let he_seam_fwd = insert_he(store, v_apex, lat_loop); // apex→v_base (lateral)

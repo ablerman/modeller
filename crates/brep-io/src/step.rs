@@ -726,7 +726,7 @@ fn parse_step(input: &str) -> Result<(ShapeStore, SolidId), KernelError> {
         let same_sense = attr_enum(same_sense_attr).map(|s| s == "T").unwrap_or(true);
 
         let surface_binding = SurfaceBinding::new(Arc::from(surf), same_sense);
-        let orientation = if same_sense { Orientation::Same } else { Orientation::Reversed };
+        let orientation = Orientation::Same;
 
         let face_id = store.insert_face(Face {
             outer_loop: sentinel_l,

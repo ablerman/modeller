@@ -9,6 +9,7 @@ brep-core.workspace = true
 brep-geom.workspace = true
 brep-topo.workspace = true
 brep-algo.workspace = true
+brep-mesh.workspace = true
 nalgebra.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
