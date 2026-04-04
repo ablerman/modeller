@@ -1,0 +1,16 @@
+[package]
+name = "brep-bool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+brep-core.workspace = true
+brep-geom.workspace = true
+brep-topo.workspace = true
+brep-algo.workspace = true
+nalgebra.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

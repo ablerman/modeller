@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "crates/brep-core",
+    "crates/brep-geom",
+    "crates/brep-topo",
+    "crates/brep-algo",
+    "crates/brep-bool",
+    "crates/brep-param",
+    "crates/brep-io",
+    "crates/brep-mesh",
+    "crates/brep-render",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/placeholder/brep-kernel"
+
+[workspace.dependencies]
+# Math
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+
+# Arena / data structures
+slotmap = { version = "1.0", features = ["serde"] }
+smallvec = { version = "1.13", features = ["serde"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+typetag = "0.2"
+
+# Error handling
+thiserror = "2.0"
+
+# Parsing
+winnow = "0.6"
+
+# Parallelism
+rayon = "1.10"
+
+# Testing utilities
+approx = "0.5"
+
+# Logging / tracing
+tracing = "0.1"
+
+# Rendering deps — declared at workspace level for version pinning only.
+# brep-render uses them as optional deps declared directly in its Cargo.toml.
+
+# Internal crates
+brep-core  = { path = "crates/brep-core" }
+brep-geom  = { path = "crates/brep-geom" }
+brep-topo  = { path = "crates/brep-topo" }
+brep-algo  = { path = "crates/brep-algo" }
+brep-bool  = { path = "crates/brep-bool" }
+brep-mesh  = { path = "crates/brep-mesh" }
