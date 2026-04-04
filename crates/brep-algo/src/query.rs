@@ -53,11 +53,16 @@ pub fn point_in_solid(
             .map(|&vid| store.vertex(vid).map(|v| v.position))
             .collect::<Result<_, _>>()?;
 
-        // Check if the point is close to this face (on-boundary test).
+        // Check if the point is on this face (on-boundary test):
+        // must be on the face plane AND within the face polygon.
         let face_normal = face_plane_normal(&positions);
         let d = face_normal.dot(&(point - positions[0]));
         if d.abs() < tol {
-            return Ok(PointLocation::OnBoundary);
+            // Project point onto face plane and test containment.
+            let projected = *point - face_normal * d;
+            if point_in_polygon(&projected, &positions, &face_normal) {
+                return Ok(PointLocation::OnBoundary);
+            }
         }
 
         // Ray–triangle fan crossing test.
@@ -100,6 +105,17 @@ fn ray_polygon_crosses(ray: &Ray, pts: &[Point3], normal: &Vec3) -> bool {
     // Fan of triangles from pts[0].
     for i in 1..n - 1 {
         if point_in_triangle(&hit, &pts[0], &pts[i], &pts[i + 1], normal) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Test whether `p` lies inside a polygon (fan of triangles from pts[0]).
+fn point_in_polygon(p: &Point3, pts: &[Point3], normal: &Vec3) -> bool {
+    let n = pts.len();
+    for i in 1..n - 1 {
+        if point_in_triangle(p, &pts[0], &pts[i], &pts[i + 1], normal) {
             return true;
         }
     }
