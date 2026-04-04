@@ -11,6 +11,33 @@ use brep_topo::{
     entity::SolidId,
 };
 
+// ── Operation history tree ────────────────────────────────────────────────────
+
+/// Records how an object was produced — forms a tree of operations.
+#[derive(Clone, Debug)]
+pub enum ObjectHistory {
+    Primitive(PrimitiveKind),
+    Boolean {
+        kind: BooleanKind,
+        left:  Box<ObjectHistory>,
+        right: Box<ObjectHistory>,
+    },
+}
+
+impl ObjectHistory {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ObjectHistory::Primitive(PrimitiveKind::Box)      => "Box",
+            ObjectHistory::Primitive(PrimitiveKind::Cylinder) => "Cylinder",
+            ObjectHistory::Primitive(PrimitiveKind::Sphere)   => "Sphere",
+            ObjectHistory::Primitive(PrimitiveKind::Cone)     => "Cone",
+            ObjectHistory::Boolean { kind: BooleanKind::Union,        .. } => "Union",
+            ObjectHistory::Boolean { kind: BooleanKind::Difference,   .. } => "Difference",
+            ObjectHistory::Boolean { kind: BooleanKind::Intersection, .. } => "Intersection",
+        }
+    }
+}
+
 // ── Scene object ──────────────────────────────────────────────────────────────
 
 /// One logical solid in the scene.  Each object owns its own `ShapeStore`.
@@ -19,6 +46,7 @@ pub struct SceneObject {
     pub store: ShapeStore,
     pub solid_id: SolidId,
     pub name: String,
+    pub history: ObjectHistory,
 }
 
 // ── Camera ────────────────────────────────────────────────────────────────────
@@ -270,14 +298,27 @@ impl EditorState {
                             .next()
                             .expect("boolean result has a solid");
                         let name = format!("Bool-{}", self.next_name());
-                        // Remove in reverse order.
+                        // Remove in reverse order, capturing histories first.
                         let (hi, lo) = if a_idx > b_idx { (a_idx, b_idx) } else { (b_idx, a_idx) };
+                        let hi_hist = self.objects[hi].history.clone();
+                        let lo_hist = self.objects[lo].history.clone();
+                        let (left_hist, right_hist) = if a_idx < b_idx {
+                            (lo_hist, hi_hist)
+                        } else {
+                            (hi_hist, lo_hist)
+                        };
                         self.objects.remove(hi);
                         self.objects.remove(lo);
+                        let history = ObjectHistory::Boolean {
+                            kind,
+                            left:  Box::new(left_hist),
+                            right: Box::new(right_hist),
+                        };
                         self.objects.push(SceneObject {
                             store: new_store,
                             solid_id: new_solid,
                             name,
+                            history,
                         });
                         self.selection.clear();
                         self.selection.insert(self.objects.len() - 1);
@@ -346,7 +387,8 @@ impl EditorState {
         };
         if let Ok(solid_id) = result {
             let name = format!("{:?}-{}", kind, self.next_name());
-            self.objects.push(SceneObject { store, solid_id, name });
+            let history = ObjectHistory::Primitive(kind);
+            self.objects.push(SceneObject { store, solid_id, name, history });
         }
     }
 

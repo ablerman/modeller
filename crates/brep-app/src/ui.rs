@@ -3,7 +3,7 @@
 use brep_bool::BooleanKind;
 use egui::Context;
 
-use crate::editor::{EditorState, PrimitiveKind, UiAction};
+use crate::editor::{EditorState, ObjectHistory, PrimitiveKind, UiAction};
 
 /// Render all egui panels.  Returns any actions the user triggered.
 pub fn build_ui(ctx: &Context, editor: &EditorState) -> Vec<UiAction> {
@@ -69,20 +69,26 @@ pub fn build_ui(ctx: &Context, editor: &EditorState) -> Vec<UiAction> {
         });
     });
 
-    // ── Left panel: object list ───────────────────────────────────────────────
-    egui::SidePanel::left("objects").min_width(160.0).show(ctx, |ui| {
+    // ── Left panel: object list (operation tree) ──────────────────────────────
+    egui::SidePanel::left("objects").min_width(180.0).show(ctx, |ui| {
         ui.strong("Objects");
         ui.separator();
         for (i, obj) in editor.objects.iter().enumerate() {
             let selected = editor.selection.contains(&i);
-            let label = egui::SelectableLabel::new(selected, &obj.name);
-            let resp = ui.add(label);
+            // Top-level row: selectable label for the result object.
+            let resp = ui.selectable_label(selected, &obj.name);
             if resp.clicked() {
                 if ui.input(|s| s.modifiers.shift || s.modifiers.ctrl) {
                     actions.push(UiAction::ToggleSelectObject(i));
                 } else {
                     actions.push(UiAction::SelectObject(i));
                 }
+            }
+            // Indented history subtree (only shown for boolean results).
+            if matches!(obj.history, ObjectHistory::Boolean { .. }) {
+                ui.indent(format!("hist_{i}"), |ui| {
+                    show_history(ui, &obj.history);
+                });
             }
         }
         if editor.objects.is_empty() {
@@ -111,4 +117,23 @@ pub fn build_ui(ctx: &Context, editor: &EditorState) -> Vec<UiAction> {
     });
 
     actions
+}
+
+/// Recursively render an operation history node as a collapsible tree.
+fn show_history(ui: &mut egui::Ui, node: &ObjectHistory) {
+    match node {
+        ObjectHistory::Primitive(_) => {
+            ui.label(
+                egui::RichText::new(node.label())
+                    .weak()
+                    .italics(),
+            );
+        }
+        ObjectHistory::Boolean { left, right, .. } => {
+            ui.collapsing(node.label(), |ui| {
+                show_history(ui, left);
+                show_history(ui, right);
+            });
+        }
+    }
 }
