@@ -271,6 +271,18 @@ impl Surface for SphericalSurface {
         Ok(n)
     }
 
+    fn closest_parameter(&self, pt: &Point3, _tol: f64) -> Result<(f64, f64), KernelError> {
+        let prel = pt - self.center;
+        let x = prel.dot(&self.x_axis);
+        let y = prel.dot(&self.y_axis);
+        let z = prel.dot(&self.z_axis);
+        let u = f64::atan2(y, x);
+        let u = if u < 0.0 { u + TAU } else { u };
+        let r_xy = (x * x + y * y).sqrt();
+        let v = f64::atan2(z, r_xy);
+        Ok((u, v))
+    }
+
     fn transformed(&self, iso: &Iso3) -> Box<dyn Surface> {
         Box::new(SphericalSurface {
             center: iso.transform_point(&self.center),

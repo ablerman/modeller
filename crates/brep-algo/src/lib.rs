@@ -1,2 +1,5 @@
-//! `brep-algo` — geometric algorithms: intersection, BVH, closest-point.
-//! Not yet implemented — Phase 4 of the roadmap.
+//! `brep-algo` — geometric algorithms: BVH, intersection, closest-point.
+
+pub mod bvh;
+pub mod intersect;
+pub mod query;
