@@ -8,6 +8,8 @@ mod ui;
 
 use std::sync::Arc;
 
+use brep_algo::bvh::Ray;
+use brep_core::{Point3, Vec3};
 use brep_render::gpu::GpuRenderer;
 use editor::{EditorState, UiAction};
 use egui_wgpu::ScreenDescriptor;
@@ -61,6 +63,8 @@ struct AppState {
     last_cursor: Option<(f32, f32)>,
     /// Position where mouse button was first pressed (for click-vs-drag detection).
     mouse_press_origin: Option<(f32, f32)>,
+    /// Current cursor position projected onto the active sketch plane (if in sketch mode).
+    sketch_cursor: Option<Point3>,
 }
 
 impl AppState {
@@ -153,6 +157,7 @@ impl AppState {
             mouse_pressed: None,
             last_cursor: None,
             mouse_press_origin: None,
+            sketch_cursor: None,
         }
     }
 
@@ -256,8 +261,10 @@ impl AppState {
         let egui_ctx = self.egui_ctx.clone();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut actions: Vec<UiAction> = Vec::new();
+        let sketch_cursor = self.sketch_cursor;
+        let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -325,6 +332,16 @@ impl AppState {
 
         Ok(())
     }
+}
+
+// ── Sketch helpers ────────────────────────────────────────────────────────────
+
+fn ray_plane_intersect(ray: &Ray, plane_origin: &Point3, plane_normal: &Vec3) -> Option<Point3> {
+    let denom = ray.direction.dot(plane_normal);
+    if denom.abs() < 1e-12 { return None; }
+    let t = (plane_origin - ray.origin).dot(plane_normal) / denom;
+    if t < 0.0 { return None; }
+    Some(ray.at(t))
 }
 
 // ── winit ApplicationHandler ──────────────────────────────────────────────────
@@ -406,9 +423,16 @@ impl ApplicationHandler for App {
                                     _ => false,
                                 };
                                 if is_click {
-                                    if let Some(cur) = state.last_cursor {
+                                    if let Some(_cur) = state.last_cursor {
                                         let w = state.surface_config.width;
                                         let h = state.surface_config.height;
+                                        if state.editor.sketch.is_some() {
+                                            // In sketch mode: place a vertex on the workplane.
+                                            if let Some(p) = state.sketch_cursor {
+                                                state.editor.apply(UiAction::SketchAddPoint(p));
+                                            }
+                                        } else {
+                                        let cur = _cur;
                                         let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
                                         if let Some(idx) = state.editor.pick_at_screen(cur.0, cur.1, w, h) {
                                             if shift {
@@ -421,6 +445,7 @@ impl ApplicationHandler for App {
                                             state.editor.apply(UiAction::ClearSelection);
                                             state.editor.scene_dirty = true;
                                         }
+                                        } // end else (not in sketch mode)
                                     }
                                 }
                             }
@@ -452,6 +477,16 @@ impl ApplicationHandler for App {
                     }
                 }
                 state.last_cursor = Some(cur);
+
+                // Update sketch cursor: project mouse ray onto the sketch plane.
+                if let Some(sk) = &state.editor.sketch {
+                    let w = state.surface_config.width;
+                    let h = state.surface_config.height;
+                    let ray = state.editor.camera.unproject_ray(cur.0, cur.1, w, h);
+                    state.sketch_cursor = ray_plane_intersect(&ray, &sk.plane.origin(), &sk.plane.normal());
+                } else {
+                    state.sketch_cursor = None;
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {

@@ -1,71 +1,133 @@
 //! egui panel layout: toolbar, object list, properties.
 
 use brep_bool::BooleanKind;
+use brep_core::Point3;
 use egui::Context;
 
-use crate::editor::{EditorState, ObjectHistory, PrimitiveKind, UiAction};
+use crate::editor::{EditorState, ObjectHistory, PrimitiveKind, SketchPlane, UiAction};
 
 /// Render all egui panels.  Returns any actions the user triggered.
-pub fn build_ui(ctx: &Context, editor: &EditorState) -> Vec<UiAction> {
+pub fn build_ui(
+    ctx: &Context,
+    editor: &EditorState,
+    viewport: (u32, u32),
+    sketch_cursor: Option<Point3>,
+) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
     // ── Top toolbar ───────────────────────────────────────────────────────────
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.strong("Add:");
-            if ui.button("Box").clicked() {
-                actions.push(UiAction::AddPrimitive(PrimitiveKind::Box));
+            if let Some(sk) = &editor.sketch {
+                // ── Sketch toolbar ────────────────────────────────────────────
+                ui.label(
+                    egui::RichText::new(format!("● Sketch  ({:?} plane)", sk.plane))
+                        .color(egui::Color32::from_rgb(100, 200, 255))
+                        .strong(),
+                );
+                ui.label(format!("{} pts", sk.points.len()));
+                ui.separator();
+
+                if ui.button("Undo pt").clicked() {
+                    actions.push(UiAction::SketchUndoPoint);
+                }
+                ui.add_enabled_ui(sk.points.len() >= 3 && !sk.closed, |ui| {
+                    if ui.button("Close Loop").clicked() {
+                        actions.push(UiAction::SketchClose);
+                    }
+                });
+
+                if sk.closed {
+                    ui.separator();
+                    let mut d = sk.extrude_dist;
+                    if ui.add(
+                        egui::DragValue::new(&mut d)
+                            .speed(0.05)
+                            .range(0.001..=1000.0)
+                            .suffix(" u"),
+                    ).changed() {
+                        actions.push(UiAction::SketchSetDistance(d));
+                    }
+                    if ui.button("Extrude").clicked() {
+                        actions.push(UiAction::SketchExtrude(sk.extrude_dist));
+                    }
+                }
+
+                ui.separator();
+                if ui.button("✕ Cancel").clicked() {
+                    actions.push(UiAction::ExitSketch);
+                }
+            } else {
+                // ── Normal toolbar ────────────────────────────────────────────
+                ui.strong("Add:");
+                if ui.button("Box").clicked() {
+                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Box));
+                }
+                if ui.button("Cylinder").clicked() {
+                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Cylinder));
+                }
+                if ui.button("Sphere").clicked() {
+                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Sphere));
+                }
+                if ui.button("Cone").clicked() {
+                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Cone));
+                }
+
+                ui.separator();
+                ui.menu_button("Sketch ▾", |ui| {
+                    for (label, plane) in [
+                        ("XY Plane", SketchPlane::XY),
+                        ("XZ Plane", SketchPlane::XZ),
+                        ("YZ Plane", SketchPlane::YZ),
+                    ] {
+                        if ui.button(label).clicked() {
+                            actions.push(UiAction::EnterSketch(plane));
+                            ui.close_menu();
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.strong("Boolean:");
+
+                let two_sel = editor.selection.len() == 2;
+                ui.add_enabled_ui(two_sel, |ui| {
+                    if ui.button("Union").clicked() {
+                        actions.push(UiAction::BooleanOp(BooleanKind::Union));
+                    }
+                    if ui.button("Difference").clicked() {
+                        actions.push(UiAction::BooleanOp(BooleanKind::Difference));
+                    }
+                    if ui.button("Intersection").clicked() {
+                        actions.push(UiAction::BooleanOp(BooleanKind::Intersection));
+                    }
+                });
+
+                ui.separator();
+
+                let can_delete = !editor.selection.is_empty();
+                ui.add_enabled_ui(can_delete, |ui| {
+                    if ui.button("Delete").clicked() {
+                        actions.push(UiAction::DeleteSelected);
+                    }
+                });
+
+                ui.separator();
+
+                ui.add_enabled_ui(editor.history.can_undo(), |ui| {
+                    if ui.button("Undo").clicked() {
+                        actions.push(UiAction::Undo);
+                    }
+                });
+                ui.add_enabled_ui(editor.history.can_redo(), |ui| {
+                    if ui.button("Redo").clicked() {
+                        actions.push(UiAction::Redo);
+                    }
+                });
+
+                ui.separator();
+                ui.label("Drag: orbit  |  Shift+drag: pan  |  Scroll: zoom");
             }
-            if ui.button("Cylinder").clicked() {
-                actions.push(UiAction::AddPrimitive(PrimitiveKind::Cylinder));
-            }
-            if ui.button("Sphere").clicked() {
-                actions.push(UiAction::AddPrimitive(PrimitiveKind::Sphere));
-            }
-            if ui.button("Cone").clicked() {
-                actions.push(UiAction::AddPrimitive(PrimitiveKind::Cone));
-            }
-
-            ui.separator();
-            ui.strong("Boolean:");
-
-            let two_sel = editor.selection.len() == 2;
-            ui.add_enabled_ui(two_sel, |ui| {
-                if ui.button("Union").clicked() {
-                    actions.push(UiAction::BooleanOp(BooleanKind::Union));
-                }
-                if ui.button("Difference").clicked() {
-                    actions.push(UiAction::BooleanOp(BooleanKind::Difference));
-                }
-                if ui.button("Intersection").clicked() {
-                    actions.push(UiAction::BooleanOp(BooleanKind::Intersection));
-                }
-            });
-
-            ui.separator();
-
-            let can_delete = !editor.selection.is_empty();
-            ui.add_enabled_ui(can_delete, |ui| {
-                if ui.button("Delete").clicked() {
-                    actions.push(UiAction::DeleteSelected);
-                }
-            });
-
-            ui.separator();
-
-            ui.add_enabled_ui(editor.history.can_undo(), |ui| {
-                if ui.button("Undo").clicked() {
-                    actions.push(UiAction::Undo);
-                }
-            });
-            ui.add_enabled_ui(editor.history.can_redo(), |ui| {
-                if ui.button("Redo").clicked() {
-                    actions.push(UiAction::Redo);
-                }
-            });
-
-            ui.separator();
-            ui.label("Drag: orbit  |  Shift+drag: pan  |  Scroll: zoom");
         });
     });
 
@@ -122,6 +184,60 @@ pub fn build_ui(ctx: &Context, editor: &EditorState) -> Vec<UiAction> {
     // ── Orientation cube gizmo (top-right, draggable) ─────────────────────────
     if let Some(snap) = draw_orientation_cube(ctx, editor) {
         actions.push(snap);
+    }
+
+    // ── Sketch overlay ────────────────────────────────────────────────────────
+    if let Some(sk) = &editor.sketch {
+        let (w, h) = viewport;
+        let cam = &editor.camera;
+        let painter = ctx.layer_painter(
+            egui::LayerId::new(egui::Order::Background, "sketch_overlay".into()),
+        );
+
+        let proj = |p: Point3| -> Option<egui::Pos2> {
+            cam.project_to_screen(p, w, h).map(|(x, y)| egui::pos2(x, y))
+        };
+
+        let edge_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255));
+        let preview_stroke = egui::Stroke::new(
+            1.5,
+            egui::Color32::from_rgba_unmultiplied(200, 230, 255, 140),
+        );
+
+        // Draw placed edges.
+        for i in 0..sk.points.len().saturating_sub(1) {
+            if let (Some(a), Some(b)) = (proj(sk.points[i]), proj(sk.points[i + 1])) {
+                painter.line_segment([a, b], edge_stroke);
+            }
+        }
+        // Closing edge (if loop is closed).
+        if sk.closed && sk.points.len() >= 2 {
+            if let (Some(a), Some(b)) = (proj(*sk.points.last().unwrap()), proj(sk.points[0])) {
+                painter.line_segment([a, b], edge_stroke);
+            }
+        }
+        // Preview line from last placed point to cursor.
+        if !sk.closed {
+            if let Some(last) = sk.points.last() {
+                if let Some(cursor_world) = sketch_cursor {
+                    if let (Some(a), Some(b)) = (proj(*last), proj(cursor_world)) {
+                        painter.line_segment([a, b], preview_stroke);
+                    }
+                }
+            }
+        }
+        // Vertex dots.
+        for &pt in &sk.points {
+            if let Some(p) = proj(pt) {
+                painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+            }
+        }
+        // Cursor dot.
+        if let Some(c) = sketch_cursor {
+            if let Some(p) = proj(c) {
+                painter.circle_filled(p, 3.0, egui::Color32::WHITE);
+            }
+        }
     }
 
     actions
@@ -385,7 +501,7 @@ fn point_in_polygon2d(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
 /// Recursively render an operation history node as a collapsible tree.
 fn show_history(ui: &mut egui::Ui, node: &ObjectHistory) {
     match node {
-        ObjectHistory::Primitive(_) => {
+        ObjectHistory::Primitive(_) | ObjectHistory::Sketch { .. } => {
             ui.label(
                 egui::RichText::new(node.label())
                     .weak()

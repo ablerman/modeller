@@ -18,6 +18,7 @@ use brep_topo::{
 #[derive(Clone, Debug)]
 pub enum ObjectHistory {
     Primitive(PrimitiveKind),
+    Sketch { plane: SketchPlane },
     Boolean {
         kind: BooleanKind,
         left:  Box<ObjectHistory>,
@@ -32,11 +33,34 @@ impl ObjectHistory {
             ObjectHistory::Primitive(PrimitiveKind::Cylinder) => "Cylinder",
             ObjectHistory::Primitive(PrimitiveKind::Sphere)   => "Sphere",
             ObjectHistory::Primitive(PrimitiveKind::Cone)     => "Cone",
+            ObjectHistory::Sketch { .. }                      => "Sketch",
             ObjectHistory::Boolean { kind: BooleanKind::Union,        .. } => "Union",
             ObjectHistory::Boolean { kind: BooleanKind::Difference,   .. } => "Difference",
             ObjectHistory::Boolean { kind: BooleanKind::Intersection, .. } => "Intersection",
         }
     }
+}
+
+// ── Sketch ────────────────────────────────────────────────────────────────────
+
+/// Which principal plane the sketch lives on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SketchPlane { XY, XZ, YZ }
+
+impl SketchPlane {
+    pub fn normal(self) -> Vec3 {
+        match self { SketchPlane::XY => Vec3::z(), SketchPlane::XZ => Vec3::y(), SketchPlane::YZ => Vec3::x() }
+    }
+    pub fn origin(self) -> Point3 { Point3::origin() }
+}
+
+/// Live in-progress 2D sketch being drawn by the user.
+#[derive(Clone, Debug)]
+pub struct SketchState {
+    pub plane:         SketchPlane,
+    pub points:        Vec<Point3>,  // world-space vertices on the plane (placed in order)
+    pub closed:        bool,
+    pub extrude_dist:  f64,
 }
 
 // ── Scene object ──────────────────────────────────────────────────────────────
@@ -171,6 +195,39 @@ impl ViewportCamera {
 
         Ray::new(eye, direction)
     }
+
+    /// Project a world-space point to pixel coordinates `(x, y)` from the top-left.
+    /// Returns `None` if the point is behind the camera.
+    pub fn project_to_screen(&self, pt: Point3, w: u32, h: u32) -> Option<(f32, f32)> {
+        use nalgebra::{Matrix4, Vector4};
+        let eye = self.eye();
+        let f = (self.target - eye).normalize();
+        let right = f.cross(&Vec3::z()).normalize();
+        let up_cam = right.cross(&f);
+        let view = Matrix4::new(
+             right.x,  right.y,  right.z, -right.dot(&eye.coords),
+             up_cam.x, up_cam.y, up_cam.z, -up_cam.dot(&eye.coords),
+            -f.x, -f.y, -f.z,  f.dot(&eye.coords),
+             0.0,  0.0,  0.0,  1.0,
+        );
+        let aspect = w as f64 / h as f64;
+        let fc = 1.0 / (self.fov_y_deg.to_radians() * 0.5).tan();
+        let (near, far) = (0.05, 1000.0_f64);
+        let proj = Matrix4::new(
+            fc / aspect, 0.0,  0.0,                   0.0,
+            0.0,         fc,   0.0,                   0.0,
+            0.0,         0.0,  far / (near - far),     (far * near) / (near - far),
+            0.0,         0.0, -1.0,                    0.0,
+        );
+        let clip = proj * view * Vector4::new(pt.x, pt.y, pt.z, 1.0);
+        if clip.w <= 0.0 { return None; }
+        let nx = clip.x / clip.w;
+        let ny = clip.y / clip.w;
+        Some((
+            ((nx + 1.0) * 0.5 * w as f64) as f32,
+            ((1.0 - ny) * 0.5 * h as f64) as f32,
+        ))
+    }
 }
 
 // ── Undo/redo ─────────────────────────────────────────────────────────────────
@@ -244,6 +301,14 @@ pub enum UiAction {
     SnapCamera { azimuth: f64, elevation: f64 },
     /// Orbit the camera by screen-space pixel deltas (from the gizmo drag).
     OrbitCamera { dx: f32, dy: f32 },
+    // ── Sketch actions ────────────────────────────────────────────────────────
+    EnterSketch(SketchPlane),
+    ExitSketch,
+    SketchAddPoint(Point3),
+    SketchUndoPoint,
+    SketchClose,
+    SketchSetDistance(f64),
+    SketchExtrude(f64),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -279,6 +344,8 @@ pub struct EditorState {
     pub scene_dirty: bool,
     /// In-progress camera snap animation, if any.
     camera_anim: Option<CameraAnimation>,
+    /// Active sketch being drawn, if any.
+    pub sketch: Option<SketchState>,
 }
 
 impl EditorState {
@@ -292,6 +359,7 @@ impl EditorState {
             next_object_id: 0,
             scene_dirty: true,
             camera_anim: None,
+            sketch: None,
         };
         // Start with a default box so the viewport isn't empty.
         s.add_primitive(PrimitiveKind::Box);
@@ -428,6 +496,74 @@ impl EditorState {
             UiAction::OrbitCamera { dx, dy } => {
                 self.camera.orbit(dx, dy);
                 false
+            }
+
+            // ── Sketch ────────────────────────────────────────────────────────
+            UiAction::EnterSketch(plane) => {
+                self.sketch = Some(SketchState {
+                    plane,
+                    points: Vec::new(),
+                    closed: false,
+                    extrude_dist: 1.0,
+                });
+                self.selection.clear();
+                false
+            }
+            UiAction::ExitSketch => {
+                self.sketch = None;
+                false
+            }
+            UiAction::SketchAddPoint(p) => {
+                if let Some(sk) = &mut self.sketch {
+                    if !sk.closed { sk.points.push(p); }
+                }
+                false
+            }
+            UiAction::SketchUndoPoint => {
+                if let Some(sk) = &mut self.sketch {
+                    if sk.closed { sk.closed = false; } else { sk.points.pop(); }
+                }
+                false
+            }
+            UiAction::SketchClose => {
+                if let Some(sk) = &mut self.sketch {
+                    if sk.points.len() >= 3 { sk.closed = true; }
+                }
+                false
+            }
+            UiAction::SketchSetDistance(d) => {
+                if let Some(sk) = &mut self.sketch { sk.extrude_dist = d; }
+                false
+            }
+            UiAction::SketchExtrude(dist) => {
+                let Some(sk) = self.sketch.take() else { return false };
+                if sk.points.len() < 3 { self.sketch = None; return false; }
+                use brep_param::{ExtrudeFeature, Feature};
+                use std::sync::Arc;
+                let feature = ExtrudeFeature {
+                    profile: sk.points,
+                    direction: sk.plane.normal(),
+                    distance: dist,
+                };
+                if let Ok(store_arc) = feature.compute(&[]) {
+                    let store: brep_topo::store::ShapeStore =
+                        Arc::try_unwrap(store_arc).unwrap_or_else(|a| (*a).clone());
+                    let solid_id = store.solid_ids().next().expect("extruded solid");
+                    let name = format!("Sketch-{}", self.next_name());
+                    let id = self.alloc_id();
+                    self.save_snapshot();
+                    self.objects.push(SceneObject {
+                        store,
+                        solid_id,
+                        name,
+                        history: ObjectHistory::Sketch { plane: sk.plane },
+                        id,
+                    });
+                    self.selection.clear();
+                    self.selection.insert(self.objects.len() - 1);
+                    self.scene_dirty = true;
+                }
+                true
             }
         }
     }

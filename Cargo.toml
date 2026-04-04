@@ -59,3 +59,4 @@ brep-topo  = { path = "crates/brep-topo" }
 brep-algo  = { path = "crates/brep-algo" }
 brep-bool  = { path = "crates/brep-bool" }
 brep-mesh  = { path = "crates/brep-mesh" }
+brep-param = { path = "crates/brep-param" }
