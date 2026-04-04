@@ -159,39 +159,21 @@ impl ViewportCamera {
     ///
     /// `(screen_x, screen_y)` are pixel coordinates from the top-left.
     pub fn unproject_ray(&self, screen_x: f32, screen_y: f32, w: u32, h: u32) -> Ray {
-        // NDC xy in [-1, 1].
+        // NDC in [-1, 1]: right/up are positive.
         let ndc_x = 2.0 * screen_x as f64 / w as f64 - 1.0;
         let ndc_y = 1.0 - 2.0 * screen_y as f64 / h as f64;
 
-        // Inverse of the view-projection matrix.
-        use nalgebra::Matrix4;
-        let eye = self.eye();
-        let f = (self.target - eye).normalize();
-        let right = f.cross(&Vec3::z()).normalize();
-        let up_cam = right.cross(&f);
+        let eye    = self.eye();
+        let f      = (self.target - eye).normalize();   // forward (into scene)
+        let right  = f.cross(&Vec3::z()).normalize();   // screen right
+        let up_cam = right.cross(&f);                   // screen up
 
-        let view = Matrix4::new(
-             right.x,  right.y,  right.z, -right.dot(&eye.coords),
-             up_cam.x, up_cam.y, up_cam.z, -up_cam.dot(&eye.coords),
-            -f.x, -f.y, -f.z,  f.dot(&eye.coords),
-             0.0,  0.0,  0.0,  1.0,
-        );
-        let aspect = w as f64 / h as f64;
-        let fov = self.fov_y_deg.to_radians();
-        let fc = 1.0 / (fov * 0.5).tan();
-        let proj = Matrix4::new(
-            fc / aspect, 0.0, 0.0, 0.0,
-            0.0, fc, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0, // simplified: not using far/near here, just direction
-            0.0, 0.0, -1.0, 0.0,
-        );
-        let inv_vp = (proj * view).try_inverse().unwrap_or(Matrix4::identity());
-
-        // Unproject point at near plane (w = 1 in clip space for eye at origin).
-        let clip = nalgebra::Vector4::new(ndc_x, ndc_y, -1.0, 1.0);
-        let world_h = inv_vp * clip;
-        let world = Point3::new(world_h.x / world_h.w, world_h.y / world_h.w, world_h.z / world_h.w);
-        let direction = (world - eye).normalize();
+        // Analytical perspective unproject — no matrix inversion needed.
+        // Ray at NDC (nx, ny) goes through camera-space point (nx·tan_x, ny·tan_y, -1).
+        let aspect  = w as f64 / h as f64;
+        let half_tan = (self.fov_y_deg.to_radians() * 0.5).tan(); // tan(fov_y/2)
+        let direction = (f + ndc_x * aspect * half_tan * right + ndc_y * half_tan * up_cam)
+            .normalize();
 
         Ray::new(eye, direction)
     }
@@ -507,6 +489,20 @@ impl EditorState {
                     extrude_dist: 1.0,
                 });
                 self.selection.clear();
+                // Animate the camera to look at the chosen plane.
+                let (az, el) = match plane {
+                    SketchPlane::XY => (self.camera.azimuth, PI / 2.0 - 0.05),
+                    SketchPlane::XZ => (-PI / 2.0, 0.0),
+                    SketchPlane::YZ => (0.0, 0.0),
+                };
+                self.camera_anim = Some(CameraAnimation {
+                    start_az:  self.camera.azimuth,
+                    start_el:  self.camera.elevation,
+                    target_az: az,
+                    target_el: el,
+                    started:   Instant::now(),
+                    duration:  0.3,
+                });
                 false
             }
             UiAction::ExitSketch => {

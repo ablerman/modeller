@@ -194,8 +194,10 @@ pub fn build_ui(
             egui::LayerId::new(egui::Order::Background, "sketch_overlay".into()),
         );
 
+        // project_to_screen returns physical pixel coords; egui painter uses logical points.
+        let ppp = ctx.pixels_per_point();
         let proj = |p: Point3| -> Option<egui::Pos2> {
-            cam.project_to_screen(p, w, h).map(|(x, y)| egui::pos2(x, y))
+            cam.project_to_screen(p, w, h).map(|(x, y)| egui::pos2(x / ppp, y / ppp))
         };
 
         let edge_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255));
@@ -501,9 +503,12 @@ fn point_in_polygon2d(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
 /// Recursively render an operation history node as a collapsible tree.
 fn show_history(ui: &mut egui::Ui, node: &ObjectHistory) {
     match node {
-        ObjectHistory::Primitive(_) | ObjectHistory::Sketch { .. } => {
+        ObjectHistory::Primitive(_) => {
+            ui.label(egui::RichText::new(node.label()).weak().italics());
+        }
+        ObjectHistory::Sketch { plane } => {
             ui.label(
-                egui::RichText::new(node.label())
+                egui::RichText::new(format!("Sketch ({plane:?})"))
                     .weak()
                     .italics(),
             );
