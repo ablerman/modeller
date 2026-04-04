@@ -227,22 +227,87 @@ impl GpuRenderer {
             min_segments: 16,
         };
         let face_meshes = tessellate(store, &opts).unwrap_or_default();
-        let mut verts: Vec<GpuVertex> = Vec::new();
+
+        // ── Collect flat triangle soup ────────────────────────────────────────
+        struct RawVert { pos: [f32; 3], flat_n: [f32; 3] }
+        let mut raw: Vec<RawVert> = Vec::new();
         for fm in &face_meshes {
             for tri in &fm.triangles {
+                let n = tri.normal;
+                let nf = [n.x as f32, n.y as f32, n.z as f32];
                 for i in 0..3 {
                     let p = tri.positions[i];
-                    let n = tri.normal;
-                    verts.push(GpuVertex {
-                        position: [p.x as f32, p.y as f32, p.z as f32],
-                        _pad0: 0.0,
-                        normal: [n.x as f32, n.y as f32, n.z as f32],
-                        _pad1: 0.0,
-                        color: base_color,
-                        _pad2: 0.0,
+                    raw.push(RawVert {
+                        pos: [p.x as f32, p.y as f32, p.z as f32],
+                        flat_n: nf,
                     });
                 }
             }
+        }
+
+        // ── Compute smooth per-vertex normals with crease-angle ───────────────
+        // cos(40°) ≈ 0.766 — hard edges sharper than 40° stay crisp.
+        const CREASE_COS: f32 = 0.766;
+        // Grid cell size: coarser than the weld distance so neighbours always
+        // land in at most 2^3 = 8 adjacent cells.
+        const CELL: f32 = 0.01;
+
+        // Build a spatial hash: cell key → list of vertex indices.
+        let cell_key = |pos: &[f32; 3]| -> (i32, i32, i32) {
+            (
+                (pos[0] / CELL).floor() as i32,
+                (pos[1] / CELL).floor() as i32,
+                (pos[2] / CELL).floor() as i32,
+            )
+        };
+        let mut grid: std::collections::HashMap<(i32,i32,i32), Vec<usize>> =
+            std::collections::HashMap::with_capacity(raw.len());
+        for (i, rv) in raw.iter().enumerate() {
+            grid.entry(cell_key(&rv.pos)).or_default().push(i);
+        }
+
+        let smooth_normals: Vec<[f32; 3]> = raw
+            .iter()
+            .map(|v| {
+                let (cx, cy, cz) = cell_key(&v.pos);
+                let mut sum = v.flat_n;
+                // Check the 3×3×3 neighbourhood of cells.
+                for dx in -1i32..=1 {
+                for dy in -1i32..=1 {
+                for dz in -1i32..=1 {
+                    let Some(bucket) = grid.get(&(cx+dx, cy+dy, cz+dz)) else { continue };
+                    for &j in bucket {
+                        let other = &raw[j];
+                        // Same position?
+                        let ex = v.pos[0] - other.pos[0];
+                        let ey = v.pos[1] - other.pos[1];
+                        let ez = v.pos[2] - other.pos[2];
+                        if ex*ex + ey*ey + ez*ez > CELL * CELL * 0.01 { continue; }
+                        // Within crease angle?
+                        let dot = v.flat_n[0]*other.flat_n[0]
+                                + v.flat_n[1]*other.flat_n[1]
+                                + v.flat_n[2]*other.flat_n[2];
+                        if dot < CREASE_COS { continue; }
+                        sum[0] += other.flat_n[0];
+                        sum[1] += other.flat_n[1];
+                        sum[2] += other.flat_n[2];
+                    }
+                }}}
+                let len = (sum[0]*sum[0] + sum[1]*sum[1] + sum[2]*sum[2]).sqrt().max(1e-12);
+                [sum[0]/len, sum[1]/len, sum[2]/len]
+            })
+            .collect();
+
+        let mut verts: Vec<GpuVertex> = Vec::with_capacity(raw.len());
+        for (rv, sn) in raw.iter().zip(smooth_normals.iter()) {
+            verts.push(GpuVertex {
+                position: rv.pos,
+                _pad0: 0.0,
+                normal: *sn,
+                _pad1: 0.0,
+                color: base_color,
+                _pad2: 0.0,
+            });
         }
 
         let vertex_count = verts.len() as u32;

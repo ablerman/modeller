@@ -1,6 +1,7 @@
 //! Editor state: scene objects, selection, camera, undo/redo.
 
 use std::f64::consts::PI;
+use std::time::Instant;
 
 use brep_algo::bvh::{Bvh, Ray};
 use brep_bool::{boolean_op, BooleanKind};
@@ -107,8 +108,25 @@ impl ViewportCamera {
     }
 
     /// Zoom by a scroll delta (positive = zoom in).
-    pub fn zoom(&mut self, delta: f32) {
-        self.distance = (self.distance * (1.0 - delta as f64 * 0.1)).clamp(0.1, 10_000.0);
+    ///
+    /// If `cursor_ray` is provided, the target drifts toward the point on the
+    /// ray at the current distance so that the geometry under the cursor stays
+    /// roughly fixed.
+    pub fn zoom(&mut self, delta: f32, cursor_ray: Option<&brep_algo::bvh::Ray>) {
+        let factor = 1.0 - delta as f64 * 0.1;
+        let new_dist = (self.distance * factor).clamp(0.1, 10_000.0);
+        let dist_delta = self.distance - new_dist; // positive when zooming in
+
+        if let Some(ray) = cursor_ray {
+            // Point on the cursor ray at the current eye distance.
+            let focus = ray.at(self.distance);
+            // Shift target by the fraction of the distance change, in the
+            // direction from target toward the cursor focus point.
+            let shift = (focus - self.target) * (dist_delta / self.distance);
+            self.target += shift;
+        }
+
+        self.distance = new_dist;
     }
 
     /// Unproject a screen pixel into a world-space ray.
@@ -220,6 +238,27 @@ pub enum UiAction {
     ClearSelection,
     Undo,
     Redo,
+    /// Snap the camera to look along `dir` with `up` as the up vector.
+    SnapCamera { azimuth: f64, elevation: f64 },
+    /// Orbit the camera by screen-space pixel deltas (from the gizmo drag).
+    OrbitCamera { dx: f32, dy: f32 },
+}
+
+// ── Camera animation ──────────────────────────────────────────────────────────
+
+struct CameraAnimation {
+    start_az:  f64,
+    start_el:  f64,
+    target_az: f64,
+    target_el: f64,
+    started:   Instant,
+    /// Duration in seconds.
+    duration:  f64,
+}
+
+fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 // ── EditorState ───────────────────────────────────────────────────────────────
@@ -234,6 +273,8 @@ pub struct EditorState {
     name_counter: u32,
     /// Set to `true` whenever objects change, so meshes can be re-uploaded.
     pub scene_dirty: bool,
+    /// In-progress camera snap animation, if any.
+    camera_anim: Option<CameraAnimation>,
 }
 
 impl EditorState {
@@ -245,6 +286,7 @@ impl EditorState {
             history: History::new(),
             name_counter: 0,
             scene_dirty: true,
+            camera_anim: None,
         };
         // Start with a default box so the viewport isn't empty.
         s.add_primitive(PrimitiveKind::Box);
@@ -365,6 +407,37 @@ impl EditorState {
                     false
                 }
             }
+            UiAction::SnapCamera { azimuth, elevation } => {
+                self.camera_anim = Some(CameraAnimation {
+                    start_az:  self.camera.azimuth,
+                    start_el:  self.camera.elevation,
+                    target_az: azimuth,
+                    target_el: elevation,
+                    started:   Instant::now(),
+                    duration:  0.2,
+                });
+                false
+            }
+            UiAction::OrbitCamera { dx, dy } => {
+                self.camera.orbit(dx, dy);
+                false
+            }
+        }
+    }
+
+    /// Advance any in-progress camera animation.  Returns `true` while animating
+    /// (caller should keep requesting redraws).
+    pub fn tick_animation(&mut self) -> bool {
+        let Some(anim) = &self.camera_anim else { return false };
+        let elapsed = anim.started.elapsed().as_secs_f64();
+        let t = smoothstep((elapsed / anim.duration).min(1.0));
+        self.camera.azimuth   = anim.start_az  + (anim.target_az - anim.start_az)  * t;
+        self.camera.elevation = anim.start_el  + (anim.target_el - anim.start_el)  * t;
+        if elapsed >= anim.duration {
+            self.camera_anim = None;
+            false
+        } else {
+            true
         }
     }
 

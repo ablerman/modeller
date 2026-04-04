@@ -182,6 +182,7 @@ impl AppState {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.editor.tick_animation();
         self.sync_meshes();
 
         let output = self.surface.get_current_texture()?;
@@ -441,7 +442,12 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.02,
                     };
-                    state.editor.camera.zoom(scroll);
+                    let cursor_ray = state.last_cursor.map(|(cx, cy)| {
+                        let w = state.surface_config.width;
+                        let h = state.surface_config.height;
+                        state.editor.camera.unproject_ray(cx, cy, w, h)
+                    });
+                    state.editor.camera.zoom(scroll, cursor_ray.as_ref());
                 }
             }
 
