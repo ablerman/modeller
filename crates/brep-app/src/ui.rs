@@ -22,6 +22,7 @@ fn icon_vertical()   -> egui::ImageSource<'static> { egui::include_image!("../as
 fn icon_equal_len()  -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/equal_length.svg") }
 fn icon_length()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/length.svg") }
 fn icon_coincident() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/coincident.svg") }
+fn icon_trash()      -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/trash.svg") }
 
 /// Icon image sized for use in toolbar buttons.
 fn toolbar_icon(src: egui::ImageSource<'static>) -> egui::Image<'static> {
@@ -1434,7 +1435,11 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("✕").clicked() {
+                                        let trash = egui::ImageButton::new(
+                                            egui::Image::new(icon_trash())
+                                                .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                                        );
+                                        if ui.add(trash).on_hover_text("Remove constraint").clicked() {
                                             remove_idx = Some(i);
                                         }
                                     },
