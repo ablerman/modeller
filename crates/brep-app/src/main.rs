@@ -15,7 +15,7 @@ use editor::{EditorState, UiAction};
 use egui_wgpu::ScreenDescriptor;
 use winit::{
     application::ApplicationHandler,
-    dpi::PhysicalSize,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
@@ -23,6 +23,74 @@ use winit::{
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+// ── Window geometry persistence ───────────────────────────────────────────────
+
+/// Saved window position and size, in physical pixels.
+#[derive(Clone, Copy)]
+struct WindowGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl WindowGeometry {
+    const DEFAULT: Self = Self { x: 100, y: 100, width: 1600, height: 1000 };
+}
+
+/// Return the path to `~/.config/brep-modeller/window.cfg` (or platform equivalent).
+fn window_config_path() -> Option<std::path::PathBuf> {
+    // Use $XDG_CONFIG_HOME on Linux, $HOME/.config otherwise; fallback to temp dir.
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+        })
+        .or_else(|| {
+            std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+        })?;
+    Some(base.join("brep-modeller").join("window.cfg"))
+}
+
+/// Load persisted window geometry, or return the default.
+fn load_window_geometry() -> WindowGeometry {
+    let path = match window_config_path() {
+        Some(p) => p,
+        None => return WindowGeometry::DEFAULT,
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return WindowGeometry::DEFAULT,
+    };
+    let nums: Vec<i64> = text
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if nums.len() >= 4 {
+        WindowGeometry {
+            x: nums[0] as i32,
+            y: nums[1] as i32,
+            width: nums[2].max(400) as u32,
+            height: nums[3].max(300) as u32,
+        }
+    } else {
+        WindowGeometry::DEFAULT
+    }
+}
+
+/// Persist window geometry to disk (best-effort; silently ignores errors).
+fn save_window_geometry(g: WindowGeometry) {
+    let path = match window_config_path() {
+        Some(p) => p,
+        None => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{} {} {} {}\n", g.x, g.y, g.width, g.height));
+}
 
 // ── GPU mesh cache ────────────────────────────────────────────────────────────
 
@@ -432,9 +500,11 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let geo = load_window_geometry();
         let attrs = Window::default_attributes()
             .with_title("BRep Modeller")
-            .with_maximized(true);
+            .with_inner_size(PhysicalSize::new(geo.width, geo.height))
+            .with_position(PhysicalPosition::new(geo.x, geo.y));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let state = pollster::block_on(AppState::new(window));
         self.state = Some(state);
@@ -646,6 +716,20 @@ impl ApplicationHandler for App {
 
             WindowEvent::Resized(new_size) => {
                 state.resize(new_size);
+                if let Ok(pos) = state.window.outer_position() {
+                    save_window_geometry(WindowGeometry {
+                        x: pos.x, y: pos.y,
+                        width: new_size.width, height: new_size.height,
+                    });
+                }
+            }
+
+            WindowEvent::Moved(pos) => {
+                let size = state.window.inner_size();
+                save_window_geometry(WindowGeometry {
+                    x: pos.x, y: pos.y,
+                    width: size.width, height: size.height,
+                });
             }
 
             WindowEvent::RedrawRequested => {
