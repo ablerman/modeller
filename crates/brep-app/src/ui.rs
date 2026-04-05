@@ -1272,174 +1272,183 @@ fn draw_constraint_marker(
     }
 }
 
-/// Snap a panel rect's top-left position to the nearest screen edge if within SNAP_DIST.
-fn snap_panel_to_edges(pos: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
+/// Snap a window rect's top-left position to the nearest viewport edge if within SNAP_DIST.
+fn snap_to_viewport(pos: egui::Pos2, size: egui::Vec2, viewport: egui::Rect) -> egui::Pos2 {
     const GAP: f32 = 12.0;
-    const SNAP_DIST: f32 = 40.0;
+    const SNAP: f32 = 40.0;
     let mut p = pos;
-    // Left / right
-    if (p.x - (bounds.left() + GAP)).abs() < SNAP_DIST { p.x = bounds.left() + GAP; }
-    else if (p.x + size.x - (bounds.right() - GAP)).abs() < SNAP_DIST { p.x = bounds.right() - GAP - size.x; }
-    // Top / bottom
-    if (p.y - (bounds.top() + GAP)).abs() < SNAP_DIST { p.y = bounds.top() + GAP; }
-    else if (p.y + size.y - (bounds.bottom() - GAP)).abs() < SNAP_DIST { p.y = bounds.bottom() - GAP - size.y; }
+    // Clamp inside viewport first.
+    p.x = p.x.clamp(viewport.left() + GAP, (viewport.right() - GAP - size.x).max(viewport.left() + GAP));
+    p.y = p.y.clamp(viewport.top() + GAP, (viewport.bottom() - GAP - size.y).max(viewport.top() + GAP));
+    // Then snap to edges.
+    if (p.x - (viewport.left()  + GAP)).abs() < SNAP { p.x = viewport.left()  + GAP; }
+    else if (p.x + size.x - (viewport.right()  - GAP)).abs() < SNAP { p.x = viewport.right()  - GAP - size.x; }
+    if (p.y - (viewport.top()   + GAP)).abs() < SNAP { p.y = viewport.top()   + GAP; }
+    else if (p.y + size.y - (viewport.bottom() - GAP)).abs() < SNAP { p.y = viewport.bottom() - GAP - size.y; }
     p
 }
 
-/// Floating sketch configuration panel — top-left of the viewport, draggable.
+/// Floating sketch configuration panel — resizable, draggable, constrained to the viewport.
 fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
     let Some(sk) = &editor.sketch else { return actions };
 
     let panel_id = egui::Id::new("sketch_info_panel");
-    let avail = ctx.available_rect();
-    let default_pos = egui::pos2(avail.left() + 12.0, avail.top() + 12.0);
+    let viewport = ctx.available_rect();
+    let default_pos = egui::pos2(viewport.left() + 12.0, viewport.top() + 12.0);
 
-    // Read the position stored from the previous frame (set after drag).
-    let stored_pos: egui::Pos2 = ctx.data(|d| d.get_temp(panel_id).unwrap_or(default_pos));
-
-    // Only snap when no pointer button is held (i.e., after a drag ends).
-    let is_pointer_down = ctx.input(|i| i.pointer.any_down());
-    let panel_size = egui::AreaState::load(ctx, panel_id)
+    // Snap to viewport edge once the pointer is released.
+    let is_dragging = ctx.input(|i| i.pointer.any_down());
+    let win_size = egui::AreaState::load(ctx, panel_id)
         .and_then(|s| s.size)
         .unwrap_or(egui::vec2(240.0, 420.0));
-    let screen = ctx.screen_rect();
-    let display_pos = if is_pointer_down {
+    let stored_pos: egui::Pos2 = ctx.data(|d| d.get_temp(panel_id).unwrap_or(default_pos));
+    let display_pos = if is_dragging {
         stored_pos
     } else {
-        snap_panel_to_edges(stored_pos, panel_size, screen)
+        snap_to_viewport(stored_pos, win_size, viewport)
     };
 
-    egui::Area::new(panel_id)
-        .current_pos(display_pos)
-        .order(egui::Order::Foreground)
+    egui::Window::new("Sketch")
+        .id(panel_id)
+        .title_bar(false)
+        .resizable(true)
         .movable(true)
+        .constrain_to(viewport)
+        .min_width(200.0)
+        .min_height(180.0)
+        .default_size(egui::vec2(260.0, 440.0))
+        .current_pos(display_pos)
+        .frame(egui::Frame::popup(ctx.style().as_ref()))
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(220.0);
-
-                // ── Finish Sketch button ──────────────────────────────────
-                ui.add_enabled_ui(sk.points.len() >= 3, |ui| {
-                    if ui.button("✓  Finish Sketch").clicked() {
-                        actions.push(UiAction::SketchFinish);
-                    }
-                });
-
-                ui.separator();
-
-                // ── Editable name ─────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.strong("Name");
-                    let mut name_buf = sk.name.clone();
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut name_buf).desired_width(140.0),
-                    );
-                    if resp.changed() {
-                        actions.push(UiAction::SketchRename(name_buf));
-                    }
-                });
-
-                // ── Plane (read-only) ─────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.strong("Plane");
-                    ui.label(format!("{:?}", sk.plane));
-                });
-
-                ui.separator();
-
-                // ── Elements ──────────────────────────────────────────────
-                ui.strong("Elements");
-                let n = sk.points.len();
-                if n == 0 {
-                    ui.label(egui::RichText::new("(none)").italics().weak());
-                } else {
-                    // Detect selection changes so we can scroll the new item into view.
-                    let prev_sel_id = panel_id.with("prev_seg_sel");
-                    let prev_sel: Vec<usize> = ctx.data(|d| d.get_temp(prev_sel_id).unwrap_or_default());
-                    let sel_changed = prev_sel != sk.seg_selection;
-                    ctx.data_mut(|d| d.insert_temp(prev_sel_id, sk.seg_selection.clone()));
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("sketch_elements_scroll")
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            for i in 0..n {
-                                let p = &sk.points[i];
-                                let selected = sk.pt_selection.contains(&i);
-                                let resp = ui.selectable_label(
-                                    selected,
-                                    format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z),
-                                );
-                                if resp.clicked() {
-                                    actions.push(UiAction::SketchPanelSelectVertex(i));
-                                }
-                            }
-                            let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
-                            for i in 0..n_segs {
-                                let j = (i + 1) % n;
-                                let selected = sk.seg_selection.contains(&i);
-                                let resp = ui.selectable_label(
-                                    selected,
-                                    format!("Segment {}  ({} → {})", i, i, j),
-                                );
-                                if resp.clicked() {
-                                    actions.push(UiAction::SketchPanelSelectSegment(i));
-                                }
-                                // Scroll to the first newly-selected segment.
-                                if selected && sel_changed && !prev_sel.contains(&i) {
-                                    resp.scroll_to_me(Some(egui::Align::Center));
-                                }
-                            }
-                        });
-                }
-
-                ui.separator();
-
-                // ── Constraints ───────────────────────────────────────────
-                ui.strong("Constraints");
-                if sk.constraints.is_empty() {
-                    ui.label(egui::RichText::new("(none)").italics().weak());
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("sketch_constraints_scroll")
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            let mut remove_idx: Option<usize> = None;
-                            for (i, c) in sk.constraints.iter().enumerate() {
-                                let is_violated =
-                                    sk.violated_constraints.get(i).copied().unwrap_or(false);
-                                let is_selected = sk.constraint_selection.contains(&i);
-                                ui.horizontal(|ui| {
-                                    ui.add(list_icon(constraint_icon(c)));
-                                    let label_text = if is_violated {
-                                        egui::RichText::new(constraint_text(c))
-                                            .color(egui::Color32::RED)
-                                    } else {
-                                        egui::RichText::new(constraint_text(c))
-                                    };
-                                    let resp = ui.selectable_label(is_selected, label_text);
-                                    if resp.clicked() {
-                                        actions.push(UiAction::SketchSelectConstraint(i));
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui.small_button("✕").clicked() {
-                                                remove_idx = Some(i);
-                                            }
-                                        },
-                                    );
-                                });
-                            }
-                            if let Some(i) = remove_idx {
-                                actions.push(UiAction::SketchRemoveConstraint(i));
-                            }
-                        });
+            // ── Finish Sketch button ──────────────────────────────────
+            ui.add_enabled_ui(sk.points.len() >= 3, |ui| {
+                if ui.button("✓  Finish Sketch").clicked() {
+                    actions.push(UiAction::SketchFinish);
                 }
             });
+
+            ui.separator();
+
+            // ── Editable name ─────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.strong("Name");
+                let mut name_buf = sk.name.clone();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut name_buf)
+                        .desired_width(ui.available_width()),
+                );
+                if resp.changed() {
+                    actions.push(UiAction::SketchRename(name_buf));
+                }
+            });
+
+            // ── Plane (read-only) ─────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.strong("Plane");
+                ui.label(format!("{:?}", sk.plane));
+            });
+
+            ui.separator();
+
+            // ── Elements ──────────────────────────────────────────────
+            ui.strong("Elements");
+            let n = sk.points.len();
+            if n == 0 {
+                ui.label(egui::RichText::new("(none)").italics().weak());
+            } else {
+                // Detect selection changes so we can scroll the new item into view.
+                let prev_sel_id = panel_id.with("prev_seg_sel");
+                let prev_sel: Vec<usize> = ctx.data(|d| d.get_temp(prev_sel_id).unwrap_or_default());
+                let sel_changed = prev_sel != sk.seg_selection;
+                ctx.data_mut(|d| d.insert_temp(prev_sel_id, sk.seg_selection.clone()));
+
+                // Elements list takes all remaining space above the constraints section.
+                // Use a fixed-ratio split: ~40% of window height for elements.
+                egui::ScrollArea::vertical()
+                    .id_salt("sketch_elements_scroll")
+                    .max_height(f32::INFINITY)
+                    .min_scrolled_height(60.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        for i in 0..n {
+                            let p = &sk.points[i];
+                            let selected = sk.pt_selection.contains(&i);
+                            let resp = ui.selectable_label(
+                                selected,
+                                format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z),
+                            );
+                            if resp.clicked() {
+                                actions.push(UiAction::SketchPanelSelectVertex(i));
+                            }
+                        }
+                        let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
+                        for i in 0..n_segs {
+                            let j = (i + 1) % n;
+                            let selected = sk.seg_selection.contains(&i);
+                            let resp = ui.selectable_label(
+                                selected,
+                                format!("Segment {}  ({} → {})", i, i, j),
+                            );
+                            if resp.clicked() {
+                                actions.push(UiAction::SketchPanelSelectSegment(i));
+                            }
+                            // Scroll to the first newly-selected segment.
+                            if selected && sel_changed && !prev_sel.contains(&i) {
+                                resp.scroll_to_me(Some(egui::Align::Center));
+                            }
+                        }
+                    });
+            }
+
+            ui.separator();
+
+            // ── Constraints ───────────────────────────────────────────
+            ui.strong("Constraints");
+            if sk.constraints.is_empty() {
+                ui.label(egui::RichText::new("(none)").italics().weak());
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("sketch_constraints_scroll")
+                    .max_height(f32::INFINITY)
+                    .min_scrolled_height(60.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let mut remove_idx: Option<usize> = None;
+                        for (i, c) in sk.constraints.iter().enumerate() {
+                            let is_violated =
+                                sk.violated_constraints.get(i).copied().unwrap_or(false);
+                            let is_selected = sk.constraint_selection.contains(&i);
+                            ui.horizontal(|ui| {
+                                ui.add(list_icon(constraint_icon(c)));
+                                let label_text = if is_violated {
+                                    egui::RichText::new(constraint_text(c))
+                                        .color(egui::Color32::RED)
+                                } else {
+                                    egui::RichText::new(constraint_text(c))
+                                };
+                                let resp = ui.selectable_label(is_selected, label_text);
+                                if resp.clicked() {
+                                    actions.push(UiAction::SketchSelectConstraint(i));
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("✕").clicked() {
+                                            remove_idx = Some(i);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        if let Some(i) = remove_idx {
+                            actions.push(UiAction::SketchRemoveConstraint(i));
+                        }
+                    });
+            }
         });
 
-    // Read back the post-drag position from egui memory and persist it.
+    // Persist the window position after each frame so snap logic has fresh data.
     if let Some(state) = egui::AreaState::load(ctx, panel_id) {
         ctx.data_mut(|d| d.insert_temp(panel_id, state.left_top_pos()));
     }
