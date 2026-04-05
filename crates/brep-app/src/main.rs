@@ -434,7 +434,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("BRep Modeller")
-            .with_inner_size(PhysicalSize::new(1280u32, 800u32));
+            .with_maximized(true);
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let state = pollster::block_on(AppState::new(window));
         self.state = Some(state);

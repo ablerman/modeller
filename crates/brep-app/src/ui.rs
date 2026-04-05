@@ -7,6 +7,16 @@ use egui::Context;
 
 use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, SketchPlane, UiAction};
 
+// ── Constraint icons (Unicode) ────────────────────────────────────────────────
+const ICON_PARALLEL:   &str = "∥";
+const ICON_PERP:       &str = "⊥";
+const ICON_ANGLE:      &str = "∠";
+const ICON_HORIZONTAL: &str = "↔";
+const ICON_VERTICAL:   &str = "↕";
+const ICON_EQUAL_LEN:  &str = "≡";
+const ICON_LENGTH:     &str = "⟺";
+const ICON_COINCIDENT: &str = "⊙";
+
 /// Render all egui panels.  Returns any actions the user triggered.
 pub fn build_ui(
     ctx: &Context,
@@ -58,68 +68,11 @@ pub fn build_ui(
                     }
                 }
 
-                // ── Constraint buttons ────────────────────────────────────
+                // ── Constraint dropdown ───────────────────────────────────
                 if !sk.points.is_empty() {
                     ui.separator();
-                    ui.strong("Constrain:");
 
                     let n_sel = sk.seg_selection.len();
-
-                    // 1-segment constraints.
-                    ui.add_enabled_ui(n_sel == 1, |ui| {
-                        if ui.button("Horizontal").clicked() {
-                            let seg = sk.seg_selection[0];
-                            actions.push(UiAction::SketchAddConstraint(
-                                SketchConstraint::Horizontal { seg }));
-                            actions.push(UiAction::SketchClearSegSelection);
-                        }
-                        if ui.button("Vertical").clicked() {
-                            let seg = sk.seg_selection[0];
-                            actions.push(UiAction::SketchAddConstraint(
-                                SketchConstraint::Vertical { seg }));
-                            actions.push(UiAction::SketchClearSegSelection);
-                        }
-                    });
-
-                    // 2-segment constraints.
-                    ui.add_enabled_ui(n_sel == 2, |ui| {
-                        if ui.button("Parallel").clicked() {
-                            actions.push(UiAction::SketchAddConstraint(
-                                SketchConstraint::Parallel {
-                                    seg_a: sk.seg_selection[0],
-                                    seg_b: sk.seg_selection[1],
-                                }));
-                            actions.push(UiAction::SketchClearSegSelection);
-                        }
-                        if ui.button("Perp.").clicked() {
-                            actions.push(UiAction::SketchAddConstraint(
-                                SketchConstraint::Perpendicular {
-                                    seg_a: sk.seg_selection[0],
-                                    seg_b: sk.seg_selection[1],
-                                }));
-                            actions.push(UiAction::SketchClearSegSelection);
-                        }
-                        if ui.button("= Len").clicked() {
-                            actions.push(UiAction::SketchAddConstraint(
-                                SketchConstraint::EqualLength {
-                                    seg_a: sk.seg_selection[0],
-                                    seg_b: sk.seg_selection[1],
-                                }));
-                            actions.push(UiAction::SketchClearSegSelection);
-                        }
-                    });
-
-                    // Angle: opens a modal dialog to enter degrees.
-                    ui.add_enabled_ui(n_sel == 2, |ui| {
-                        if ui.button("Angle…").clicked() {
-                            actions.push(UiAction::SketchBeginAngleInput {
-                                seg_a: sk.seg_selection[0],
-                                seg_b: sk.seg_selection[1],
-                            });
-                        }
-                    });
-
-                    // Length: 1 segment OR 2 vertices selected.
                     let n_pts = sk.pt_selection.len();
                     let length_target: Option<LengthTarget> = if n_sel == 1 {
                         Some(LengthTarget::Segment(sk.seg_selection[0]))
@@ -128,12 +81,70 @@ pub fn build_ui(
                     } else {
                         None
                     };
-                    ui.add_enabled_ui(length_target.is_some(), |ui| {
-                        if ui.button("Length…").clicked() {
-                            if let Some(t) = length_target {
-                                actions.push(UiAction::SketchBeginLengthInput(t));
+
+                    ui.menu_button("Constrain ▾", |ui| {
+                        ui.add_enabled_ui(n_sel == 1, |ui| {
+                            if ui.button(format!("{ICON_HORIZONTAL}  Horizontal")).clicked() {
+                                actions.push(UiAction::SketchAddConstraint(
+                                    SketchConstraint::Horizontal { seg: sk.seg_selection[0] }));
+                                actions.push(UiAction::SketchClearSegSelection);
+                                ui.close_menu();
                             }
-                        }
+                            if ui.button(format!("{ICON_VERTICAL}  Vertical")).clicked() {
+                                actions.push(UiAction::SketchAddConstraint(
+                                    SketchConstraint::Vertical { seg: sk.seg_selection[0] }));
+                                actions.push(UiAction::SketchClearSegSelection);
+                                ui.close_menu();
+                            }
+                        });
+                        ui.separator();
+                        ui.add_enabled_ui(n_sel == 2, |ui| {
+                            if ui.button(format!("{ICON_PARALLEL}  Parallel")).clicked() {
+                                actions.push(UiAction::SketchAddConstraint(
+                                    SketchConstraint::Parallel {
+                                        seg_a: sk.seg_selection[0],
+                                        seg_b: sk.seg_selection[1],
+                                    }));
+                                actions.push(UiAction::SketchClearSegSelection);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{ICON_PERP}  Perpendicular")).clicked() {
+                                actions.push(UiAction::SketchAddConstraint(
+                                    SketchConstraint::Perpendicular {
+                                        seg_a: sk.seg_selection[0],
+                                        seg_b: sk.seg_selection[1],
+                                    }));
+                                actions.push(UiAction::SketchClearSegSelection);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{ICON_EQUAL_LEN}  Equal Length")).clicked() {
+                                actions.push(UiAction::SketchAddConstraint(
+                                    SketchConstraint::EqualLength {
+                                        seg_a: sk.seg_selection[0],
+                                        seg_b: sk.seg_selection[1],
+                                    }));
+                                actions.push(UiAction::SketchClearSegSelection);
+                                ui.close_menu();
+                            }
+                        });
+                        ui.separator();
+                        ui.add_enabled_ui(n_sel == 2, |ui| {
+                            if ui.button(format!("{ICON_ANGLE}  Angle…")).clicked() {
+                                actions.push(UiAction::SketchBeginAngleInput {
+                                    seg_a: sk.seg_selection[0],
+                                    seg_b: sk.seg_selection[1],
+                                });
+                                ui.close_menu();
+                            }
+                        });
+                        ui.add_enabled_ui(length_target.is_some(), |ui| {
+                            if ui.button(format!("{ICON_LENGTH}  Length…")).clicked() {
+                                if let Some(t) = length_target {
+                                    actions.push(UiAction::SketchBeginLengthInput(t));
+                                }
+                                ui.close_menu();
+                            }
+                        });
                     });
 
                     if sk.constraints_conflict {
@@ -267,26 +278,26 @@ pub fn build_ui(
         if editor.objects.is_empty() {
             ui.label(egui::RichText::new("(empty scene)").italics().weak());
         }
-    });
 
-    // ── Right panel: properties ───────────────────────────────────────────────
-    egui::SidePanel::right("properties").min_width(160.0).show(ctx, |ui| {
-        ui.strong("Properties");
-        ui.separator();
-        if let Some((faces, edges, verts)) = editor.selection_stats() {
-            ui.label(format!("Faces:    {faces}"));
-            ui.label(format!("Edges:    {edges}"));
-            ui.label(format!("Vertices: {verts}"));
-        } else {
-            ui.label(egui::RichText::new("(nothing selected)").italics().weak());
-        }
-
-        ui.separator();
-        ui.strong("Camera");
-        let cam = &editor.camera;
-        let eye = cam.eye();
-        ui.label(format!("eye:  ({:.2}, {:.2}, {:.2})", eye.x, eye.y, eye.z));
-        ui.label(format!("dist: {:.2}", cam.distance));
+        // ── Properties (merged into left panel) ───────────────────────────
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.add_space(4.0);
+            let cam = &editor.camera;
+            let eye = cam.eye();
+            ui.label(format!("dist: {:.2}", cam.distance));
+            ui.label(format!("eye  ({:.2}, {:.2}, {:.2})", eye.x, eye.y, eye.z));
+            ui.strong("Camera");
+            ui.separator();
+            if let Some((faces, edges, verts)) = editor.selection_stats() {
+                ui.label(format!("Verts: {verts}"));
+                ui.label(format!("Edges: {edges}"));
+                ui.label(format!("Faces: {faces}"));
+            } else {
+                ui.label(egui::RichText::new("(nothing selected)").italics().weak());
+            }
+            ui.strong("Properties");
+            ui.separator();
+        });
     });
 
     // ── Viewport axes (drawn into the 3-D area via egui painter) ─────────────
@@ -773,23 +784,23 @@ fn point_in_polygon2d(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
 fn constraint_label(c: &SketchConstraint) -> String {
     match c {
         SketchConstraint::Parallel { seg_a, seg_b } =>
-            format!("Parallel  seg {seg_a} ∥ {seg_b}"),
+            format!("{ICON_PARALLEL}  Parallel  {seg_a} ∥ {seg_b}"),
         SketchConstraint::Perpendicular { seg_a, seg_b } =>
-            format!("Perp.  seg {seg_a} ⊥ {seg_b}"),
+            format!("{ICON_PERP}  Perpendicular  {seg_a} ⊥ {seg_b}"),
         SketchConstraint::Angle { seg_a, seg_b, degrees } =>
-            format!("Angle  {degrees:.0}°  seg {seg_a}/{seg_b}"),
+            format!("{ICON_ANGLE}  Angle  {degrees:.0}°  ({seg_a}/{seg_b})"),
         SketchConstraint::Horizontal { seg } =>
-            format!("Horizontal  seg {seg}"),
+            format!("{ICON_HORIZONTAL}  Horizontal  seg {seg}"),
         SketchConstraint::Vertical { seg } =>
-            format!("Vertical  seg {seg}"),
+            format!("{ICON_VERTICAL}  Vertical  seg {seg}"),
         SketchConstraint::EqualLength { seg_a, seg_b } =>
-            format!("Equal len  seg {seg_a} = {seg_b}"),
+            format!("{ICON_EQUAL_LEN}  Equal Length  {seg_a} = {seg_b}"),
         SketchConstraint::Coincident { pt_a, pt_b } =>
-            format!("Coincident  pt {pt_a} = {pt_b}"),
+            format!("{ICON_COINCIDENT}  Coincident  pt {pt_a} = {pt_b}"),
         SketchConstraint::FixedLength { seg, value } =>
-            format!("Length  seg {seg} = {value:.3}"),
+            format!("{ICON_LENGTH}  Length  seg {seg} = {value:.3}"),
         SketchConstraint::PointDistance { pt_a, pt_b, value } =>
-            format!("Distance  pt {pt_a}–{pt_b} = {value:.3}"),
+            format!("{ICON_LENGTH}  Distance  pt {pt_a}–{pt_b} = {value:.3}"),
     }
 }
 
@@ -806,8 +817,9 @@ fn draw_constraint_marker(
         let b = proj(points[(seg + 1) % n])?;
         Some(egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5))
     };
-    let color = egui::Color32::from_rgb(230, 220, 70);
-    let font = egui::FontId::proportional(11.0);
+    // Subdued — same icons as the toolbar but smaller and less saturated.
+    let color = egui::Color32::from_rgb(160, 155, 55);
+    let font = egui::FontId::proportional(10.0);
     let draw = |seg: usize, sym: &str| {
         if let Some(m) = midpoint(seg) {
             painter.text(m + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, sym, font.clone(), color);
@@ -815,39 +827,35 @@ fn draw_constraint_marker(
     };
     match c {
         SketchConstraint::Parallel { seg_a, seg_b } => {
-            draw(*seg_a, "∥"); draw(*seg_b, "∥");
+            draw(*seg_a, ICON_PARALLEL); draw(*seg_b, ICON_PARALLEL);
         }
         SketchConstraint::Perpendicular { seg_a, seg_b } => {
-            draw(*seg_a, "⊾"); draw(*seg_b, "⊾");
+            draw(*seg_a, ICON_PERP); draw(*seg_b, ICON_PERP);
         }
         SketchConstraint::Angle { seg_a, degrees, .. } => {
-            draw(*seg_a, &format!("{:.0}°", degrees));
+            draw(*seg_a, &format!("{ICON_ANGLE}{:.0}°", degrees));
         }
-        SketchConstraint::Horizontal { seg } => { draw(*seg, "—"); }
-        SketchConstraint::Vertical { seg } => { draw(*seg, "|"); }
+        SketchConstraint::Horizontal { seg } => { draw(*seg, ICON_HORIZONTAL); }
+        SketchConstraint::Vertical { seg } => { draw(*seg, ICON_VERTICAL); }
         SketchConstraint::EqualLength { seg_a, seg_b } => {
-            draw(*seg_a, "="); draw(*seg_b, "=");
+            draw(*seg_a, ICON_EQUAL_LEN); draw(*seg_b, ICON_EQUAL_LEN);
         }
         SketchConstraint::Coincident { pt_a, .. } => {
             if let Some(p) = proj(points[*pt_a]) {
-                painter.circle_stroke(p, 6.0, egui::Stroke::new(1.5, color));
+                painter.circle_stroke(p, 5.0, egui::Stroke::new(1.2, color));
             }
         }
         SketchConstraint::FixedLength { seg, value } => {
-            draw(
-                *seg,
-                &format!("{value:.2}"),
-            );
+            draw(*seg, &format!("{ICON_LENGTH}{value:.2}"));
         }
         SketchConstraint::PointDistance { pt_a, pt_b, value } => {
-            // Draw marker near the midpoint between the two points.
             if let (Some(a), Some(b)) = (proj(points[*pt_a]), proj(points[*pt_b])) {
                 let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
                 painter.text(
                     mid + egui::vec2(6.0, -6.0),
                     egui::Align2::LEFT_BOTTOM,
-                    &format!("{value:.2}"),
-                    egui::FontId::proportional(11.0),
+                    &format!("{ICON_LENGTH}{value:.2}"),
+                    font.clone(),
                     color,
                 );
             }
