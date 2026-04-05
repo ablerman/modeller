@@ -470,6 +470,10 @@ pub enum UiAction {
     SketchRename(String),
     /// Toggle-select a constraint by index.
     SketchSelectConstraint(usize),
+    /// Toggle-select a segment from the panel list (no max-2 cap, preserves other segs).
+    SketchPanelSelectSegment(usize),
+    /// Toggle-select a vertex from the panel list (no max-2 cap, preserves other pts).
+    SketchPanelSelectVertex(usize),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -832,6 +836,28 @@ impl EditorState {
                         sk.constraint_selection.remove(pos);
                     } else {
                         sk.constraint_selection.push(i);
+                    }
+                }
+                false
+            }
+            UiAction::SketchPanelSelectSegment(i) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.pt_selection.clear();
+                    if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
+                        sk.seg_selection.remove(pos);
+                    } else {
+                        sk.seg_selection.push(i);
+                    }
+                }
+                false
+            }
+            UiAction::SketchPanelSelectVertex(i) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.seg_selection.clear();
+                    if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
+                        sk.pt_selection.remove(pos);
+                    } else {
+                        sk.pt_selection.push(i);
                     }
                 }
                 false

@@ -5,7 +5,7 @@ use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchPlane, UiAction};
+use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, SketchPlane, UiAction};
 
 // ── Toolbar menu icons (image files) ─────────────────────────────────────────
 fn icon_file()       -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/file.svg") }
@@ -76,7 +76,8 @@ pub fn build_ui(
 
                     let n_sel = sk.seg_selection.len();
                     let n_pts = sk.pt_selection.len();
-                    let length_target: Option<LengthTarget> = if n_sel == 1 {
+                    // Length target: first selected seg (dialog applies to all selected on confirm).
+                    let length_target: Option<LengthTarget> = if n_sel >= 1 {
                         Some(LengthTarget::Segment(sk.seg_selection[0]))
                     } else if n_pts == 2 {
                         Some(LengthTarget::Points(sk.pt_selection[0], sk.pt_selection[1]))
@@ -89,28 +90,14 @@ pub fn build_ui(
                     let ref_sel = sk.ref_selection;
                     let pt1 = sk.pt_selection.first().copied();
 
-                    // Build the constraint each button would apply, or None if not applicable.
-                    // H/V: pair of points (via segment or explicit), or 1 pt + origin/axis ref.
-                    let h_constraint: Option<SketchConstraint> = if n_sel == 1 {
-                        let s = sk.seg_selection[0];
-                        Some(SketchConstraint::HorizontalPair { pt_a: s, pt_b: (s + 1) % sk.points.len(), perp_u: h_pu, perp_v: h_pv })
-                    } else if n_pts == 2 {
-                        Some(SketchConstraint::HorizontalPair { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: h_pu, perp_v: h_pv })
-                    } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)) {
-                        Some(SketchConstraint::PointOnXAxis { pt: pt1.unwrap() })
-                    } else {
-                        None
-                    };
-                    let v_constraint: Option<SketchConstraint> = if n_sel == 1 {
-                        let s = sk.seg_selection[0];
-                        Some(SketchConstraint::VerticalPair { pt_a: s, pt_b: (s + 1) % sk.points.len(), perp_u: v_pu, perp_v: v_pv })
-                    } else if n_pts == 2 {
-                        Some(SketchConstraint::VerticalPair { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: v_pu, perp_v: v_pv })
-                    } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)) {
-                        Some(SketchConstraint::PointOnYAxis { pt: pt1.unwrap() })
-                    } else {
-                        None
-                    };
+                    // H/V applicable: any segments selected, or 2 pts, or 1 pt + ref.
+                    let h_applicable = n_sel >= 1
+                        || n_pts == 2
+                        || (n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)));
+                    let v_applicable = n_sel >= 1
+                        || n_pts == 2
+                        || (n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)));
+
                     let coincident_constraint: Option<SketchConstraint> = if n_pts == 2 && n_sel == 0 {
                         Some(SketchConstraint::Coincident { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1] })
                     } else if n_sel == 1 && n_pts == 1 {
@@ -121,25 +108,52 @@ pub fn build_ui(
                         None
                     };
 
+                    // Build H constraints for all selected segments/points.
+                    let make_h = |sk: &SketchState| -> Vec<SketchConstraint> {
+                        let n = sk.points.len();
+                        if sk.seg_selection.len() >= 1 {
+                            sk.seg_selection.iter().map(|&s| SketchConstraint::HorizontalPair {
+                                pt_a: s, pt_b: (s + 1) % n, perp_u: h_pu, perp_v: h_pv,
+                            }).collect()
+                        } else if n_pts == 2 {
+                            vec![SketchConstraint::HorizontalPair {
+                                pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: h_pu, perp_v: h_pv,
+                            }]
+                        } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)) {
+                            vec![SketchConstraint::PointOnXAxis { pt: sk.pt_selection[0] }]
+                        } else { vec![] }
+                    };
+                    // Build V constraints for all selected segments/points.
+                    let make_v = |sk: &SketchState| -> Vec<SketchConstraint> {
+                        let n = sk.points.len();
+                        if sk.seg_selection.len() >= 1 {
+                            sk.seg_selection.iter().map(|&s| SketchConstraint::VerticalPair {
+                                pt_a: s, pt_b: (s + 1) % n, perp_u: v_pu, perp_v: v_pv,
+                            }).collect()
+                        } else if n_pts == 2 {
+                            vec![SketchConstraint::VerticalPair {
+                                pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: v_pu, perp_v: v_pv,
+                            }]
+                        } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)) {
+                            vec![SketchConstraint::PointOnYAxis { pt: sk.pt_selection[0] }]
+                        } else { vec![] }
+                    };
+
                     ui.menu_button("Constrain ▾", |ui| {
-                        ui.add_enabled_ui(h_constraint.is_some(), |ui| {
+                        ui.add_enabled_ui(h_applicable, |ui| {
                             if ui.add(egui::Button::image_and_text(toolbar_icon(icon_horizontal()), "Horizontal")).clicked() {
-                                if let Some(c) = h_constraint.clone() {
-                                    actions.push(UiAction::SketchAddConstraint(c));
-                                }
+                                for c in make_h(sk) { actions.push(UiAction::SketchAddConstraint(c)); }
                                 ui.close_menu();
                             }
                         });
-                        ui.add_enabled_ui(v_constraint.is_some(), |ui| {
+                        ui.add_enabled_ui(v_applicable, |ui| {
                             if ui.add(egui::Button::image_and_text(toolbar_icon(icon_vertical()), "Vertical")).clicked() {
-                                if let Some(c) = v_constraint.clone() {
-                                    actions.push(UiAction::SketchAddConstraint(c));
-                                }
+                                for c in make_v(sk) { actions.push(UiAction::SketchAddConstraint(c)); }
                                 ui.close_menu();
                             }
                         });
                         ui.separator();
-                        ui.add_enabled_ui(n_sel == 2, |ui| {
+                        ui.add_enabled_ui(n_sel >= 2, |ui| {
                             if ui.add(egui::Button::image_and_text(toolbar_icon(icon_parallel()), "Parallel")).clicked() {
                                 actions.push(UiAction::SketchAddConstraint(
                                     SketchConstraint::Parallel {
@@ -157,11 +171,14 @@ pub fn build_ui(
                                 ui.close_menu();
                             }
                             if ui.add(egui::Button::image_and_text(toolbar_icon(icon_equal_len()), "Equal Length")).clicked() {
-                                actions.push(UiAction::SketchAddConstraint(
-                                    SketchConstraint::EqualLength {
-                                        seg_a: sk.seg_selection[0],
-                                        seg_b: sk.seg_selection[1],
-                                    }));
+                                // Chain all segs to be equal to seg_selection[0].
+                                for i in 1..sk.seg_selection.len() {
+                                    actions.push(UiAction::SketchAddConstraint(
+                                        SketchConstraint::EqualLength {
+                                            seg_a: sk.seg_selection[0],
+                                            seg_b: sk.seg_selection[i],
+                                        }));
+                                }
                                 ui.close_menu();
                             }
                         });
@@ -761,13 +778,28 @@ pub fn build_ui(
                 if confirm {
                     let value = ctx.data(|d| d.get_temp(len_id).unwrap_or(initial_len));
                     ctx.data_mut(|d| d.remove::<bool>(len_init_id));
-                    let c = match target {
-                        LengthTarget::Segment(seg) =>
-                            SketchConstraint::FixedLength { seg, value },
-                        LengthTarget::Points(pt_a, pt_b) =>
-                            SketchConstraint::PointDistance { pt_a, pt_b, value },
-                    };
-                    actions.push(UiAction::SketchAddConstraint(c));
+                    match target {
+                        LengthTarget::Segment(_) => {
+                            // Apply to all currently selected segments (multi-select support).
+                            let segs: Vec<usize> = editor.sketch.as_ref()
+                                .map(|sk| sk.seg_selection.clone())
+                                .unwrap_or_default();
+                            let segs = if segs.is_empty() {
+                                // Fallback: use the target segment directly.
+                                match target { LengthTarget::Segment(s) => vec![s], _ => vec![] }
+                            } else { segs };
+                            for seg in segs {
+                                actions.push(UiAction::SketchAddConstraint(
+                                    SketchConstraint::FixedLength { seg, value }
+                                ));
+                            }
+                        }
+                        LengthTarget::Points(pt_a, pt_b) => {
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::PointDistance { pt_a, pt_b, value }
+                            ));
+                        }
+                    }
                 } else if dismiss {
                     ctx.data_mut(|d| d.remove::<bool>(len_init_id));
                     actions.push(UiAction::SketchCancelLengthInput);
@@ -1240,19 +1272,48 @@ fn draw_constraint_marker(
     }
 }
 
-/// Floating sketch configuration panel — top-left of the viewport.
+/// Snap a panel rect's top-left position to the nearest screen edge if within SNAP_DIST.
+fn snap_panel_to_edges(pos: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
+    const GAP: f32 = 12.0;
+    const SNAP_DIST: f32 = 40.0;
+    let mut p = pos;
+    // Left / right
+    if (p.x - (bounds.left() + GAP)).abs() < SNAP_DIST { p.x = bounds.left() + GAP; }
+    else if (p.x + size.x - (bounds.right() - GAP)).abs() < SNAP_DIST { p.x = bounds.right() - GAP - size.x; }
+    // Top / bottom
+    if (p.y - (bounds.top() + GAP)).abs() < SNAP_DIST { p.y = bounds.top() + GAP; }
+    else if (p.y + size.y - (bounds.bottom() - GAP)).abs() < SNAP_DIST { p.y = bounds.bottom() - GAP - size.y; }
+    p
+}
+
+/// Floating sketch configuration panel — top-left of the viewport, draggable.
 fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
     let Some(sk) = &editor.sketch else { return actions };
 
-    // Position just inside the viewport area (below toolbar, right of left panel).
+    let panel_id = egui::Id::new("sketch_info_panel");
     let avail = ctx.available_rect();
-    let pos = egui::pos2(avail.left() + 12.0, avail.top() + 12.0);
+    let default_pos = egui::pos2(avail.left() + 12.0, avail.top() + 12.0);
 
-    egui::Area::new(egui::Id::new("sketch_info_panel"))
-        .fixed_pos(pos)
+    // Read the position stored from the previous frame (set after drag).
+    let stored_pos: egui::Pos2 = ctx.data(|d| d.get_temp(panel_id).unwrap_or(default_pos));
+
+    // Only snap when no pointer button is held (i.e., after a drag ends).
+    let is_pointer_down = ctx.input(|i| i.pointer.any_down());
+    let panel_size = egui::AreaState::load(ctx, panel_id)
+        .and_then(|s| s.size)
+        .unwrap_or(egui::vec2(240.0, 420.0));
+    let screen = ctx.screen_rect();
+    let display_pos = if is_pointer_down {
+        stored_pos
+    } else {
+        snap_panel_to_edges(stored_pos, panel_size, screen)
+    };
+
+    egui::Area::new(panel_id)
+        .current_pos(display_pos)
         .order(egui::Order::Foreground)
-        .movable(false)
+        .movable(true)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(220.0);
@@ -1304,7 +1365,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                     format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z),
                                 );
                                 if resp.clicked() {
-                                    actions.push(UiAction::SketchSelectVertex(i));
+                                    actions.push(UiAction::SketchPanelSelectVertex(i));
                                 }
                             }
                             let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
@@ -1316,7 +1377,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                     format!("Segment {}  ({} → {})", i, i, j),
                                 );
                                 if resp.clicked() {
-                                    actions.push(UiAction::SketchSelectSegment(i));
+                                    actions.push(UiAction::SketchPanelSelectSegment(i));
                                 }
                             }
                         });
@@ -1367,6 +1428,11 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                 }
             });
         });
+
+    // Read back the post-drag position from egui memory and persist it.
+    if let Some(state) = egui::AreaState::load(ctx, panel_id) {
+        ctx.data_mut(|d| d.insert_temp(panel_id, state.left_top_pos()));
+    }
 
     actions
 }
