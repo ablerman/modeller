@@ -60,4 +60,9 @@ pub enum SketchConstraint {
     /// Constraint: `perp_u*(u[b]-u[a]) + perp_v*(v[b]-v[a]) = 0`
     /// where `(perp_u, perp_v)` is the viewport "right" direction projected onto the sketch UV plane.
     VerticalPair { pt_a: usize, pt_b: usize, perp_u: f64, perp_v: f64 },
+
+    /// A point must lie on the circle defined by `(center_u, center_v)` and `radius`.
+    /// Equation: (u[pt] - cu)² + (v[pt] - cv)² = r²
+    /// Used for "point on circle" and "point on arc" constraints.
+    PointOnCircle { pt: usize, center_u: f64, center_v: f64, radius: f64 },
 }

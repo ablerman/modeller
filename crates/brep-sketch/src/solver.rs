@@ -110,6 +110,10 @@ fn count_residuals(constraints: &[SketchConstraint]) -> usize {
         .sum()
 }
 
+// (helper used below — returns u, v coords of a variable-index point)
+#[inline]
+fn pv(vars: &[f64], i: usize) -> (f64, f64) { (vars[2 * i], vars[2 * i + 1]) }
+
 /// Fill the residual vector in-place.
 ///
 /// The constraint order determines which `r[row]` each residual lands in.
@@ -228,6 +232,13 @@ fn fill_residuals(
                 let (ax, ay) = pt(*pt_a);
                 let (bx, by) = pt(*pt_b);
                 r[row] = perp_u * (bx - ax) + perp_v * (by - ay);
+                row += 1;
+            }
+            SketchConstraint::PointOnCircle { pt: pi, center_u, center_v, radius } => {
+                let (pu, pv) = pt(*pi);
+                let du = pu - center_u;
+                let dv = pv - center_v;
+                r[row] = du * du + dv * dv - radius * radius;
                 row += 1;
             }
         }
@@ -477,6 +488,15 @@ fn fill_jacobian(
                 j_flat[row * nv + 2 * a + 1] = -perp_v;
                 j_flat[row * nv + 2 * b]     = *perp_u;
                 j_flat[row * nv + 2 * b + 1] = *perp_v;
+                row += 1;
+            }
+            SketchConstraint::PointOnCircle { pt: pi, center_u, center_v, .. } => {
+                // r = (u[p] - cu)² + (v[p] - cv)² - r²
+                // ∂r/∂u[p] = 2*(u[p] - cu),  ∂r/∂v[p] = 2*(v[p] - cv)
+                let p = *pi;
+                let (pu, pv) = pv(vars, p);
+                j_flat[row * nv + 2 * p]     = 2.0 * (pu - center_u);
+                j_flat[row * nv + 2 * p + 1] = 2.0 * (pv - center_v);
                 row += 1;
             }
         }

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Clockwise arc -->
+  <path d="M 6 6 A 5.5 5.5 0 1 1 5 12" fill="none" stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Arrowhead pointing right/down at start of arc -->
+  <polyline points="9,3 6,6 9,7" fill="none" stroke="#DEDEDE" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

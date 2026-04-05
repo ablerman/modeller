@@ -1,33 +1,13 @@
 //! egui panel layout: toolbar, object list, properties.
 
-use brep_bool::BooleanKind;
 use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, SketchPlane, UiAction};
-
-// ── Toolbar menu icons (image files) ─────────────────────────────────────────
-fn icon_file()       -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/file.svg") }
-fn icon_primitives() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/primitives.svg") }
-fn icon_sketch()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/sketch.svg") }
-fn icon_boolean()    -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/boolean.svg") }
-
-// ── Constraint icons (image files) ───────────────────────────────────────────
-fn icon_parallel()   -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/parallel.svg") }
-fn icon_perp()       -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/perpendicular.svg") }
-fn icon_angle()      -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/angle.svg") }
-fn icon_horizontal() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/horizontal.svg") }
-fn icon_vertical()   -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/vertical.svg") }
-fn icon_equal_len()  -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/equal_length.svg") }
-fn icon_length()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/length.svg") }
-fn icon_coincident() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/coincident.svg") }
-fn icon_trash()      -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/trash.svg") }
-
-/// Icon image sized for use in toolbar buttons.
-fn toolbar_icon(src: egui::ImageSource<'static>) -> egui::Image<'static> {
-    egui::Image::new(src).fit_to_exact_size(egui::vec2(16.0, 16.0))
-}
+use crate::editor::{self, EditorState, LengthTarget, ObjectHistory, ProfileShape, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
+use crate::icons::{icon_angle, icon_coincident, icon_equal_len, icon_horizontal, icon_length, icon_parallel, icon_perp, icon_trash, icon_vertical};
+use crate::toolbar::IconSize;
+use crate::toolbar_defs;
 
 /// Icon image sized for use in constraint list labels.
 fn list_icon(src: egui::ImageSource<'static>) -> egui::Image<'static> {
@@ -44,6 +24,8 @@ pub fn build_ui(
     snap_segment: Option<usize>,
     snap_ref: Option<RefEntity>,
     snap_constraint: Option<usize>,
+    snap_committed: Option<(usize, usize)>,
+    snap_committed_curve: Option<usize>,
     angle_dialog: Option<(usize, usize)>,
     length_dialog: Option<(LengthTarget, f64)>,
 ) -> Vec<UiAction> {
@@ -62,197 +44,23 @@ pub fn build_ui(
                 ui.label(format!("{} pts", sk.points.len()));
                 ui.separator();
 
-                if ui.button("Undo").clicked() {
-                    actions.push(UiAction::SketchUndoPoint);
-                }
-                ui.add_enabled_ui(sk.points.len() >= 3, |ui| {
-                    if ui.button("Finish").clicked() {
-                        actions.push(UiAction::SketchFinish);
-                    }
-                });
+                crate::toolbar::render_toolbar(
+                    ui, toolbar_defs::SKETCH_EDITING_BUTTONS, editor, &mut actions, IconSize::Toolbar,
+                );
 
                 // ── Constraint dropdown ───────────────────────────────────
                 if !sk.points.is_empty() {
                     ui.separator();
 
-                    let n_sel = sk.seg_selection.len();
-                    let n_pts = sk.pt_selection.len();
-                    // Length target: first selected seg (dialog applies to all selected on confirm).
-                    let length_target: Option<LengthTarget> = if n_sel >= 1 {
-                        Some(LengthTarget::Segment(sk.seg_selection[0]))
-                    } else if n_pts == 2 {
-                        Some(LengthTarget::Points(sk.pt_selection[0], sk.pt_selection[1]))
-                    } else {
-                        None
-                    };
-
-                    // Precompute viewport-aligned perp directions and point pair for H/V constraints.
-                    let ((h_pu, h_pv), (v_pu, v_pv)) = editor.camera.sketch_align_dirs(sk.plane);
-                    let ref_sel = sk.ref_selection;
-                    let pt1 = sk.pt_selection.first().copied();
-
-                    // H/V applicable: any segments selected, or 2 pts, or 1 pt + ref.
-                    let h_applicable = n_sel >= 1
-                        || n_pts == 2
-                        || (n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)));
-                    let v_applicable = n_sel >= 1
-                        || n_pts == 2
-                        || (n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)));
-
-                    let coincident_constraint: Option<SketchConstraint> = if n_pts == 2 && n_sel == 0 {
-                        Some(SketchConstraint::Coincident { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1] })
-                    } else if n_sel == 1 && n_pts == 1 {
-                        Some(SketchConstraint::PointOnLine { pt: sk.pt_selection[0], seg: sk.seg_selection[0] })
-                    } else if n_pts == 1 && ref_sel == Some(RefEntity::Origin) {
-                        Some(SketchConstraint::PointOnOrigin { pt: pt1.unwrap() })
-                    } else {
-                        None
-                    };
-
-                    // Build H constraints for all selected segments/points.
-                    let make_h = |sk: &SketchState| -> Vec<SketchConstraint> {
-                        let n = sk.points.len();
-                        if sk.seg_selection.len() >= 1 {
-                            sk.seg_selection.iter().map(|&s| SketchConstraint::HorizontalPair {
-                                pt_a: s, pt_b: (s + 1) % n, perp_u: h_pu, perp_v: h_pv,
-                            }).collect()
-                        } else if n_pts == 2 {
-                            vec![SketchConstraint::HorizontalPair {
-                                pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: h_pu, perp_v: h_pv,
-                            }]
-                        } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)) {
-                            vec![SketchConstraint::PointOnXAxis { pt: sk.pt_selection[0] }]
-                        } else { vec![] }
-                    };
-                    // Build V constraints for all selected segments/points.
-                    let make_v = |sk: &SketchState| -> Vec<SketchConstraint> {
-                        let n = sk.points.len();
-                        if sk.seg_selection.len() >= 1 {
-                            sk.seg_selection.iter().map(|&s| SketchConstraint::VerticalPair {
-                                pt_a: s, pt_b: (s + 1) % n, perp_u: v_pu, perp_v: v_pv,
-                            }).collect()
-                        } else if n_pts == 2 {
-                            vec![SketchConstraint::VerticalPair {
-                                pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: v_pu, perp_v: v_pv,
-                            }]
-                        } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)) {
-                            vec![SketchConstraint::PointOnYAxis { pt: sk.pt_selection[0] }]
-                        } else { vec![] }
-                    };
-
                     ui.menu_button("Constrain ▾", |ui| {
-                        ui.add_enabled_ui(h_applicable, |ui| {
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_horizontal()), "Horizontal")).clicked() {
-                                for c in make_h(sk) { actions.push(UiAction::SketchAddConstraint(c)); }
-                                ui.close_menu();
-                            }
-                        });
-                        ui.add_enabled_ui(v_applicable, |ui| {
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_vertical()), "Vertical")).clicked() {
-                                for c in make_v(sk) { actions.push(UiAction::SketchAddConstraint(c)); }
-                                ui.close_menu();
-                            }
-                        });
-                        ui.separator();
-                        ui.add_enabled_ui(n_sel >= 2, |ui| {
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_parallel()), "Parallel")).clicked() {
-                                actions.push(UiAction::SketchAddConstraint(
-                                    SketchConstraint::Parallel {
-                                        seg_a: sk.seg_selection[0],
-                                        seg_b: sk.seg_selection[1],
-                                    }));
-                                ui.close_menu();
-                            }
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_perp()), "Perpendicular")).clicked() {
-                                actions.push(UiAction::SketchAddConstraint(
-                                    SketchConstraint::Perpendicular {
-                                        seg_a: sk.seg_selection[0],
-                                        seg_b: sk.seg_selection[1],
-                                    }));
-                                ui.close_menu();
-                            }
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_equal_len()), "Equal Length")).clicked() {
-                                // Chain all segs to be equal to seg_selection[0].
-                                for i in 1..sk.seg_selection.len() {
-                                    actions.push(UiAction::SketchAddConstraint(
-                                        SketchConstraint::EqualLength {
-                                            seg_a: sk.seg_selection[0],
-                                            seg_b: sk.seg_selection[i],
-                                        }));
-                                }
-                                ui.close_menu();
-                            }
-                        });
-                        ui.separator();
-                        ui.add_enabled_ui(n_sel == 2, |ui| {
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_angle()), "Angle…")).clicked() {
-                                actions.push(UiAction::SketchBeginAngleInput {
-                                    seg_a: sk.seg_selection[0],
-                                    seg_b: sk.seg_selection[1],
-                                });
-                                ui.close_menu();
-                            }
-                        });
-                        ui.add_enabled_ui(length_target.is_some(), |ui| {
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_length()), "Length…")).clicked() {
-                                if let Some(t) = length_target {
-                                    actions.push(UiAction::SketchBeginLengthInput(t));
-                                }
-                                ui.close_menu();
-                            }
-                        });
-                        ui.add_enabled_ui(coincident_constraint.is_some(), |ui| {
-                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_coincident()), "Coincident")).clicked() {
-                                if let Some(c) = coincident_constraint.clone() {
-                                    actions.push(UiAction::SketchAddConstraint(c));
-                                }
-                                ui.close_menu();
-                            }
-                        });
+                        let before = actions.len();
+                        crate::toolbar::render_toolbar(
+                            ui, toolbar_defs::SKETCH_CONSTRAIN_MENU, editor, &mut actions, IconSize::Toolbar,
+                        );
+                        if actions.len() > before { ui.close_menu(); }
                     });
 
-                    if sk.constraints_conflict {
-                        let n_conflict = sk.violated_constraints.iter().filter(|&&v| v).count();
-                        let badge = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new("⚠ conflict")
-                                    .color(egui::Color32::from_rgb(255, 80, 80))
-                                    .strong(),
-                            )
-                            .sense(egui::Sense::hover()),
-                        );
-                        badge.on_hover_ui(|ui| {
-                            ui.set_max_width(280.0);
-                            ui.label(egui::RichText::new("Constraint conflict").strong());
-                            ui.separator();
-                            if n_conflict > 0 {
-                                ui.label(format!(
-                                    "{} constraint{} cannot be satisfied together:",
-                                    n_conflict,
-                                    if n_conflict == 1 { "" } else { "s" }
-                                ));
-                                for (i, c) in sk.constraints.iter().enumerate() {
-                                    if sk.violated_constraints.get(i).copied().unwrap_or(false) {
-                                        ui.horizontal(|ui| {
-                                            ui.add(list_icon(constraint_icon(c)));
-                                            ui.label(
-                                                egui::RichText::new(constraint_text(c))
-                                                    .color(egui::Color32::from_rgb(255, 100, 100)),
-                                            );
-                                        });
-                                    }
-                                }
-                            } else {
-                                ui.label("The solver could not converge. Try removing a constraint.");
-                            }
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("Remove a highlighted constraint to resolve.")
-                                    .italics()
-                                    .weak(),
-                            );
-                        });
-                    }
+                    draw_conflict_badge(ui, sk);
 
                     // Active constraints list.
                     if !sk.constraints.is_empty() {
@@ -292,120 +100,14 @@ pub fn build_ui(
                 }
 
                 ui.separator();
-                if ui.button("✕ Cancel").clicked() {
-                    actions.push(UiAction::ExitSketch);
-                }
+                crate::toolbar::render_toolbar(
+                    ui, toolbar_defs::SKETCH_CANCEL_BUTTON, editor, &mut actions, IconSize::Toolbar,
+                );
             } else {
-                // ── Normal toolbar ────────────────────────────────────────────
-                egui::menu::menu_custom_button(ui,
-                    egui::Button::image_and_text(toolbar_icon(icon_file()), "File")
-                        .image_tint_follows_text_color(true),
-                    |ui| {
-                    if ui.button("New").clicked() {
-                        actions.push(UiAction::New);
-                        ui.close_menu();
-                    }
-                    if ui.button("Open…").clicked() {
-                        actions.push(UiAction::Open);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Save").clicked() {
-                        actions.push(UiAction::Save);
-                        ui.close_menu();
-                    }
-                    if ui.button("Save As…").clicked() {
-                        actions.push(UiAction::SaveAs);
-                        ui.close_menu();
-                    }
-                });
-                ui.separator();
-                egui::menu::menu_custom_button(ui,
-                    egui::Button::image_and_text(toolbar_icon(icon_primitives()), "Primitives")
-                        .image_tint_follows_text_color(true),
-                    |ui| {
-                    if ui.button("☐  Box").clicked() {
-                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Box));
-                        ui.close_menu();
-                    }
-                    if ui.button("◎  Cylinder").clicked() {
-                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Cylinder));
-                        ui.close_menu();
-                    }
-                    if ui.button("◉  Sphere").clicked() {
-                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Sphere));
-                        ui.close_menu();
-                    }
-                    if ui.button("△  Cone").clicked() {
-                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Cone));
-                        ui.close_menu();
-                    }
-                });
-
-                ui.separator();
-                egui::menu::menu_custom_button(ui,
-                    egui::Button::image_and_text(toolbar_icon(icon_sketch()), "Sketch")
-                        .image_tint_follows_text_color(true),
-                    |ui| {
-                    for (label, plane) in [
-                        ("XY Plane", SketchPlane::XY),
-                        ("XZ Plane", SketchPlane::XZ),
-                        ("YZ Plane", SketchPlane::YZ),
-                    ] {
-                        if ui.button(label).clicked() {
-                            actions.push(UiAction::EnterSketch(plane));
-                            ui.close_menu();
-                        }
-                    }
-                });
-
-                ui.separator();
-
-                let two_sel = editor.selection.iter()
-                    .filter(|&&i| matches!(editor.entries.get(i), Some(SceneEntry::Solid(_))))
-                    .count() == 2;
-                ui.add_enabled_ui(two_sel, |ui| {
-                    egui::menu::menu_custom_button(ui,
-                        egui::Button::image_and_text(toolbar_icon(icon_boolean()), "Boolean")
-                            .image_tint_follows_text_color(true),
-                        |ui| {
-                        if ui.button("⊕  Union").clicked() {
-                            actions.push(UiAction::BooleanOp(BooleanKind::Union));
-                            ui.close_menu();
-                        }
-                        if ui.button("⊖  Difference").clicked() {
-                            actions.push(UiAction::BooleanOp(BooleanKind::Difference));
-                            ui.close_menu();
-                        }
-                        if ui.button("⊗  Intersection").clicked() {
-                            actions.push(UiAction::BooleanOp(BooleanKind::Intersection));
-                            ui.close_menu();
-                        }
-                    });
-                });
-
-                ui.separator();
-
-                let can_delete = !editor.selection.is_empty();
-                ui.add_enabled_ui(can_delete, |ui| {
-                    if ui.button("Delete").clicked() {
-                        actions.push(UiAction::DeleteSelected);
-                    }
-                });
-
-                ui.separator();
-
-                ui.add_enabled_ui(editor.history.can_undo(), |ui| {
-                    if ui.button("Undo").clicked() {
-                        actions.push(UiAction::Undo);
-                    }
-                });
-                ui.add_enabled_ui(editor.history.can_redo(), |ui| {
-                    if ui.button("Redo").clicked() {
-                        actions.push(UiAction::Redo);
-                    }
-                });
-
+                // ── Normal toolbar (data-driven) ──────────────────────────────
+                crate::toolbar::render_toolbar(
+                    ui, toolbar_defs::MAIN_TOOLBAR, editor, &mut actions, IconSize::Toolbar,
+                );
                 ui.separator();
                 ui.label("Drag: orbit  |  Shift+drag: pan  |  Scroll: zoom");
             }
@@ -529,6 +231,9 @@ pub fn build_ui(
     // ── Sketch info panel (top-left of viewport, sketch mode only) ────────────
     actions.extend(draw_sketch_info_panel(ctx, editor));
 
+    // ── Sketch viewport toolbar (floating, top-center of canvas) ─────────────
+    actions.extend(draw_sketch_viewport_toolbar(ctx, editor));
+
     // ── Sketch overlay ────────────────────────────────────────────────────────
     if let Some(sk) = &editor.sketch {
         let (w, h) = viewport;
@@ -610,7 +315,33 @@ pub fn build_ui(
             }
         }
 
-        // Draw placed edges.
+        // Draw committed profiles (circles, arcs, rectangles, etc.) first.
+        let committed_sel = sk.committed_selection;
+        for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+            let is_sel = committed_sel == Some(pi);
+            let is_curve_hovered = snap_committed_curve == Some(pi);
+            let cp_stroke = if is_sel {
+                egui::Stroke::new(edge_stroke.width + 1.0, egui::Color32::from_rgb(255, 160, 60))
+            } else if is_curve_hovered {
+                egui::Stroke::new(edge_stroke.width + 1.0, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 210))
+            } else {
+                edge_stroke
+            };
+            draw_committed_profile(&painter, cp, &proj, cp_stroke);
+        }
+        // Snap highlight on committed profile vertices.
+        if let Some((snap_pi, snap_vi)) = snap_committed {
+            if let Some(cp) = sk.committed_profiles.get(snap_pi) {
+                if let Some(&snap_pt) = cp.points.get(snap_vi) {
+                    if let Some(p) = proj(snap_pt) {
+                        painter.circle_stroke(p, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                        painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+                    }
+                }
+            }
+        }
+
+        // Draw active profile edges.
         let n = sk.points.len();
         let seg_count = if sk.closed { n } else { n.saturating_sub(1) };
         for i in 0..seg_count {
@@ -647,21 +378,66 @@ pub fn build_ui(
             let hovered  = snap_constraint == Some(i);
             draw_constraint_marker(&painter, c, &sk.points, n, &proj, selected, hovered);
         }
-        // Preview line from last placed point to cursor (only when loop is open).
+        // Preview — shows what will be committed on the next click.
         if !sk.closed {
-            if let Some(last) = sk.points.last() {
-                let cursor_target = snap_vertex
-                    .and_then(|i| sk.points.get(i).copied())
-                    .or(sketch_cursor);
-                if let Some(cursor_world) = cursor_target {
-                    if let (Some(a), Some(b)) = (proj(*last), proj(cursor_world)) {
-                        painter.line_segment([a, b], preview_stroke);
+            let cursor_snapped = snap_vertex
+                .and_then(|i| sk.points.get(i).copied())
+                .or(sketch_cursor);
+
+            match &sk.tool_in_progress {
+                None => {
+                    // Polyline (or idle): line from last committed point to cursor.
+                    if let (Some(last), Some(cur)) = (sk.points.last(), cursor_snapped) {
+                        if let (Some(a), Some(b)) = (proj(*last), proj(cur)) {
+                            painter.line_segment([a, b], preview_stroke);
+                        }
+                    }
+                }
+                Some(ToolInProgress::Arc1 { start }) => {
+                    // Arc start placed: mark it and draw a line to the cursor (= future through-point).
+                    if let Some(sp) = proj(*start) {
+                        painter.circle_stroke(
+                            sp, 5.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(100, 255, 180, 200)),
+                        );
+                    }
+                    if let Some(cur) = cursor_snapped {
+                        if let (Some(a), Some(b)) = (proj(*start), proj(cur)) {
+                            painter.line_segment([a, b], preview_stroke);
+                        }
+                    }
+                }
+                Some(ToolInProgress::Arc2 { start, end_pt }) => {
+                    // start + end placed; next click = arc center.
+                    // Preview: arc from start to end_pt with cursor as center.
+                    if let Some(cur) = cursor_snapped {
+                        draw_arc_preview(&painter, *start, *end_pt, cur, sk.plane, &proj, preview_stroke);
+                    }
+                    // Mark the end point.
+                    if let Some(tp) = proj(*end_pt) {
+                        painter.circle_stroke(
+                            tp, 5.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(100, 255, 180, 200)),
+                        );
+                    }
+                }
+                Some(ToolInProgress::RectFirst { corner }) => {
+                    // First corner placed: draw rectangle preview to cursor.
+                    if let Some(cur) = cursor_snapped {
+                        draw_rect_preview(&painter, *corner, cur, sk.plane, &proj, preview_stroke);
+                    }
+                }
+                Some(ToolInProgress::CircleCenter { center }) => {
+                    // Center placed: draw circle preview to cursor.
+                    if let Some(cur) = cursor_snapped {
+                        draw_circle_preview(&painter, *center, cur, sk.plane, &proj, preview_stroke);
                     }
                 }
             }
         }
         // Vertex dots — highlight snapped/selected vertices.
-        let can_close = !sk.closed && n >= 3;
+        // Suppress the close-loop hint while a multi-step tool is in progress.
+        let can_close = !sk.closed && n >= 3 && sk.tool_in_progress.is_none();
         for (i, &pt) in sk.points.iter().enumerate() {
             if let Some(p) = proj(pt) {
                 let is_snap = snap_vertex == Some(i);
@@ -715,11 +491,16 @@ pub fn build_ui(
                 } else {
                     egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 160, 200, 80))
                 };
+                // Draw primary profile.
                 let n = sk.points.len();
                 for j in 0..n {
                     if let (Some(a), Some(b)) = (proj(sk.points[j]), proj(sk.points[(j + 1) % n])) {
                         painter.line_segment([a, b], stroke);
                     }
+                }
+                // Draw extra profiles (circles, arcs, rectangles, etc.).
+                for cp in &sk.extra_profiles {
+                    draw_committed_profile(&painter, cp, &proj, stroke);
                 }
                 if is_selected {
                     for &pt in &sk.points {
@@ -1135,6 +916,7 @@ fn constraint_icon(c: &SketchConstraint) -> egui::ImageSource<'static> {
         SketchConstraint::HorizontalPair { .. } => icon_horizontal(),
         SketchConstraint::VerticalPair { .. }   => icon_vertical(),
         SketchConstraint::PointOnLine { .. }    => icon_coincident(),
+        SketchConstraint::PointOnCircle { .. }  => icon_coincident(),
     }
 }
 
@@ -1166,6 +948,7 @@ fn constraint_text(c: &SketchConstraint) -> String {
         SketchConstraint::HorizontalPair { pt_a, pt_b, .. } => format!("Horizontal  pt {pt_a}–{pt_b}"),
         SketchConstraint::VerticalPair   { pt_a, pt_b, .. } => format!("Vertical  pt {pt_a}–{pt_b}"),
         SketchConstraint::PointOnLine { pt, seg }           => format!("On Line  pt {pt} on seg {seg}"),
+        SketchConstraint::PointOnCircle { pt, .. }          => format!("On Circle  pt {pt}"),
     }
 }
 
@@ -1268,6 +1051,12 @@ fn draw_constraint_marker(
             if let (Some(a), Some(b)) = (proj(points[*seg]), proj(points[(*seg + 1) % n])) {
                 let m = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
                 painter.text(m + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "◯", font.clone(), color);
+            }
+        }
+        SketchConstraint::PointOnCircle { pt, .. } => {
+            if let Some(p) = proj(points[*pt]) {
+                painter.circle_stroke(p, 5.0, egui::Stroke::new(1.2, color));
+                painter.text(p + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "◎", font.clone(), color);
             }
         }
     }
@@ -1399,6 +1188,20 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                 resp.scroll_to_me(Some(egui::Align::Center));
                             }
                         }
+                        // Committed profiles (circles, arcs, rectangles).
+                        for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            let label = match cp.shape {
+                                ProfileShape::Circle => format!("Circle {pi}"),
+                                ProfileShape::Arc    => format!("Arc {pi}"),
+                                ProfileShape::Polyline => format!("Rectangle {pi}"),
+                            };
+                            let is_sel = sk.committed_selection == Some(pi);
+                            let resp = ui.selectable_label(is_sel, label);
+                            if resp.clicked() {
+                                let new_sel = if is_sel { None } else { Some(pi) };
+                                actions.push(UiAction::SketchSelectCommitted(new_sel));
+                            }
+                        }
                     });
             }
 
@@ -1491,4 +1294,214 @@ fn show_history_op(ui: &mut egui::Ui, node: &ObjectHistory) {
             });
         }
     }
+}
+
+// ── Tool preview helpers ──────────────────────────────────────────────────────
+
+/// Draw an arc preview: `start` → `end_pt`, with `center` as the arc center.
+fn draw_arc_preview(
+    painter: &egui::Painter,
+    start: Point3, end_pt: Point3, center: Point3,
+    plane: crate::editor::SketchPlane,
+    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
+    stroke: egui::Stroke,
+) {
+    let pts = editor::tessellate_arc_from_center(start, end_pt, center, plane);
+    for w in pts.windows(2) {
+        if let (Some(a), Some(b)) = (proj(w[0]), proj(w[1])) {
+            painter.line_segment([a, b], stroke);
+        }
+    }
+    // Mark the center with a small cross.
+    if let Some(cp) = proj(center) {
+        painter.line_segment(
+            [cp - egui::vec2(4.0, 0.0), cp + egui::vec2(4.0, 0.0)],
+            egui::Stroke::new(1.0, stroke.color),
+        );
+        painter.line_segment(
+            [cp - egui::vec2(0.0, 4.0), cp + egui::vec2(0.0, 4.0)],
+            egui::Stroke::new(1.0, stroke.color),
+        );
+    }
+}
+
+/// Draw a rectangle preview from `corner` to the opposite `cursor` corner.
+fn draw_rect_preview(
+    painter: &egui::Painter,
+    corner: Point3, cursor: Point3,
+    plane: crate::editor::SketchPlane,
+    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
+    stroke: egui::Stroke,
+) {
+    let corners = editor::rect_corners(corner, cursor, plane);
+    for i in 0..4 {
+        if let (Some(a), Some(b)) = (proj(corners[i]), proj(corners[(i + 1) % 4])) {
+            painter.line_segment([a, b], stroke);
+        }
+    }
+}
+
+/// Draw a circle preview centred at `center` passing through `radius_pt`.
+fn draw_circle_preview(
+    painter: &egui::Painter,
+    center: Point3, radius_pt: Point3,
+    plane: crate::editor::SketchPlane,
+    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
+    stroke: egui::Stroke,
+) {
+    let pts = editor::tessellate_circle(center, radius_pt, plane, 64);
+    let n = pts.len();
+    for i in 0..n {
+        if let (Some(a), Some(b)) = (proj(pts[i]), proj(pts[(i + 1) % n])) {
+            painter.line_segment([a, b], stroke);
+        }
+    }
+}
+
+// ── Committed profile rendering ───────────────────────────────────────────────
+
+/// Render a committed profile (circle, arc, or polyline) using its stored shape.
+fn draw_committed_profile(
+    painter: &egui::Painter,
+    cp: &crate::editor::CommittedProfile,
+    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
+    stroke: egui::Stroke,
+) {
+    match &cp.shape {
+        ProfileShape::Circle => {
+            // points[0] = center, points[1] = boundary point.
+            if let (Some(&center), Some(&boundary)) = (cp.points.get(0), cp.points.get(1)) {
+                if let (Some(c_screen), Some(b_screen)) = (proj(center), proj(boundary)) {
+                    let radius = (b_screen - c_screen).length();
+                    painter.circle_stroke(c_screen, radius, stroke);
+                    // Small cross-hair at center — always dim so it doesn't look "selected".
+                    let dot_col = egui::Color32::from_rgba_unmultiplied(180, 180, 180, 120);
+                    painter.circle_filled(c_screen, 2.5, dot_col);
+                    // Boundary drag handle — also dim.
+                    painter.circle_filled(b_screen, 2.5, dot_col);
+                }
+            }
+        }
+        ProfileShape::Arc => {
+            // points[0] = start, points[1] = end_pt, points[2] = center.
+            if let (Some(&start), Some(&end_pt), Some(&center)) =
+                (cp.points.get(0), cp.points.get(1), cp.points.get(2))
+            {
+                if let Some(plane) = cp.plane {
+                    let pts = editor::tessellate_arc_from_center(start, end_pt, center, plane);
+                    for w in pts.windows(2) {
+                        if let (Some(a), Some(b)) = (proj(w[0]), proj(w[1])) {
+                            painter.line_segment([a, b], stroke);
+                        }
+                    }
+                } else {
+                    // Fallback: straight line.
+                    if let (Some(a), Some(b)) = (proj(start), proj(end_pt)) {
+                        painter.line_segment([a, b], stroke);
+                    }
+                }
+                // Mark start, end, and center as dots.
+                for pt in [start, end_pt, center] {
+                    if let Some(p) = proj(pt) {
+                        painter.circle_filled(p, 3.0, stroke.color);
+                    }
+                }
+            }
+        }
+        ProfileShape::Polyline => {
+            let cn = cp.points.len();
+            let seg_count = if cp.closed { cn } else { cn.saturating_sub(1) };
+            for i in 0..seg_count {
+                if let (Some(a), Some(b)) = (proj(cp.points[i]), proj(cp.points[(i + 1) % cn])) {
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+            // Corner dots.
+            for &pt in &cp.points {
+                if let Some(p) = proj(pt) {
+                    painter.circle_filled(p, 3.0, stroke.color);
+                }
+            }
+        }
+    }
+}
+
+// ── Constraint conflict badge ─────────────────────────────────────────────────
+
+fn draw_conflict_badge(ui: &mut egui::Ui, sk: &SketchState) {
+    if !sk.constraints_conflict { return; }
+    let n_conflict = sk.violated_constraints.iter().filter(|&&v| v).count();
+    let badge = ui.add(
+        egui::Label::new(
+            egui::RichText::new("⚠ conflict")
+                .color(egui::Color32::from_rgb(255, 80, 80))
+                .strong(),
+        )
+        .sense(egui::Sense::hover()),
+    );
+    badge.on_hover_ui(|ui| {
+        ui.set_max_width(280.0);
+        ui.label(egui::RichText::new("Constraint conflict").strong());
+        ui.separator();
+        if n_conflict > 0 {
+            ui.label(format!(
+                "{} constraint{} cannot be satisfied together:",
+                n_conflict,
+                if n_conflict == 1 { "" } else { "s" }
+            ));
+            for (i, c) in sk.constraints.iter().enumerate() {
+                if sk.violated_constraints.get(i).copied().unwrap_or(false) {
+                    ui.horizontal(|ui| {
+                        ui.add(list_icon(constraint_icon(c)));
+                        ui.label(
+                            egui::RichText::new(constraint_text(c))
+                                .color(egui::Color32::from_rgb(255, 100, 100)),
+                        );
+                    });
+                }
+            }
+        } else {
+            ui.label("The solver could not converge. Try removing a constraint.");
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Remove a highlighted constraint to resolve.")
+                .italics()
+                .weak(),
+        );
+    });
+}
+
+// ── Sketch viewport toolbar ───────────────────────────────────────────────────
+
+/// Floating toolbar at the top-centre of the sketch canvas.
+/// Returns any actions the user triggered.
+fn draw_sketch_viewport_toolbar(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAction> {
+    if editor.sketch.is_none() { return vec![]; }
+    let mut actions: Vec<UiAction> = Vec::new();
+
+    // Anchor to the top-centre of the viewport canvas (below the top panel).
+    let avail_top = ctx.available_rect().min.y;
+
+    egui::Area::new(egui::Id::new("sketch_viewport_toolbar"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, avail_top + 16.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgba_unmultiplied(28, 28, 36, 220))
+                .rounding(egui::Rounding::same(5.0))
+                .inner_margin(egui::Margin::same(5.0))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 80, 100, 180)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        crate::toolbar::render_toolbar(
+                            ui, toolbar_defs::SKETCH_VIEWPORT_TOOLBAR,
+                            editor, &mut actions, IconSize::Viewport,
+                        );
+                    });
+                });
+        });
+
+    actions
 }

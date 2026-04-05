@@ -80,6 +80,24 @@ impl SketchPlane {
     }
 }
 
+/// Active drawing tool in the sketcher.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DrawTool { Pointer, Polyline, Arc, Rectangle, Circle }
+
+/// Intermediate state accumulated by multi-click drawing tools (Arc/Rect/Circle).
+/// Stored in `SketchState`; cleared when the tool operation is committed or cancelled.
+#[derive(Clone, Debug)]
+pub enum ToolInProgress {
+    /// Arc tool: first point (start) has been placed.
+    Arc1 { start: Point3 },
+    /// Arc tool: start and end-point have been placed; waiting for arc center.
+    Arc2 { start: Point3, end_pt: Point3 },
+    /// Circle tool: center has been placed; waiting for radius point.
+    CircleCenter { center: Point3 },
+    /// Rectangle tool: first corner has been placed; waiting for opposite corner.
+    RectFirst { corner: Point3 },
+}
+
 /// What a length constraint applies to — used for the modal dialog.
 #[derive(Clone, Copy, Debug)]
 pub enum LengthTarget {
@@ -88,6 +106,155 @@ pub enum LengthTarget {
     /// Constrain the distance between two (possibly non-adjacent) vertices.
     Points(usize, usize),
 }
+
+// ── Sketch plane geometry helpers ─────────────────────────────────────────────
+
+/// Project a world-space point onto the sketch plane, returning (u, v) coordinates.
+pub(crate) fn world_to_plane(p: Point3, plane: SketchPlane) -> (f64, f64) {
+    let (u, v) = plane.uv_axes();
+    (p.coords.dot(&u), p.coords.dot(&v))
+}
+
+/// Lift 2D sketch-plane coordinates back to world space.
+pub(crate) fn plane_to_world(u_val: f64, v_val: f64, plane: SketchPlane) -> Point3 {
+    let (u, v) = plane.uv_axes();
+    Point3::from(u * u_val + v * v_val)
+}
+
+/// Circumscribed circle through three 2D points.
+/// Returns `None` if the points are collinear.
+fn circumscribed_circle_2d(
+    a: (f64, f64), b: (f64, f64), c: (f64, f64),
+) -> Option<((f64, f64), f64)> {
+    let n_ab = (-(b.1 - a.1), b.0 - a.0);
+    let n_bc = (-(c.1 - b.1), c.0 - b.0);
+    let m_ab = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+    let m_bc = ((b.0 + c.0) * 0.5, (b.1 + c.1) * 0.5);
+    let dx = m_bc.0 - m_ab.0;
+    let dy = m_bc.1 - m_ab.1;
+    let det = -n_ab.0 * n_bc.1 + n_bc.0 * n_ab.1;
+    if det.abs() < 1e-10 { return None; }
+    let t = (-dx * n_bc.1 + n_bc.0 * dy) / det;
+    let cx = m_ab.0 + t * n_ab.0;
+    let cy = m_ab.1 + t * n_ab.1;
+    let r = ((cx - a.0).powi(2) + (cy - a.1).powi(2)).sqrt();
+    Some(((cx, cy), r))
+}
+
+/// Tessellate a circular arc through `start`, `through`, `end` into world-space points.
+/// Returns `None` if the three points are collinear (degenerate arc).
+/// The returned slice includes both `start` and `end`.
+pub(crate) fn tessellate_arc(
+    start: Point3, through: Point3, end: Point3, plane: SketchPlane,
+) -> Option<Vec<Point3>> {
+    use std::f64::consts::TAU;
+    let a = world_to_plane(start,   plane);
+    let b = world_to_plane(through, plane);
+    let c = world_to_plane(end,     plane);
+    let ((cx, cy), r) = circumscribed_circle_2d(a, b, c)?;
+
+    let theta0 = (a.1 - cy).atan2(a.0 - cx);
+    let theta1 = (b.1 - cy).atan2(b.0 - cx);
+    let theta2 = (c.1 - cy).atan2(c.0 - cx);
+
+    let norm = |ang: f64| (ang % TAU + TAU) % TAU;
+    let r1 = norm(theta1 - theta0);
+    let r2 = norm(theta2 - theta0);
+    // Span: positive = CCW (r1 < r2), negative = CW.
+    let span = if r1 < r2 { r2 } else { r2 - TAU };
+
+    // Scale segment count with arc length; minimum 4 segments.
+    let n = (32.0 * span.abs() / TAU).ceil().max(4.0) as usize;
+
+    let pts = (0..=n).map(|i| {
+        let theta = theta0 + span * (i as f64 / n as f64);
+        plane_to_world(cx + r * theta.cos(), cy + r * theta.sin(), plane)
+    }).collect();
+    Some(pts)
+}
+
+/// Project a raw center click onto the perpendicular bisector of (start, end_pt)
+/// so that the resulting center is equidistant from both endpoints.
+/// The signed distance from the chord midpoint along the bisector is preserved,
+/// so the caller's intent (which side to bow toward) is kept.
+pub(crate) fn project_center_to_arc_bisector(
+    start: Point3, end_pt: Point3, center: Point3, plane: SketchPlane,
+) -> Point3 {
+    let s = world_to_plane(start,  plane);
+    let e = world_to_plane(end_pt, plane);
+    let c = world_to_plane(center, plane);
+    let mx = (s.0 + e.0) * 0.5;
+    let my = (s.1 + e.1) * 0.5;
+    let chord_dx = e.0 - s.0;
+    let chord_dy = e.1 - s.1;
+    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
+    if chord_len < 1e-10 { return center; }
+    let px = -chord_dy / chord_len;
+    let py =  chord_dx / chord_len;
+    let t = (c.0 - mx) * px + (c.1 - my) * py;
+    plane_to_world(mx + t * px, my + t * py, plane)
+}
+
+/// Tessellate a circular arc defined by start, end, and arc-center points.
+/// The center must already lie on the perpendicular bisector of (start, end_pt)
+/// — use `project_center_to_arc_bisector` before storing.
+/// The arc sweeps the shorter path (|span| ≤ π).
+pub(crate) fn tessellate_arc_from_center(
+    start: Point3, end_pt: Point3, center: Point3, plane: SketchPlane,
+) -> Vec<Point3> {
+    use std::f64::consts::PI;
+    let s = world_to_plane(start,  plane);
+    let e = world_to_plane(end_pt, plane);
+    let c = world_to_plane(center, plane);
+
+    let radius = ((s.0 - c.0).powi(2) + (s.1 - c.1).powi(2)).sqrt();
+    if radius < 1e-10 { return vec![start, end_pt]; }
+
+    let theta_s = (s.1 - c.1).atan2(s.0 - c.0);
+    let theta_e = (e.1 - c.1).atan2(e.0 - c.0);
+
+    // Sweep the shorter arc: normalize delta to (−π, π].
+    let mut span = theta_e - theta_s;
+    span = span.rem_euclid(2.0 * PI);
+    if span > PI { span -= 2.0 * PI; }
+
+    let n = ((32.0 * span.abs() / (2.0 * PI)).ceil() as usize).max(4);
+    (0..=n).map(|i| {
+        let theta = theta_s + span * (i as f64 / n as f64);
+        plane_to_world(c.0 + radius * theta.cos(), c.1 + radius * theta.sin(), plane)
+    }).collect()
+}
+
+/// Tessellate a full circle (center → radius point) into `n` world-space points.
+/// The points form a closed polygon when connected back to the first.
+pub(crate) fn tessellate_circle(
+    center: Point3, radius_pt: Point3, plane: SketchPlane, n: usize,
+) -> Vec<Point3> {
+    use std::f64::consts::TAU;
+    let c = world_to_plane(center, plane);
+    let rp = world_to_plane(radius_pt, plane);
+    let r = ((rp.0 - c.0).powi(2) + (rp.1 - c.1).powi(2)).sqrt();
+    let theta0 = (rp.1 - c.1).atan2(rp.0 - c.0); // start angle at radius_pt
+    (0..n).map(|i| {
+        let theta = theta0 + TAU * i as f64 / n as f64;
+        plane_to_world(c.0 + r * theta.cos(), c.1 + r * theta.sin(), plane)
+    }).collect()
+}
+
+/// Compute the four corners of an axis-aligned (in sketch-plane space) rectangle
+/// given two opposite corners in world space.
+pub(crate) fn rect_corners(c1: Point3, c2: Point3, plane: SketchPlane) -> [Point3; 4] {
+    let (u1, v1) = world_to_plane(c1, plane);
+    let (u2, v2) = world_to_plane(c2, plane);
+    [
+        plane_to_world(u1, v1, plane),
+        plane_to_world(u2, v1, plane),
+        plane_to_world(u2, v2, plane),
+        plane_to_world(u1, v2, plane),
+    ]
+}
+
+// ── Sketch state ──────────────────────────────────────────────────────────────
 
 /// Live in-progress 2D sketch being drawn by the user.
 #[derive(Clone, Debug)]
@@ -116,15 +283,61 @@ pub struct SketchState {
     pub constraint_selection: Vec<usize>,
     /// Independent undo/redo stack for sketch edits.
     pub history: SketchHistory,
+    /// Currently active drawing tool.
+    pub active_tool: DrawTool,
+    /// Partial state for multi-click tools (Arc, Rectangle, Circle).
+    /// `None` when idle (Polyline or between tool operations).
+    pub tool_in_progress: Option<ToolInProgress>,
+    /// Closed profiles already committed in this sketch session (e.g. each finished
+    /// rectangle or circle).  The active `points`/`closed`/`constraints` represent
+    /// the profile currently being drawn.
+    pub committed_profiles: Vec<CommittedProfile>,
+    /// Index of the committed profile currently selected (for constraints like PointOnCircle).
+    pub committed_selection: Option<usize>,
 }
 
-/// A closed 2D sketch profile stored in the operations list (no solid yet).
+/// How the points of a `CommittedProfile` should be interpreted geometrically.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum ProfileShape {
+    /// Straight-line polygon.  Points are vertices; `closed` determines whether the last
+    /// point connects back to the first.
+    #[default]
+    Polyline,
+    /// Full circle.  `points[0]` = center, `points[1]` = a point on the circumference
+    /// (defines the radius).
+    Circle,
+    /// Circular arc.  `points[0]` = start, `points[1]` = through-point, `points[2]` = end.
+    Arc,
+}
+
+/// A single sub-profile within a sketch (e.g. one circle, one rectangle, or one
+/// closed polyline).  A `SketchState` can accumulate many of these alongside the active
+/// open profile being drawn.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CommittedProfile {
+    pub points:      Vec<Point3>,
+    pub closed:      bool,
+    /// Geometric interpretation of `points`.  Defaults to `Polyline` for backward compat.
+    #[serde(default)]
+    pub shape:       ProfileShape,
+    /// The sketch plane this profile lives on (needed for arc tessellation during rendering).
+    #[serde(default)]
+    pub plane:       Option<SketchPlane>,
+    pub constraints: Vec<SketchConstraint>,
+}
+
+/// A sketch stored in the operations list.  Contains one or more profiles.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RawSketch {
     pub name:        String,
     pub plane:       SketchPlane,
+    /// Primary profile (the one that was active when Finish was pressed, or the first
+    /// profile for backward compatibility).
     pub points:      Vec<Point3>,
     pub constraints: Vec<SketchConstraint>,
+    /// Additional profiles (circles, rectangles, extra polylines).
+    #[serde(default)]
+    pub extra_profiles: Vec<CommittedProfile>,
     /// Stable identity (for future use, e.g. referencing by extrude ops).
     pub id:          u64,
 }
@@ -370,9 +583,10 @@ impl History {
 
 #[derive(Clone, Debug)]
 struct SketchSnapshot {
-    points:      Vec<Point3>,
-    constraints: Vec<SketchConstraint>,
-    closed:      bool,
+    points:             Vec<Point3>,
+    constraints:        Vec<SketchConstraint>,
+    closed:             bool,
+    committed_profiles: Vec<CommittedProfile>,
 }
 
 #[derive(Clone, Debug)]
@@ -401,8 +615,8 @@ impl SketchHistory {
         Some(next)
     }
 
-    fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
-    fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
+    pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
+    pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
 }
 
 // ── Primitive kind ────────────────────────────────────────────────────────────
@@ -418,6 +632,7 @@ pub enum PrimitiveKind {
 // ── UI actions ────────────────────────────────────────────────────────────────
 
 /// An action the UI requests the editor to perform.
+#[derive(Clone)]
 pub enum UiAction {
     // ── File actions ──────────────────────────────────────────────────────────
     New,
@@ -474,6 +689,13 @@ pub enum UiAction {
     SketchPanelSelectSegment(usize),
     /// Toggle-select a vertex from the panel list (no max-2 cap, preserves other pts).
     SketchPanelSelectVertex(usize),
+    /// Switch the active drawing tool.
+    SketchSetTool(DrawTool),
+    /// Cancel the current in-progress drawing operation and clear the active profile points.
+    /// Committed profiles (circles, rectangles) are kept.
+    SketchAbortActive,
+    /// Select (or deselect) a committed profile by index, for use with constraints.
+    SketchSelectCommitted(Option<usize>),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -568,9 +790,10 @@ fn find_conflicting_constraints(
 
 fn sketch_snapshot(sk: &SketchState) -> SketchSnapshot {
     SketchSnapshot {
-        points:      sk.points.clone(),
-        constraints: sk.constraints.clone(),
-        closed:      sk.closed,
+        points:             sk.points.clone(),
+        constraints:        sk.constraints.clone(),
+        closed:             sk.closed,
+        committed_profiles: sk.committed_profiles.clone(),
     }
 }
 
@@ -694,9 +917,11 @@ impl EditorState {
                     if sk.history.can_undo() {
                         let current = sketch_snapshot(sk);
                         if let Some(prev) = sk.history.undo(current) {
-                            sk.points      = prev.points;
-                            sk.constraints = prev.constraints;
-                            sk.closed      = prev.closed;
+                            sk.points              = prev.points;
+                            sk.constraints         = prev.constraints;
+                            sk.closed              = prev.closed;
+                            sk.committed_profiles  = prev.committed_profiles;
+                            sk.tool_in_progress    = None;
                             apply_constraints(sk);
                         }
                     }
@@ -715,9 +940,11 @@ impl EditorState {
                     if sk.history.can_redo() {
                         let current = sketch_snapshot(sk);
                         if let Some(next) = sk.history.redo(current) {
-                            sk.points      = next.points;
-                            sk.constraints = next.constraints;
-                            sk.closed      = next.closed;
+                            sk.points              = next.points;
+                            sk.constraints         = next.constraints;
+                            sk.closed              = next.closed;
+                            sk.committed_profiles  = next.committed_profiles;
+                            sk.tool_in_progress    = None;
                             apply_constraints(sk);
                         }
                     }
@@ -761,7 +988,11 @@ impl EditorState {
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
-                    history: SketchHistory::new(),
+                    history:            SketchHistory::new(),
+                    active_tool:        DrawTool::Polyline,
+                    tool_in_progress:   None,
+                    committed_profiles: Vec::new(),
+                    committed_selection: None,
                 });
                 self.selection.clear();
                 // Animate the camera to look at the chosen plane with axes oriented
@@ -794,9 +1025,14 @@ impl EditorState {
                 };
                 self.entries.remove(i);
                 self.selection.clear();
+                let plane = raw.plane;
+                // Backfill the plane for any committed profiles that predate the field.
+                let committed_profiles: Vec<_> = raw.extra_profiles.into_iter()
+                    .map(|mut cp| { if cp.plane.is_none() { cp.plane = Some(plane); } cp })
+                    .collect();
                 self.sketch = Some(SketchState {
                     name:                 raw.name,
-                    plane:                raw.plane,
+                    plane,
                     points:               raw.points,
                     closed:               true,
                     constraints:          raw.constraints,
@@ -807,6 +1043,10 @@ impl EditorState {
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
                     history:              SketchHistory::new(),
+                    active_tool:          DrawTool::Polyline,
+                    tool_in_progress:     None,
+                    committed_profiles,
+                    committed_selection:  None,
                 });
                 // Animate camera to face the sketch plane.
                 let (az, el) = match raw.plane {
@@ -860,30 +1100,135 @@ impl EditorState {
                 }
                 false
             }
-            UiAction::SketchAddPoint(p) => {
+            UiAction::SketchSetTool(t) => {
                 if let Some(sk) = &mut self.sketch {
-                    if sk.closed { return false; }
-                    sk.history.push(sketch_snapshot(sk));
-                    sk.points.push(p);
-                    apply_constraints(sk);
+                    sk.active_tool = t;
+                    sk.tool_in_progress = None;
+                }
+                false
+            }
+            UiAction::SketchAbortActive => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.tool_in_progress = None;
+                    sk.points.clear();
+                    sk.closed = false;
+                    sk.seg_selection.clear();
+                    sk.pt_selection.clear();
+                    sk.committed_selection = None;
+                }
+                false
+            }
+            UiAction::SketchSelectCommitted(idx) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.committed_selection = idx;
+                }
+                false
+            }
+            UiAction::SketchAddPoint(p) => {
+                let Some(sk) = &mut self.sketch else { return false };
+                if sk.closed { return false; }
+                if sk.active_tool == DrawTool::Pointer { return false; }
+                match sk.active_tool {
+                    DrawTool::Pointer => unreachable!(),
+                    DrawTool::Polyline => {
+                        sk.history.push(sketch_snapshot(sk));
+                        sk.points.push(p);
+                        apply_constraints(sk);
+                    }
+                    DrawTool::Arc => {
+                        match sk.tool_in_progress.take() {
+                            None => {
+                                sk.tool_in_progress = Some(ToolInProgress::Arc1 { start: p });
+                            }
+                            Some(ToolInProgress::Arc1 { start }) => {
+                                sk.tool_in_progress = Some(ToolInProgress::Arc2 { start, end_pt: p });
+                            }
+                            Some(ToolInProgress::Arc2 { start, end_pt }) => {
+                                // p = arc center click; project onto perpendicular bisector before storing.
+                                let center = project_center_to_arc_bisector(start, end_pt, p, sk.plane);
+                                sk.history.push(sketch_snapshot(sk));
+                                sk.committed_profiles.push(CommittedProfile {
+                                    points:      vec![start, end_pt, center],
+                                    closed:      false,
+                                    shape:       ProfileShape::Arc,
+                                    plane:       Some(sk.plane),
+                                    constraints: Vec::new(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    DrawTool::Rectangle => {
+                        match sk.tool_in_progress.take() {
+                            None => {
+                                sk.tool_in_progress = Some(ToolInProgress::RectFirst { corner: p });
+                            }
+                            Some(ToolInProgress::RectFirst { corner }) => {
+                                let corners = rect_corners(corner, p, sk.plane);
+                                sk.history.push(sketch_snapshot(sk));
+                                sk.committed_profiles.push(CommittedProfile {
+                                    points:      corners.to_vec(),
+                                    closed:      true,
+                                    shape:       ProfileShape::Polyline,
+                                    plane:       None,
+                                    constraints: Vec::new(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    DrawTool::Circle => {
+                        match sk.tool_in_progress.take() {
+                            None => {
+                                sk.tool_in_progress = Some(ToolInProgress::CircleCenter { center: p });
+                            }
+                            Some(ToolInProgress::CircleCenter { center }) => {
+                                sk.history.push(sketch_snapshot(sk));
+                                sk.committed_profiles.push(CommittedProfile {
+                                    points:      vec![center, p],
+                                    closed:      true,
+                                    shape:       ProfileShape::Circle,
+                                    plane:       Some(sk.plane),
+                                    constraints: Vec::new(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 false
             }
             UiAction::SketchUndoPoint => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.history.push(sketch_snapshot(sk));
-                    if sk.closed {
-                        sk.closed = false;
-                    } else {
-                        sk.points.pop();
+                    match sk.tool_in_progress.take() {
+                        // Step back through multi-click tool state before touching points.
+                        Some(ToolInProgress::Arc2 { start, .. }) => {
+                            // Step back: forget end_pt, keep start.
+                            sk.tool_in_progress = Some(ToolInProgress::Arc1 { start });
+                        }
+                        Some(_) => {
+                            // Arc1, RectFirst, CircleCenter: cancel back to idle.
+                        }
+                        None => {
+                            // No tool in progress: undo the last committed point or profile.
+                            sk.history.push(sketch_snapshot(sk));
+                            if sk.closed {
+                                sk.closed = false;
+                            } else if !sk.points.is_empty() {
+                                sk.points.pop();
+                            } else {
+                                // Active profile is empty — remove the last committed profile.
+                                sk.committed_profiles.pop();
+                            }
+                        }
                     }
                 }
                 false
             }
             UiAction::SketchCloseLoop => {
-                // Close the polyline loop; stay in sketch mode.
+                // Only close when no multi-step tool is in progress.
                 if let Some(sk) = &mut self.sketch {
-                    if sk.points.len() >= 3 {
+                    if sk.points.len() >= 3 && sk.tool_in_progress.is_none() {
                         sk.history.push(sketch_snapshot(sk));
                         sk.closed = true;
                     }
@@ -893,22 +1238,33 @@ impl EditorState {
             UiAction::SketchFinish => {
                 // Save to entries and exit sketch mode.
                 let Some(sk) = self.sketch.take() else { return false };
-                if sk.points.len() < 3 {
+                let has_active = sk.points.len() >= 3;
+                if !has_active && sk.committed_profiles.is_empty() {
                     self.sketch = Some(sk);
                     return false;
                 }
-                let persistent_constraints: Vec<_> = sk.constraints.iter()
-                    .filter(|c| !matches!(c, SketchConstraint::PointFixed { .. }))
-                    .cloned()
-                    .collect();
+                // Build the full list of profiles to save.
+                let mut extra_profiles = sk.committed_profiles;
+                let (primary_points, primary_constraints) = if has_active {
+                    let persistent: Vec<_> = sk.constraints.iter()
+                        .filter(|c| !matches!(c, SketchConstraint::PointFixed { .. }))
+                        .cloned()
+                        .collect();
+                    (sk.points, persistent)
+                } else {
+                    // No active profile — promote first committed as primary.
+                    let first = extra_profiles.remove(0);
+                    (first.points, first.constraints)
+                };
                 let id = self.alloc_id();
                 let name = sk.name.clone();
                 self.save_snapshot();
                 self.entries.push(SceneEntry::Sketch(RawSketch {
                     name,
-                    plane:       sk.plane,
-                    points:      sk.points,
-                    constraints: persistent_constraints,
+                    plane:          sk.plane,
+                    points:         primary_points,
+                    constraints:    primary_constraints,
+                    extra_profiles,
                     id,
                 }));
                 // Sketch entries are not "selected" (no solid to operate on).
@@ -1146,7 +1502,7 @@ impl EditorState {
             match saved {
                 SavedEntry::Sketch { name, plane, points, constraints } => {
                     let id = { let v = self.next_object_id; self.next_object_id += 1; v };
-                    self.entries.push(SceneEntry::Sketch(RawSketch { name, plane, points, constraints, id }));
+                    self.entries.push(SceneEntry::Sketch(RawSketch { name, plane, points, constraints, extra_profiles: Vec::new(), id }));
                 }
                 SavedEntry::Solid { name, history } => {
                     if let Some(obj) = rebuild_solid(name, &history, &mut self.next_object_id) {

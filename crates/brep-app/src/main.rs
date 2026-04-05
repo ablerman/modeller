@@ -3,7 +3,11 @@
 //! Architecture:
 //!   winit event loop → wgpu 3-D renderer + egui overlay → BRep kernel
 
+mod commands;
 mod editor;
+mod icons;
+mod toolbar;
+mod toolbar_defs;
 mod ui;
 
 use std::sync::Arc;
@@ -99,6 +103,14 @@ struct AppState {
     snap_constraint: Option<usize>,
     /// Index of the vertex currently being dragged (set on mouse-press over a snap vertex).
     drag_vertex: Option<usize>,
+    /// (profile_idx, vertex_idx) in committed_profiles that the cursor is snapping to.
+    snap_committed: Option<(usize, usize)>,
+    /// (profile_idx, vertex_idx) currently being dragged within committed_profiles.
+    drag_committed: Option<(usize, usize)>,
+    /// Index of committed circle/arc profile whose curve the cursor is hovering over.
+    snap_committed_curve: Option<usize>,
+    /// Index of committed circle/arc profile whose curve is being dragged (resize).
+    drag_committed_curve: Option<usize>,
 }
 
 impl AppState {
@@ -201,6 +213,10 @@ impl AppState {
             length_dialog: None,
             snap_constraint: None,
             drag_vertex: None,
+            snap_committed: None,
+            drag_committed: None,
+            snap_committed_curve: None,
+            drag_committed_curve: None,
         }
     }
 
@@ -305,11 +321,13 @@ impl AppState {
         let snap_segment = self.snap_segment;
         let snap_ref = self.snap_ref;
         let snap_constraint = self.snap_constraint;
+        let snap_committed = self.snap_committed;
+        let snap_committed_curve = self.snap_committed_curve;
         let angle_dialog = self.angle_dialog;
         let length_dialog = self.length_dialog;  // Option<(LengthTarget, f64)>
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, angle_dialog, length_dialog);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, snap_committed, snap_committed_curve, angle_dialog, length_dialog);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -368,48 +386,71 @@ impl AppState {
         // Apply UI actions after rendering (avoids borrow conflicts during egui run).
         let mut needs_mesh_update = false;
         for action in actions {
-            // Intercept app-level actions before passing to the editor.
-            match &action {
-                UiAction::New  => { self.do_new();     continue; }
-                UiAction::Open => { self.do_open();    continue; }
-                UiAction::Save => { self.do_save();    continue; }
-                UiAction::SaveAs => { self.do_save_as(); continue; }
-                UiAction::SketchBeginAngleInput { seg_a, seg_b } => {
-                    self.angle_dialog = Some((*seg_a, *seg_b));
-                    continue;
-                }
-                UiAction::SketchCancelAngleInput => {
-                    self.angle_dialog = None;
-                    continue;
-                }
-                UiAction::SketchBeginLengthInput(target) => {
-                    let initial = current_length(*target, &self.editor.sketch);
-                    self.length_dialog = Some((*target, initial));
-                    continue;
-                }
-                UiAction::SketchCancelLengthInput => {
-                    self.length_dialog = None;
-                    continue;
-                }
-                // Confirm (SketchAddConstraint) closes both dialogs.
-                UiAction::SketchAddConstraint(_) => {
-                    self.angle_dialog = None;
-                    self.length_dialog = None;
-                }
-                UiAction::ExitSketch => {
-                    self.angle_dialog = None;
-                    self.length_dialog = None;
-                }
-                _ => {}
-            }
-            let changed = self.editor.apply(action);
-            needs_mesh_update |= changed;
+            needs_mesh_update |= self.dispatch_action(action);
         }
         if needs_mesh_update {
             self.sync_meshes();
         }
 
         Ok(())
+    }
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────────
+
+impl AppState {
+    /// Dispatch one `UiAction`, intercepting app-level actions before passing
+    /// to `EditorState::apply`.  Returns `true` if GPU meshes need re-upload.
+    fn dispatch_action(&mut self, action: UiAction) -> bool {
+        // Intercept actions that modify AppState rather than EditorState.
+        match &action {
+            UiAction::New    => { self.do_new();     return false; }
+            UiAction::Open   => { self.do_open();    return false; }
+            UiAction::Save   => { self.do_save();    return false; }
+            UiAction::SaveAs => { self.do_save_as(); return false; }
+            UiAction::SketchBeginAngleInput { seg_a, seg_b } => {
+                self.angle_dialog = Some((*seg_a, *seg_b));
+                return false;
+            }
+            UiAction::SketchCancelAngleInput => {
+                self.angle_dialog = None;
+                return false;
+            }
+            UiAction::SketchBeginLengthInput(target) => {
+                let initial = current_length(*target, &self.editor.sketch);
+                self.length_dialog = Some((*target, initial));
+                return false;
+            }
+            UiAction::SketchCancelLengthInput => {
+                self.length_dialog = None;
+                return false;
+            }
+            // Confirm (SketchAddConstraint) closes both dialogs.
+            UiAction::SketchAddConstraint(_) => {
+                self.angle_dialog = None;
+                self.length_dialog = None;
+            }
+            UiAction::ExitSketch => {
+                self.angle_dialog = None;
+                self.length_dialog = None;
+            }
+            _ => {}
+        }
+        self.editor.apply(action)
+    }
+
+    /// Invoke a command by its string ID.  Returns `true` if GPU meshes need
+    /// re-upload, `false` if the command was unknown or produced no geometry change.
+    #[allow(dead_code)]
+    pub fn execute_command(&mut self, id: &str) -> bool {
+        let Some(spec) = commands::lookup_command(id) else { return false };
+        let actions = commands::resolve(spec, &self.editor);
+        let mut changed = false;
+        for action in actions {
+            changed |= self.dispatch_action(action);
+        }
+        if changed { self.sync_meshes(); }
+        changed
     }
 }
 
@@ -591,6 +632,7 @@ fn constraint_marker_screen_pos(
         SC::HorizontalPair { pt_a, pt_b, .. } => midpoint_pts(*pt_a, *pt_b),
         SC::VerticalPair { pt_a, pt_b, .. }   => midpoint_pts(*pt_a, *pt_b),
         SC::PointOnLine { pt, .. }        => points.get(*pt).copied(),
+        SC::PointOnCircle { pt, .. }      => points.get(*pt).copied(),
     };
     world_pos.and_then(|p| cam.project_to_screen(p, w, h))
 }
@@ -662,19 +704,19 @@ impl ApplicationHandler for App {
                     if modifiers {
                         match key_event.physical_key {
                             PhysicalKey::Code(KeyCode::KeyZ) => {
-                                state.editor.apply(UiAction::Undo);
+                                state.dispatch_action(UiAction::Undo);
                             }
                             PhysicalKey::Code(KeyCode::KeyY) => {
-                                state.editor.apply(UiAction::Redo);
+                                state.dispatch_action(UiAction::Redo);
                             }
                             PhysicalKey::Code(KeyCode::KeyS) => {
-                                state.do_save();
+                                state.dispatch_action(UiAction::Save);
                             }
                             PhysicalKey::Code(KeyCode::KeyO) => {
-                                state.do_open();
+                                state.dispatch_action(UiAction::Open);
                             }
                             PhysicalKey::Code(KeyCode::KeyN) => {
-                                state.do_new();
+                                state.dispatch_action(UiAction::New);
                             }
                             _ => {}
                         }
@@ -683,7 +725,10 @@ impl ApplicationHandler for App {
                         key_event.physical_key,
                         PhysicalKey::Code(KeyCode::Delete | KeyCode::Backspace)
                     ) {
-                        state.editor.apply(UiAction::DeleteSelected);
+                        state.dispatch_action(UiAction::DeleteSelected);
+                    }
+                    if matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Escape)) {
+                        state.dispatch_action(UiAction::SketchAbortActive);
                     }
                 }
             }
@@ -694,12 +739,18 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             state.mouse_pressed = Some(button);
                             state.mouse_press_origin = state.last_cursor;
-                            // Begin vertex drag if hovering over a sketch vertex.
-                            if button == MouseButton::Left
-                                && state.editor.sketch.is_some()
-                                && state.snap_vertex.is_some()
-                            {
-                                state.drag_vertex = state.snap_vertex;
+                            if button == MouseButton::Left && state.editor.sketch.is_some() {
+                                // Committed vertex drag (pointer tool — takes priority).
+                                let is_pointer = state.editor.sketch.as_ref()
+                                    .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                if is_pointer && state.snap_committed.is_some() {
+                                    state.drag_committed = state.snap_committed;
+                                } else if is_pointer && state.snap_committed_curve.is_some() {
+                                    state.drag_committed_curve = state.snap_committed_curve;
+                                } else if state.snap_vertex.is_some() {
+                                    // Begin active-profile vertex drag.
+                                    state.drag_vertex = state.snap_vertex;
+                                }
                             }
                         }
                         ElementState::Released => {
@@ -714,16 +765,52 @@ impl ApplicationHandler for App {
                                     _ => false,
                                 };
 
-                                if let Some(drag_vi) = state.drag_vertex.take() {
-                                    // We were dragging a vertex.  If the movement was tiny
-                                    // (< 4 px), treat it as a click.
+                                // Committed curve drag released.
+                                if let Some(pi) = state.drag_committed_curve.take() {
                                     if is_click {
-                                        let can_close = state.editor.sketch.as_ref()
-                                            .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
-                                        if drag_vi == 0 && can_close {
-                                            state.editor.apply(UiAction::SketchCloseLoop);
+                                        state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
+                                    }
+                                    // Drag already moved the boundary point; nothing else needed.
+                                }
+                                // Committed vertex drag released.
+                                if let Some((pi, vi)) = state.drag_committed.take() {
+                                    if is_click {
+                                        let is_pointer = state.editor.sketch.as_ref()
+                                            .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                        if is_pointer {
+                                            // Pointer tool: click on committed vertex → select profile.
+                                            state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
                                         } else {
-                                            state.editor.apply(UiAction::SketchSelectVertex(drag_vi));
+                                            // Drawing tool: click on committed vertex → add point there (snap to it).
+                                            let pt = state.editor.sketch.as_ref()
+                                                .and_then(|sk| sk.committed_profiles.get(pi))
+                                                .and_then(|cp| cp.points.get(vi).copied());
+                                            if let Some(p) = pt {
+                                                state.editor.apply(UiAction::SketchAddPoint(p));
+                                            }
+                                        }
+                                    }
+                                    // Drag already moved the point; nothing else needed.
+                                } else if let Some(drag_vi) = state.drag_vertex.take() {
+                                    // We were dragging an active-profile vertex. Tiny movement = click.
+                                    if is_click {
+                                        let tool_busy = state.editor.sketch.as_ref()
+                                            .map_or(false, |sk| sk.tool_in_progress.is_some());
+                                        if tool_busy {
+                                            // Multi-step tool in progress: use vertex position as a tool point.
+                                            if let Some(p) = state.editor.sketch.as_ref()
+                                                .and_then(|sk| sk.points.get(drag_vi).copied())
+                                            {
+                                                state.editor.apply(UiAction::SketchAddPoint(p));
+                                            }
+                                        } else {
+                                            let can_close = state.editor.sketch.as_ref()
+                                                .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
+                                            if drag_vi == 0 && can_close {
+                                                state.editor.apply(UiAction::SketchCloseLoop);
+                                            } else {
+                                                state.editor.apply(UiAction::SketchSelectVertex(drag_vi));
+                                            }
                                         }
                                     }
                                     // Otherwise the drag already updated the positions;
@@ -733,7 +820,19 @@ impl ApplicationHandler for App {
                                         let w = state.surface_config.width;
                                         let h = state.surface_config.height;
                                         if state.editor.sketch.is_some() {
-                                            if let Some(vi) = state.snap_vertex {
+                                            let tool_busy = state.editor.sketch.as_ref()
+                                                .map_or(false, |sk| sk.tool_in_progress.is_some());
+                                            if tool_busy {
+                                                // Multi-step tool: all clicks add a point.
+                                                // Snap to a hovered vertex if available.
+                                                let pt = state.snap_vertex
+                                                    .and_then(|vi| state.editor.sketch.as_ref()
+                                                        .and_then(|sk| sk.points.get(vi).copied()))
+                                                    .or(state.sketch_cursor);
+                                                if let Some(p) = pt {
+                                                    state.editor.apply(UiAction::SketchAddPoint(p));
+                                                }
+                                            } else if let Some(vi) = state.snap_vertex {
                                                 // Clicking vertex 0 with ≥3 pts closes the polyline loop.
                                                 let can_close = state.editor.sketch.as_ref()
                                                     .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
@@ -749,7 +848,17 @@ impl ApplicationHandler for App {
                                             } else if let Some(seg) = state.snap_segment {
                                                 state.editor.apply(UiAction::SketchSelectSegment(seg));
                                             } else {
-                                                if let Some(p) = state.sketch_cursor {
+                                                let is_pointer = state.editor.sketch.as_ref()
+                                                    .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                                if is_pointer {
+                                                    if let Some(pi) = state.snap_committed_curve {
+                                                        // Pointer + click on circle/arc curve → select it.
+                                                        state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
+                                                    } else {
+                                                        // Pointer tool: clicking empty space clears committed selection.
+                                                        state.editor.apply(UiAction::SketchSelectCommitted(None));
+                                                    }
+                                                } else if let Some(p) = state.sketch_cursor {
                                                     state.editor.apply(UiAction::SketchAddPoint(p));
                                                 }
                                             }
@@ -771,12 +880,16 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
+                            state.drag_committed = None;
+                            state.drag_committed_curve = None;
                             state.mouse_pressed = None;
                             state.last_cursor = None;
                             state.mouse_press_origin = None;
                         }
                     }
                 } else {
+                    state.drag_committed = None;
+                    state.drag_committed_curve = None;
                     state.mouse_pressed = None;
                     state.last_cursor = None;
                     state.mouse_press_origin = None;
@@ -786,8 +899,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let cur = (position.x as f32, position.y as f32);
 
-                // Orbit/pan only when not dragging a sketch vertex.
-                if state.drag_vertex.is_none() {
+                // Orbit/pan only when not dragging a sketch vertex or committed vertex.
+                if state.drag_vertex.is_none() && state.drag_committed.is_none() && state.drag_committed_curve.is_none() {
                     if let (Some(btn), Some(last)) = (state.mouse_pressed, state.last_cursor) {
                         let dx = cur.0 - last.0;
                         let dy = cur.1 - last.1;
@@ -834,6 +947,79 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // Drag committed profile vertex if one is being held.
+                    if let Some((pi, vi)) = state.drag_committed {
+                        if state.mouse_pressed == Some(MouseButton::Left) {
+                            if let Some(cursor_pt) = state.sketch_cursor {
+                                if let Some(sk) = &mut state.editor.sketch {
+                                    if let Some(cp) = sk.committed_profiles.get_mut(pi) {
+                                        match cp.shape {
+                                            editor::ProfileShape::Circle if vi == 0 => {
+                                                // Dragging the center moves the whole circle.
+                                                let old_center = cp.points.get(0).copied();
+                                                if let (Some(old_c), Some(boundary)) =
+                                                    (old_center, cp.points.get_mut(1))
+                                                {
+                                                    let delta = cursor_pt - old_c;
+                                                    *boundary += delta;
+                                                }
+                                                if let Some(c) = cp.points.get_mut(0) {
+                                                    *c = cursor_pt;
+                                                }
+                                            }
+                                            editor::ProfileShape::Arc if vi == 0 || vi == 1 => {
+                                                // Move the endpoint, then reproject center onto new bisector.
+                                                if let Some(pt) = cp.points.get_mut(vi) {
+                                                    *pt = cursor_pt;
+                                                }
+                                                if let (Some(&s), Some(&e), Some(&c), Some(plane)) = (
+                                                    cp.points.get(0), cp.points.get(1),
+                                                    cp.points.get(2), cp.plane,
+                                                ) {
+                                                    let new_c = editor::project_center_to_arc_bisector(s, e, c, plane);
+                                                    if let Some(center) = cp.points.get_mut(2) {
+                                                        *center = new_c;
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                if let Some(pt) = cp.points.get_mut(vi) {
+                                                    *pt = cursor_pt;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Drag committed curve: for circles move boundary point (vi=1) = resize.
+                    if let Some(pi) = state.drag_committed_curve {
+                        if state.mouse_pressed == Some(MouseButton::Left) {
+                            if let Some(cursor_pt) = state.sketch_cursor {
+                                if let Some(sk) = &mut state.editor.sketch {
+                                    if let Some(cp) = sk.committed_profiles.get_mut(pi) {
+                                        match cp.shape {
+                                            editor::ProfileShape::Circle => {
+                                                if let Some(pt) = cp.points.get_mut(1) {
+                                                    *pt = cursor_pt;
+                                                }
+                                            }
+                                            editor::ProfileShape::Arc => {
+                                                // Dragging arc curve moves the center (vi=2).
+                                                if let Some(pt) = cp.points.get_mut(2) {
+                                                    *pt = cursor_pt;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Snap to nearest vertex (works for both open and closed sketches).
                     const SNAP_PX: f32 = 15.0;
                     let mut snapped = None;
@@ -849,6 +1035,82 @@ impl ApplicationHandler for App {
                         }
                     }
                     state.snap_vertex = snapped;
+
+                    // Snap to committed profile vertices (for pointer tool drag / constraint target).
+                    let mut snap_comm = None;
+                    'outer: for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                        for (vi, &pt) in cp.points.iter().enumerate() {
+                            if let Some((px, py)) = state.editor.camera.project_to_screen(pt, w, h) {
+                                let dx = px - cur.0;
+                                let dy = py - cur.1;
+                                if (dx * dx + dy * dy).sqrt() < SNAP_PX {
+                                    snap_comm = Some((pi, vi));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    state.snap_committed = snap_comm;
+
+                    // Snap to committed circle/arc curves (hover the curve itself, not just control points).
+                    const CURVE_SNAP_PX: f32 = 8.0;
+                    let mut snap_curve: Option<usize> = None;
+                    if snap_comm.is_none() {
+                        'curve_outer: for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            match &cp.shape {
+                                editor::ProfileShape::Circle => {
+                                    if let (Some(&center), Some(&boundary)) =
+                                        (cp.points.get(0), cp.points.get(1))
+                                    {
+                                        if let (Some((cx, cy)), Some((bx, by))) = (
+                                            state.editor.camera.project_to_screen(center, w, h),
+                                            state.editor.camera.project_to_screen(boundary, w, h),
+                                        ) {
+                                            let radius = ((bx - cx).powi(2) + (by - cy).powi(2)).sqrt();
+                                            let dist_to_center = ((cur.0 - cx).powi(2) + (cur.1 - cy).powi(2)).sqrt();
+                                            if (dist_to_center - radius).abs() < CURVE_SNAP_PX {
+                                                snap_curve = Some(pi);
+                                                break 'curve_outer;
+                                            }
+                                        }
+                                    }
+                                }
+                                editor::ProfileShape::Arc => {
+                                    if let (Some(&start), Some(&end_pt), Some(&center), Some(plane)) =
+                                        (cp.points.get(0), cp.points.get(1), cp.points.get(2), cp.plane)
+                                    {
+                                        let pts = editor::tessellate_arc_from_center(start, end_pt, center, plane);
+                                        for pair in pts.windows(2) {
+                                            if let (Some((ax, ay)), Some((bx, by))) = (
+                                                state.editor.camera.project_to_screen(pair[0], w, h),
+                                                state.editor.camera.project_to_screen(pair[1], w, h),
+                                            ) {
+                                                // Distance from cursor to segment ab.
+                                                let seg_dx = bx - ax;
+                                                let seg_dy = by - ay;
+                                                let seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
+                                                let dist = if seg_len2 < 1e-6 {
+                                                    ((cur.0 - ax).powi(2) + (cur.1 - ay).powi(2)).sqrt()
+                                                } else {
+                                                    let t = ((cur.0 - ax) * seg_dx + (cur.1 - ay) * seg_dy) / seg_len2;
+                                                    let t = t.clamp(0.0, 1.0);
+                                                    let px = ax + t * seg_dx;
+                                                    let py = ay + t * seg_dy;
+                                                    ((cur.0 - px).powi(2) + (cur.1 - py).powi(2)).sqrt()
+                                                };
+                                                if dist < CURVE_SNAP_PX {
+                                                    snap_curve = Some(pi);
+                                                    break 'curve_outer;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    state.snap_committed_curve = snap_curve;
 
                     // Reference entity snap (origin / axes) — only when not snapping to a vertex.
                     if state.snap_vertex.is_none() {

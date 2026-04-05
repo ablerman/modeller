@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Arc curve -->
+  <path d="M 3 15 A 9 9 0 0 1 17 15" fill="none" stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Endpoint dots -->
+  <circle cx="3"  cy="15" r="1.5" fill="#DEDEDE"/>
+  <circle cx="17" cy="15" r="1.5" fill="#DEDEDE"/>
+</svg>

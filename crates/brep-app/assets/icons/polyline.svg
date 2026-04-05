@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Zigzag polyline -->
+  <polyline points="3,15 7,5 12,13 17,5" fill="none" stroke="#DEDEDE" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- Vertex dots -->
+  <circle cx="3"  cy="15" r="1.5" fill="#DEDEDE"/>
+  <circle cx="7"  cy="5"  r="1.5" fill="#DEDEDE"/>
+  <circle cx="12" cy="13" r="1.5" fill="#DEDEDE"/>
+  <circle cx="17" cy="5"  r="1.5" fill="#DEDEDE"/>
+</svg>
