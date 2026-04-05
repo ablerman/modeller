@@ -71,8 +71,9 @@ struct AppState {
     snap_segment: Option<usize>,
     /// When Some((seg_a, seg_b)), the angle-input modal dialog is open.
     angle_dialog: Option<(usize, usize)>,
-    /// When Some(target), the length-input modal dialog is open.
-    length_dialog: Option<editor::LengthTarget>,
+    /// When Some((target, initial_len)), the length-input modal dialog is open.
+    /// `initial_len` is the measured length/distance at the moment the dialog was opened.
+    length_dialog: Option<(editor::LengthTarget, f64)>,
 }
 
 impl AppState {
@@ -277,7 +278,7 @@ impl AppState {
         let snap_vertex = self.snap_vertex;
         let snap_segment = self.snap_segment;
         let angle_dialog = self.angle_dialog;
-        let length_dialog = self.length_dialog;
+        let length_dialog = self.length_dialog;  // Option<(LengthTarget, f64)>
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
             actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, angle_dialog, length_dialog);
@@ -350,7 +351,8 @@ impl AppState {
                     continue;
                 }
                 UiAction::SketchBeginLengthInput(target) => {
-                    self.length_dialog = Some(*target);
+                    let initial = current_length(*target, &self.editor.sketch);
+                    self.length_dialog = Some((*target, initial));
                     continue;
                 }
                 UiAction::SketchCancelLengthInput => {
@@ -387,6 +389,24 @@ fn ray_plane_intersect(ray: &Ray, plane_origin: &Point3, plane_normal: &Vec3) ->
     let t = (plane_origin - ray.origin).dot(plane_normal) / denom;
     if t < 0.0 { return None; }
     Some(ray.at(t))
+}
+
+/// Measure the current length/distance for a `LengthTarget` from sketch geometry.
+fn current_length(target: editor::LengthTarget, sketch: &Option<editor::SketchState>) -> f64 {
+    let Some(sk) = sketch else { return 1.0 };
+    let n = sk.points.len();
+    if n == 0 { return 1.0; }
+    match target {
+        editor::LengthTarget::Segment(seg) if seg < n => {
+            let a = sk.points[seg];
+            let b = sk.points[(seg + 1) % n];
+            (b - a).norm()
+        }
+        editor::LengthTarget::Points(pa, pb) if pa < n && pb < n => {
+            (sk.points[pb] - sk.points[pa]).norm()
+        }
+        _ => 1.0,
+    }
 }
 
 /// Perpendicular distance from point `(px, py)` to segment `(ax,ay)→(bx,by)`.

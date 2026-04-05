@@ -16,7 +16,7 @@ pub fn build_ui(
     snap_vertex: Option<usize>,
     snap_segment: Option<usize>,
     angle_dialog: Option<(usize, usize)>,
-    length_dialog: Option<LengthTarget>,
+    length_dialog: Option<(LengthTarget, f64)>,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
@@ -398,12 +398,22 @@ pub fn build_ui(
     }
 
     // ── Length input modal ────────────────────────────────────────────────────
-    if let Some(target) = length_dialog {
+    if let Some((target, initial_len)) = length_dialog {
         let len_id = egui::Id::new("sketch_length_value");
+        let len_init_id = egui::Id::new("sketch_length_initialized");
         let description = match target {
             LengthTarget::Segment(seg) => format!("Length of segment {seg}:"),
             LengthTarget::Points(a, b) => format!("Distance between vertex {a} and vertex {b}:"),
         };
+
+        // Seed the input with the actual current length the first time this dialog opens.
+        let already_initialized: bool = ctx.data(|d| d.get_temp(len_init_id).unwrap_or(false));
+        if !already_initialized {
+            ctx.data_mut(|d| {
+                d.insert_temp(len_id, initial_len);
+                d.insert_temp(len_init_id, true);
+            });
+        }
 
         let modal = egui::Modal::new(egui::Id::new("length_input_modal")).show(ctx, |ui| {
             ui.set_min_width(240.0);
@@ -412,7 +422,7 @@ pub fn build_ui(
             ui.label(&description);
             ui.add_space(6.0);
 
-            let mut val: f64 = ctx.data_mut(|d| *d.get_temp_mut_or(len_id, 1.0_f64));
+            let mut val: f64 = ctx.data_mut(|d| *d.get_temp_mut_or(len_id, initial_len));
             let resp = ui.add(
                 egui::DragValue::new(&mut val)
                     .speed(0.01)
@@ -420,7 +430,7 @@ pub fn build_ui(
                     .min_decimals(3),
             );
             if resp.changed() {
-                ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(len_id, 1.0) = val);
+                ctx.data_mut(|d| d.insert_temp(len_id, val));
             }
 
             ui.add_space(10.0);
@@ -428,8 +438,12 @@ pub fn build_ui(
                 let apply = ui.button("Apply");
                 let cancel = ui.button("Cancel");
 
-                if apply.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    let value = ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(len_id, 1.0));
+                let confirm = apply.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let dismiss = cancel.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+                if confirm {
+                    let value = ctx.data(|d| d.get_temp(len_id).unwrap_or(initial_len));
+                    ctx.data_mut(|d| d.remove::<bool>(len_init_id));
                     let c = match target {
                         LengthTarget::Segment(seg) =>
                             SketchConstraint::FixedLength { seg, value },
@@ -439,14 +453,15 @@ pub fn build_ui(
                     actions.push(UiAction::SketchAddConstraint(c));
                     actions.push(UiAction::SketchClearSegSelection);
                     actions.push(UiAction::SketchClearPtSelection);
-                }
-                if cancel.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                } else if dismiss {
+                    ctx.data_mut(|d| d.remove::<bool>(len_init_id));
                     actions.push(UiAction::SketchCancelLengthInput);
                 }
             });
         });
 
         if modal.should_close() {
+            ctx.data_mut(|d| d.remove::<bool>(len_init_id));
             actions.push(UiAction::SketchCancelLengthInput);
         }
     }
