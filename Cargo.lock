@@ -200,6 +200,7 @@ dependencies = [
  "brep-bool",
  "brep-core",
  "brep-mesh",
+ "brep-param",
  "brep-render",
  "brep-topo",
  "bytemuck",

@@ -12,6 +12,7 @@ pub fn build_ui(
     editor: &EditorState,
     viewport: (u32, u32),
     sketch_cursor: Option<Point3>,
+    snap_vertex: Option<usize>,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
@@ -218,26 +219,43 @@ pub fn build_ui(
                 painter.line_segment([a, b], edge_stroke);
             }
         }
-        // Preview line from last placed point to cursor.
+        // Preview line from last placed point to cursor (snaps to vertex if applicable).
         if !sk.closed {
             if let Some(last) = sk.points.last() {
-                if let Some(cursor_world) = sketch_cursor {
+                let cursor_target = snap_vertex
+                    .and_then(|i| sk.points.get(i).copied())
+                    .or(sketch_cursor);
+                if let Some(cursor_world) = cursor_target {
                     if let (Some(a), Some(b)) = (proj(*last), proj(cursor_world)) {
                         painter.line_segment([a, b], preview_stroke);
                     }
                 }
             }
         }
-        // Vertex dots.
-        for &pt in &sk.points {
+        // Vertex dots — highlight snapped vertex.
+        for (i, &pt) in sk.points.iter().enumerate() {
             if let Some(p) = proj(pt) {
-                painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+                let is_snap = snap_vertex == Some(i);
+                let is_close = i == 0 && is_snap && sk.points.len() >= 3;
+                if is_close {
+                    // Green ring = "click here to close the loop"
+                    painter.circle_stroke(p, 8.0, egui::Stroke::new(2.5, egui::Color32::from_rgb(80, 230, 80)));
+                    painter.circle_filled(p, 5.0, egui::Color32::YELLOW);
+                } else if is_snap {
+                    // White ring = hovering another vertex
+                    painter.circle_stroke(p, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+                } else {
+                    painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+                }
             }
         }
-        // Cursor dot.
-        if let Some(c) = sketch_cursor {
-            if let Some(p) = proj(c) {
-                painter.circle_filled(p, 3.0, egui::Color32::WHITE);
+        // Cursor dot — hidden while snapping.
+        if snap_vertex.is_none() {
+            if let Some(c) = sketch_cursor {
+                if let Some(p) = proj(c) {
+                    painter.circle_filled(p, 3.0, egui::Color32::WHITE);
+                }
             }
         }
     }

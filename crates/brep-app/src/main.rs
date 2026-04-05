@@ -65,6 +65,8 @@ struct AppState {
     mouse_press_origin: Option<(f32, f32)>,
     /// Current cursor position projected onto the active sketch plane (if in sketch mode).
     sketch_cursor: Option<Point3>,
+    /// Index of the sketch vertex the cursor is currently snapping to (if any).
+    snap_vertex: Option<usize>,
 }
 
 impl AppState {
@@ -158,6 +160,7 @@ impl AppState {
             last_cursor: None,
             mouse_press_origin: None,
             sketch_cursor: None,
+            snap_vertex: None,
         }
     }
 
@@ -262,9 +265,10 @@ impl AppState {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut actions: Vec<UiAction> = Vec::new();
         let sketch_cursor = self.sketch_cursor;
+        let snap_vertex = self.snap_vertex;
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -427,10 +431,18 @@ impl ApplicationHandler for App {
                                         let w = state.surface_config.width;
                                         let h = state.surface_config.height;
                                         if state.editor.sketch.is_some() {
-                                            // In sketch mode: place a vertex on the workplane.
-                                            if let Some(p) = state.sketch_cursor {
-                                                state.editor.apply(UiAction::SketchAddPoint(p));
+                                            // In sketch mode: close loop if snapping to first vertex,
+                                            // place a vertex otherwise.
+                                            let pts_len = state.editor.sketch.as_ref()
+                                                .map_or(0, |s| s.points.len());
+                                            if state.snap_vertex == Some(0) && pts_len >= 3 {
+                                                state.editor.apply(UiAction::SketchClose);
+                                            } else if state.snap_vertex.is_none() {
+                                                if let Some(p) = state.sketch_cursor {
+                                                    state.editor.apply(UiAction::SketchAddPoint(p));
+                                                }
                                             }
+                                            // snap_vertex == Some(i > 0) → do nothing
                                         } else {
                                         let cur = _cur;
                                         let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
@@ -484,8 +496,28 @@ impl ApplicationHandler for App {
                     let h = state.surface_config.height;
                     let ray = state.editor.camera.unproject_ray(cur.0, cur.1, w, h);
                     state.sketch_cursor = ray_plane_intersect(&ray, &sk.plane.origin(), &sk.plane.normal());
+
+                    // Detect snap to nearest existing vertex (screen-space threshold).
+                    if !sk.closed {
+                        const SNAP_PX: f32 = 15.0;
+                        let mut snapped = None;
+                        for (i, &pt) in sk.points.iter().enumerate() {
+                            if let Some((px, py)) = state.editor.camera.project_to_screen(pt, w, h) {
+                                let dx = px - cur.0;
+                                let dy = py - cur.1;
+                                if (dx * dx + dy * dy).sqrt() < SNAP_PX {
+                                    snapped = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                        state.snap_vertex = snapped;
+                    } else {
+                        state.snap_vertex = None;
+                    }
                 } else {
                     state.sketch_cursor = None;
+                    state.snap_vertex = None;
                 }
             }
 
