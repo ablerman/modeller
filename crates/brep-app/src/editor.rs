@@ -6,6 +6,7 @@ use std::time::Instant;
 use brep_algo::bvh::{Bvh, Ray};
 use brep_bool::{boolean_op, BooleanKind};
 use brep_core::{Point3, Vec3};
+use brep_sketch::{solve_constraints, SketchConstraint, SolveResult};
 use brep_topo::{
     primitives::{make_box, make_cone, make_cylinder, make_sphere},
     store::ShapeStore,
@@ -52,15 +53,30 @@ impl SketchPlane {
         match self { SketchPlane::XY => Vec3::z(), SketchPlane::XZ => Vec3::y(), SketchPlane::YZ => Vec3::x() }
     }
     pub fn origin(self) -> Point3 { Point3::origin() }
+
+    /// The two in-plane unit axes `(U, V)` as world-space vectors.
+    pub fn uv_axes(self) -> (Vec3, Vec3) {
+        match self {
+            SketchPlane::XY => (Vec3::x(), Vec3::y()),
+            SketchPlane::XZ => (Vec3::x(), Vec3::z()),
+            SketchPlane::YZ => (Vec3::y(), Vec3::z()),
+        }
+    }
 }
 
 /// Live in-progress 2D sketch being drawn by the user.
 #[derive(Clone, Debug)]
 pub struct SketchState {
-    pub plane:         SketchPlane,
-    pub points:        Vec<Point3>,  // world-space vertices on the plane (placed in order)
-    pub closed:        bool,
-    pub extrude_dist:  f64,
+    pub plane:                SketchPlane,
+    pub points:               Vec<Point3>,  // world-space vertices on the plane (placed in order)
+    pub closed:               bool,
+    pub extrude_dist:         f64,
+    /// Active geometric constraints on this sketch.
+    pub constraints:          Vec<SketchConstraint>,
+    /// Indices of currently selected segments (max 2).
+    pub seg_selection:        Vec<usize>,
+    /// Set when the last constraint solve did not converge.
+    pub constraints_conflict: bool,
 }
 
 // ── Scene object ──────────────────────────────────────────────────────────────
@@ -291,6 +307,13 @@ pub enum UiAction {
     SketchClose,
     SketchSetDistance(f64),
     SketchExtrude(f64),
+    // ── Sketch constraint actions ─────────────────────────────────────────────
+    /// Toggle-select a segment by index (max 2 at a time).
+    SketchSelectSegment(usize),
+    SketchClearSegSelection,
+    SketchAddConstraint(SketchConstraint),
+    /// Remove a constraint by its index in `SketchState::constraints`.
+    SketchRemoveConstraint(usize),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -328,6 +351,24 @@ pub struct EditorState {
     camera_anim: Option<CameraAnimation>,
     /// Active sketch being drawn, if any.
     pub sketch: Option<SketchState>,
+}
+
+/// Run the constraint solver on the sketch, updating point positions in place.
+fn apply_constraints(sk: &mut SketchState) {
+    if sk.constraints.is_empty() || sk.points.len() < 2 { return; }
+    let (u, v) = sk.plane.uv_axes();
+    // Map Point3 → [f64; 2] in plane coordinates.
+    let mut pts2d: Vec<[f64; 2]> = sk.points.iter()
+        .map(|p| [p.coords.dot(&u), p.coords.dot(&v)])
+        .collect();
+    let n = pts2d.len();
+    let result = solve_constraints(&mut pts2d, &sk.constraints, n);
+    sk.constraints_conflict = result == SolveResult::Conflict;
+    if result == SolveResult::Ok {
+        for (i, p) in sk.points.iter_mut().enumerate() {
+            *p = Point3::origin() + u * pts2d[i][0] + v * pts2d[i][1];
+        }
+    }
 }
 
 impl EditorState {
@@ -487,6 +528,9 @@ impl EditorState {
                     points: Vec::new(),
                     closed: false,
                     extrude_dist: 1.0,
+                    constraints: Vec::new(),
+                    seg_selection: Vec::new(),
+                    constraints_conflict: false,
                 });
                 self.selection.clear();
                 // Animate the camera to look at the chosen plane.
@@ -511,7 +555,10 @@ impl EditorState {
             }
             UiAction::SketchAddPoint(p) => {
                 if let Some(sk) = &mut self.sketch {
-                    if !sk.closed { sk.points.push(p); }
+                    if !sk.closed {
+                        sk.points.push(p);
+                        apply_constraints(sk);
+                    }
                 }
                 false
             }
@@ -531,6 +578,38 @@ impl EditorState {
                 if let Some(sk) = &mut self.sketch { sk.extrude_dist = d; }
                 false
             }
+            UiAction::SketchSelectSegment(i) => {
+                if let Some(sk) = &mut self.sketch {
+                    if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
+                        sk.seg_selection.remove(pos);
+                    } else {
+                        if sk.seg_selection.len() >= 2 { sk.seg_selection.remove(0); }
+                        sk.seg_selection.push(i);
+                    }
+                }
+                false
+            }
+            UiAction::SketchClearSegSelection => {
+                if let Some(sk) = &mut self.sketch { sk.seg_selection.clear(); }
+                false
+            }
+            UiAction::SketchAddConstraint(c) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.constraints.push(c);
+                    apply_constraints(sk);
+                }
+                false
+            }
+            UiAction::SketchRemoveConstraint(idx) => {
+                if let Some(sk) = &mut self.sketch {
+                    if idx < sk.constraints.len() {
+                        sk.constraints.remove(idx);
+                        apply_constraints(sk);
+                    }
+                }
+                false
+            }
+
             UiAction::SketchExtrude(dist) => {
                 let Some(sk) = self.sketch.take() else { return false };
                 if sk.points.len() < 3 { self.sketch = None; return false; }

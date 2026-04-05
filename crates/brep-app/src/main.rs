@@ -67,6 +67,8 @@ struct AppState {
     sketch_cursor: Option<Point3>,
     /// Index of the sketch vertex the cursor is currently snapping to (if any).
     snap_vertex: Option<usize>,
+    /// Index of the sketch segment the cursor is hovering over (if any).
+    snap_segment: Option<usize>,
 }
 
 impl AppState {
@@ -161,6 +163,7 @@ impl AppState {
             mouse_press_origin: None,
             sketch_cursor: None,
             snap_vertex: None,
+            snap_segment: None,
         }
     }
 
@@ -266,9 +269,10 @@ impl AppState {
         let mut actions: Vec<UiAction> = Vec::new();
         let sketch_cursor = self.sketch_cursor;
         let snap_vertex = self.snap_vertex;
+        let snap_segment = self.snap_segment;
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -346,6 +350,21 @@ fn ray_plane_intersect(ray: &Ray, plane_origin: &Point3, plane_normal: &Vec3) ->
     let t = (plane_origin - ray.origin).dot(plane_normal) / denom;
     if t < 0.0 { return None; }
     Some(ray.at(t))
+}
+
+/// Perpendicular distance from point `(px, py)` to segment `(ax,ay)→(bx,by)`.
+fn point_to_segment_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-6 {
+        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+    }
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    let t = t.clamp(0.0, 1.0);
+    let cx = ax + t * dx;
+    let cy = ay + t * dy;
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
 // ── winit ApplicationHandler ──────────────────────────────────────────────────
@@ -431,18 +450,22 @@ impl ApplicationHandler for App {
                                         let w = state.surface_config.width;
                                         let h = state.surface_config.height;
                                         if state.editor.sketch.is_some() {
-                                            // In sketch mode: close loop if snapping to first vertex,
-                                            // place a vertex otherwise.
                                             let pts_len = state.editor.sketch.as_ref()
                                                 .map_or(0, |s| s.points.len());
-                                            if state.snap_vertex == Some(0) && pts_len >= 3 {
+                                            let is_closed = state.editor.sketch.as_ref()
+                                                .map_or(false, |s| s.closed);
+                                            if state.snap_vertex == Some(0) && pts_len >= 3 && !is_closed {
+                                                // Click on first vertex → close loop.
                                                 state.editor.apply(UiAction::SketchClose);
-                                            } else if state.snap_vertex.is_none() {
+                                            } else if let Some(seg) = state.snap_segment {
+                                                // Click on a segment → select/deselect for constraints.
+                                                state.editor.apply(UiAction::SketchSelectSegment(seg));
+                                            } else if state.snap_vertex.is_none() && !is_closed {
+                                                // Free click on the workplane → add point.
                                                 if let Some(p) = state.sketch_cursor {
                                                     state.editor.apply(UiAction::SketchAddPoint(p));
                                                 }
                                             }
-                                            // snap_vertex == Some(i > 0) → do nothing
                                         } else {
                                         let cur = _cur;
                                         let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
@@ -515,9 +538,31 @@ impl ApplicationHandler for App {
                     } else {
                         state.snap_vertex = None;
                     }
+
+                    // Segment hover — only when not hovering a vertex.
+                    if state.snap_vertex.is_none() {
+                        const SEG_SNAP_PX: f32 = 10.0;
+                        let n = sk.points.len();
+                        let seg_count = if sk.closed { n } else { n.saturating_sub(1) };
+                        let mut nearest_seg = None;
+                        for i in 0..seg_count {
+                            let pa = state.editor.camera.project_to_screen(sk.points[i], w, h);
+                            let pb = state.editor.camera.project_to_screen(sk.points[(i + 1) % n], w, h);
+                            if let (Some((ax, ay)), Some((bx, by))) = (pa, pb) {
+                                if point_to_segment_dist(cur.0, cur.1, ax, ay, bx, by) < SEG_SNAP_PX {
+                                    nearest_seg = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                        state.snap_segment = nearest_seg;
+                    } else {
+                        state.snap_segment = None;
+                    }
                 } else {
                     state.sketch_cursor = None;
                     state.snap_vertex = None;
+                    state.snap_segment = None;
                 }
             }
 

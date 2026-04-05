@@ -9,6 +9,7 @@ members = [
     "crates/brep-io",
     "crates/brep-mesh",
     "crates/brep-render",
+    "crates/brep-sketch",
     "crates/brep-app",
 ]
 resolver = "2"
@@ -53,7 +54,8 @@ tracing = "0.1"
 # brep-render uses them as optional deps declared directly in its Cargo.toml.
 
 # Internal crates
-brep-core  = { path = "crates/brep-core" }
+brep-core   = { path = "crates/brep-core" }
+brep-sketch = { path = "crates/brep-sketch" }
 brep-geom  = { path = "crates/brep-geom" }
 brep-topo  = { path = "crates/brep-topo" }
 brep-algo  = { path = "crates/brep-algo" }

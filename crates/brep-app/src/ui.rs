@@ -2,6 +2,7 @@
 
 use brep_bool::BooleanKind;
 use brep_core::Point3;
+use brep_sketch::SketchConstraint;
 use egui::Context;
 
 use crate::editor::{EditorState, ObjectHistory, PrimitiveKind, SketchPlane, UiAction};
@@ -13,6 +14,7 @@ pub fn build_ui(
     viewport: (u32, u32),
     sketch_cursor: Option<Point3>,
     snap_vertex: Option<usize>,
+    snap_segment: Option<usize>,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
@@ -51,6 +53,111 @@ pub fn build_ui(
                     }
                     if ui.button("Extrude").clicked() {
                         actions.push(UiAction::SketchExtrude(sk.extrude_dist));
+                    }
+                }
+
+                // ── Constraint buttons ────────────────────────────────────
+                if !sk.points.is_empty() {
+                    ui.separator();
+                    ui.strong("Constrain:");
+
+                    let n_sel = sk.seg_selection.len();
+
+                    // 1-segment constraints.
+                    ui.add_enabled_ui(n_sel == 1, |ui| {
+                        if ui.button("Horizontal").clicked() {
+                            let seg = sk.seg_selection[0];
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::Horizontal { seg }));
+                            actions.push(UiAction::SketchClearSegSelection);
+                        }
+                        if ui.button("Vertical").clicked() {
+                            let seg = sk.seg_selection[0];
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::Vertical { seg }));
+                            actions.push(UiAction::SketchClearSegSelection);
+                        }
+                    });
+
+                    // 2-segment constraints.
+                    ui.add_enabled_ui(n_sel == 2, |ui| {
+                        if ui.button("Parallel").clicked() {
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::Parallel {
+                                    seg_a: sk.seg_selection[0],
+                                    seg_b: sk.seg_selection[1],
+                                }));
+                            actions.push(UiAction::SketchClearSegSelection);
+                        }
+                        if ui.button("Perp.").clicked() {
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::Perpendicular {
+                                    seg_a: sk.seg_selection[0],
+                                    seg_b: sk.seg_selection[1],
+                                }));
+                            actions.push(UiAction::SketchClearSegSelection);
+                        }
+                        if ui.button("= Len").clicked() {
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::EqualLength {
+                                    seg_a: sk.seg_selection[0],
+                                    seg_b: sk.seg_selection[1],
+                                }));
+                            actions.push(UiAction::SketchClearSegSelection);
+                        }
+                    });
+
+                    // Angle: 2 segments + degree input.
+                    if n_sel == 2 {
+                        let angle_id = egui::Id::new("sketch_angle_deg");
+                        let mut deg: f64 = ctx.data_mut(|d| {
+                            *d.get_temp_mut_or(angle_id, 90.0_f64)
+                        });
+                        ui.add(
+                            egui::DragValue::new(&mut deg)
+                                .speed(1.0)
+                                .range(1.0..=179.0)
+                                .suffix("°"),
+                        );
+                        ctx.data_mut(|d| {
+                            *d.get_temp_mut_or::<f64>(angle_id, 90.0) = deg;
+                        });
+                        if ui.button("Angle").clicked() {
+                            actions.push(UiAction::SketchAddConstraint(
+                                SketchConstraint::Angle {
+                                    seg_a: sk.seg_selection[0],
+                                    seg_b: sk.seg_selection[1],
+                                    degrees: deg,
+                                }));
+                            actions.push(UiAction::SketchClearSegSelection);
+                        }
+                    }
+
+                    if sk.constraints_conflict {
+                        ui.colored_label(egui::Color32::RED, "⚠ conflict");
+                    }
+
+                    // Active constraints list.
+                    if !sk.constraints.is_empty() {
+                        ui.separator();
+                        ui.menu_button(
+                            format!("Constraints ({})", sk.constraints.len()),
+                            |ui| {
+                                let mut to_remove = None;
+                                for (i, c) in sk.constraints.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(constraint_label(c));
+                                        if ui.small_button("✕").clicked() {
+                                            to_remove = Some(i);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                                if let Some(i) = to_remove {
+                                    actions.push(UiAction::SketchRemoveConstraint(i));
+                                }
+                            },
+                        );
                     }
                 }
 
@@ -208,16 +315,39 @@ pub fn build_ui(
         );
 
         // Draw placed edges.
-        for i in 0..sk.points.len().saturating_sub(1) {
-            if let (Some(a), Some(b)) = (proj(sk.points[i]), proj(sk.points[i + 1])) {
+        let n = sk.points.len();
+        let seg_count = if sk.closed { n } else { n.saturating_sub(1) };
+        for i in 0..seg_count {
+            if let (Some(a), Some(b)) = (proj(sk.points[i]), proj(sk.points[(i + 1) % n])) {
                 painter.line_segment([a, b], edge_stroke);
             }
         }
-        // Closing edge (if loop is closed).
-        if sk.closed && sk.points.len() >= 2 {
-            if let (Some(a), Some(b)) = (proj(*sk.points.last().unwrap()), proj(sk.points[0])) {
-                painter.line_segment([a, b], edge_stroke);
+
+        // Hovered segment highlight.
+        if let Some(si) = snap_segment {
+            if si < seg_count {
+                if let (Some(a), Some(b)) = (proj(sk.points[si]), proj(sk.points[(si + 1) % n])) {
+                    painter.line_segment(
+                        [a, b],
+                        egui::Stroke::new(3.5, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 210)),
+                    );
+                }
             }
+        }
+
+        // Selected segment highlight (orange).
+        let sel_stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 160, 60));
+        for &si in &sk.seg_selection {
+            if si < seg_count {
+                if let (Some(a), Some(b)) = (proj(sk.points[si]), proj(sk.points[(si + 1) % n])) {
+                    painter.line_segment([a, b], sel_stroke);
+                }
+            }
+        }
+
+        // Constraint markers.
+        for c in &sk.constraints {
+            draw_constraint_marker(&painter, c, &sk.points, n, &proj);
         }
         // Preview line from last placed point to cursor (snaps to vertex if applicable).
         if !sk.closed {
@@ -516,6 +646,69 @@ fn point_in_polygon2d(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
         }
     }
     true
+}
+
+/// Short display label for a constraint.
+fn constraint_label(c: &SketchConstraint) -> String {
+    match c {
+        SketchConstraint::Parallel { seg_a, seg_b } =>
+            format!("Parallel  seg {seg_a} ∥ {seg_b}"),
+        SketchConstraint::Perpendicular { seg_a, seg_b } =>
+            format!("Perp.  seg {seg_a} ⊥ {seg_b}"),
+        SketchConstraint::Angle { seg_a, seg_b, degrees } =>
+            format!("Angle  {degrees:.0}°  seg {seg_a}/{seg_b}"),
+        SketchConstraint::Horizontal { seg } =>
+            format!("Horizontal  seg {seg}"),
+        SketchConstraint::Vertical { seg } =>
+            format!("Vertical  seg {seg}"),
+        SketchConstraint::EqualLength { seg_a, seg_b } =>
+            format!("Equal len  seg {seg_a} = {seg_b}"),
+        SketchConstraint::Coincident { pt_a, pt_b } =>
+            format!("Coincident  pt {pt_a} = {pt_b}"),
+    }
+}
+
+/// Draw a small symbol near the segment midpoint to indicate a constraint.
+fn draw_constraint_marker(
+    painter: &egui::Painter,
+    c: &SketchConstraint,
+    points: &[brep_core::Point3],
+    n: usize,
+    proj: &impl Fn(brep_core::Point3) -> Option<egui::Pos2>,
+) {
+    let midpoint = |seg: usize| -> Option<egui::Pos2> {
+        let a = proj(points[seg])?;
+        let b = proj(points[(seg + 1) % n])?;
+        Some(egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5))
+    };
+    let color = egui::Color32::from_rgb(230, 220, 70);
+    let font = egui::FontId::proportional(11.0);
+    let draw = |seg: usize, sym: &str| {
+        if let Some(m) = midpoint(seg) {
+            painter.text(m + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, sym, font.clone(), color);
+        }
+    };
+    match c {
+        SketchConstraint::Parallel { seg_a, seg_b } => {
+            draw(*seg_a, "∥"); draw(*seg_b, "∥");
+        }
+        SketchConstraint::Perpendicular { seg_a, seg_b } => {
+            draw(*seg_a, "⊾"); draw(*seg_b, "⊾");
+        }
+        SketchConstraint::Angle { seg_a, degrees, .. } => {
+            draw(*seg_a, &format!("{:.0}°", degrees));
+        }
+        SketchConstraint::Horizontal { seg } => { draw(*seg, "—"); }
+        SketchConstraint::Vertical { seg } => { draw(*seg, "|"); }
+        SketchConstraint::EqualLength { seg_a, seg_b } => {
+            draw(*seg_a, "="); draw(*seg_b, "=");
+        }
+        SketchConstraint::Coincident { pt_a, .. } => {
+            if let Some(p) = proj(points[*pt_a]) {
+                painter.circle_stroke(p, 6.0, egui::Stroke::new(1.5, color));
+            }
+        }
+    }
 }
 
 /// Recursively render an operation history node as a collapsible tree.

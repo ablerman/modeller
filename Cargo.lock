@@ -202,6 +202,7 @@ dependencies = [
  "brep-mesh",
  "brep-param",
  "brep-render",
+ "brep-sketch",
  "brep-topo",
  "bytemuck",
  "egui",
@@ -310,6 +311,14 @@ dependencies = [
  "thiserror 2.0.18",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "brep-sketch"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

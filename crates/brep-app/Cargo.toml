@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 brep-core.workspace = true
+brep-sketch.workspace = true
 brep-topo.workspace = true
 brep-algo.workspace = true
 brep-bool.workspace = true
