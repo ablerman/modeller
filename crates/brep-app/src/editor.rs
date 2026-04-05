@@ -842,7 +842,6 @@ impl EditorState {
             }
             UiAction::SketchPanelSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.pt_selection.clear();
                     if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
                         sk.seg_selection.remove(pos);
                     } else {
@@ -853,7 +852,6 @@ impl EditorState {
             }
             UiAction::SketchPanelSelectVertex(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.seg_selection.clear();
                     if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
                         sk.pt_selection.remove(pos);
                     } else {
@@ -918,42 +916,24 @@ impl EditorState {
             }
             UiAction::SketchSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    // Allow 1 seg + 1 pt to coexist (for PointOnLine / Coincident constraints).
-                    // If there's exactly 1 point selected and no segments yet, add the segment
-                    // alongside the point rather than clearing it.
-                    if sk.pt_selection.len() == 1 && sk.seg_selection.is_empty() {
-                        // Toggle the segment, keeping the point.
-                        sk.seg_selection.push(i);
+                    // Toggle segment (max 2); points are unaffected.
+                    if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
+                        sk.seg_selection.remove(pos);
                     } else {
-                        // Normal seg-only mode: clear points, toggle segment (max 2).
-                        sk.pt_selection.clear();
-                        if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
-                            sk.seg_selection.remove(pos);
-                        } else {
-                            if sk.seg_selection.len() >= 2 { sk.seg_selection.remove(0); }
-                            sk.seg_selection.push(i);
-                        }
+                        if sk.seg_selection.len() >= 2 { sk.seg_selection.remove(0); }
+                        sk.seg_selection.push(i);
                     }
                 }
                 false
             }
             UiAction::SketchSelectVertex(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    // Allow 1 seg + 1 pt to coexist (for PointOnLine / Coincident constraints).
-                    // If there's exactly 1 segment selected and no points yet, add the point
-                    // alongside the segment rather than clearing it.
-                    if sk.seg_selection.len() == 1 && sk.pt_selection.is_empty() {
-                        // Toggle the point, keeping the segment.
-                        sk.pt_selection.push(i);
+                    // Toggle point (max 2); segments are unaffected.
+                    if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
+                        sk.pt_selection.remove(pos);
                     } else {
-                        // Normal pt-only mode: clear segments, toggle point (max 2).
-                        sk.seg_selection.clear();
-                        if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
-                            sk.pt_selection.remove(pos);
-                        } else {
-                            if sk.pt_selection.len() >= 2 { sk.pt_selection.remove(0); }
-                            sk.pt_selection.push(i);
-                        }
+                        if sk.pt_selection.len() >= 2 { sk.pt_selection.remove(0); }
+                        sk.pt_selection.push(i);
                     }
                 }
                 false
