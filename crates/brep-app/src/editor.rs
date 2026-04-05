@@ -112,6 +112,8 @@ pub struct SketchState {
     /// the system converge (i.e., it is one of the conflicting constraints).
     /// Empty when there is no conflict.
     pub violated_constraints: Vec<bool>,
+    /// Indices of currently selected constraints (for highlighting).
+    pub constraint_selection: Vec<usize>,
     /// Independent undo/redo stack for sketch edits.
     pub history: SketchHistory,
 }
@@ -466,6 +468,8 @@ pub enum UiAction {
     OpenSketch(usize),
     /// Rename the active sketch.
     SketchRename(String),
+    /// Toggle-select a constraint by index.
+    SketchSelectConstraint(usize),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -752,6 +756,7 @@ impl EditorState {
                     ref_selection: None,
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
+                    constraint_selection: Vec::new(),
                     history: SketchHistory::new(),
                 });
                 self.selection.clear();
@@ -796,6 +801,7 @@ impl EditorState {
                     ref_selection:        None,
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
+                    constraint_selection: Vec::new(),
                     history:              SketchHistory::new(),
                 });
                 // Animate camera to face the sketch plane.
@@ -817,6 +823,16 @@ impl EditorState {
             UiAction::SketchRename(name) => {
                 if let Some(sk) = &mut self.sketch {
                     sk.name = name;
+                }
+                false
+            }
+            UiAction::SketchSelectConstraint(i) => {
+                if let Some(sk) = &mut self.sketch {
+                    if let Some(pos) = sk.constraint_selection.iter().position(|&x| x == i) {
+                        sk.constraint_selection.remove(pos);
+                    } else {
+                        sk.constraint_selection.push(i);
+                    }
                 }
                 false
             }

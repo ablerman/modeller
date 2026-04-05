@@ -95,6 +95,8 @@ struct AppState {
     /// When Some((target, initial_len)), the length-input modal dialog is open.
     /// `initial_len` is the measured length/distance at the moment the dialog was opened.
     length_dialog: Option<(editor::LengthTarget, f64)>,
+    /// Index of the sketch constraint marker the cursor is hovering over (if any).
+    snap_constraint: Option<usize>,
     /// Index of the vertex currently being dragged (set on mouse-press over a snap vertex).
     drag_vertex: Option<usize>,
 }
@@ -197,6 +199,7 @@ impl AppState {
             snap_ref: None,
             angle_dialog: None,
             length_dialog: None,
+            snap_constraint: None,
             drag_vertex: None,
         }
     }
@@ -301,11 +304,12 @@ impl AppState {
         let snap_vertex = self.snap_vertex;
         let snap_segment = self.snap_segment;
         let snap_ref = self.snap_ref;
+        let snap_constraint = self.snap_constraint;
         let angle_dialog = self.angle_dialog;
         let length_dialog = self.length_dialog;  // Option<(LengthTarget, f64)>
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, angle_dialog, length_dialog);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, angle_dialog, length_dialog);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -544,6 +548,48 @@ fn point_to_segment_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
+/// Primary screen-space position (physical pixels) of a constraint's visual marker.
+/// Returns `None` for constraints that have no drawn marker (e.g. `PointFixed`).
+fn constraint_marker_screen_pos(
+    c: &brep_sketch::SketchConstraint,
+    points: &[Point3],
+    n: usize,
+    cam: &editor::ViewportCamera,
+    w: u32,
+    h: u32,
+) -> Option<(f32, f32)> {
+    use brep_sketch::SketchConstraint as SC;
+    let midpoint_pt = |seg: usize| -> Option<Point3> {
+        let a = points.get(seg)?;
+        let b = points.get((seg + 1) % n)?;
+        Some(Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5))
+    };
+    let midpoint_pts = |pa: usize, pb: usize| -> Option<Point3> {
+        let a = points.get(pa)?;
+        let b = points.get(pb)?;
+        Some(Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5))
+    };
+    let world_pos: Option<Point3> = match c {
+        SC::Parallel { seg_a, .. }        => midpoint_pt(*seg_a),
+        SC::Perpendicular { seg_a, .. }   => midpoint_pt(*seg_a),
+        SC::Angle { seg_a, .. }           => midpoint_pt(*seg_a),
+        SC::Horizontal { seg }            => midpoint_pt(*seg),
+        SC::Vertical { seg }              => midpoint_pt(*seg),
+        SC::EqualLength { seg_a, .. }     => midpoint_pt(*seg_a),
+        SC::Coincident { pt_a, .. }       => points.get(*pt_a).copied(),
+        SC::FixedLength { seg, .. }       => midpoint_pt(*seg),
+        SC::PointDistance { pt_a, pt_b, .. } => midpoint_pts(*pt_a, *pt_b),
+        SC::PointFixed { .. }             => None,
+        SC::PointOnOrigin { pt }          => points.get(*pt).copied(),
+        SC::PointOnXAxis { pt }           => points.get(*pt).copied(),
+        SC::PointOnYAxis { pt }           => points.get(*pt).copied(),
+        SC::HorizontalPair { pt_a, pt_b, .. } => midpoint_pts(*pt_a, *pt_b),
+        SC::VerticalPair { pt_a, pt_b, .. }   => midpoint_pts(*pt_a, *pt_b),
+        SC::PointOnLine { pt, .. }        => points.get(*pt).copied(),
+    };
+    world_pos.and_then(|p| cam.project_to_screen(p, w, h))
+}
+
 // ── winit ApplicationHandler ──────────────────────────────────────────────────
 
 struct App {
@@ -676,6 +722,8 @@ impl ApplicationHandler for App {
                                                 }
                                             } else if let Some(r) = state.snap_ref {
                                                 state.editor.apply(UiAction::SketchSelectRef(r));
+                                            } else if let Some(ci) = state.snap_constraint {
+                                                state.editor.apply(UiAction::SketchSelectConstraint(ci));
                                             } else if let Some(seg) = state.snap_segment {
                                                 state.editor.apply(UiAction::SketchSelectSegment(seg));
                                             } else {
@@ -846,11 +894,34 @@ impl ApplicationHandler for App {
                     } else {
                         state.snap_segment = None;
                     }
+
+                    // Constraint marker hover — only when not snapping to vertex/ref/segment.
+                    if state.snap_vertex.is_none() && state.snap_ref.is_none() && state.snap_segment.is_none() {
+                        const CONSTRAINT_SNAP_PX: f32 = 14.0;
+                        let n = sk.points.len();
+                        let mut snapped_c = None;
+                        for (i, c) in sk.constraints.iter().enumerate() {
+                            if let Some((mx, my)) = constraint_marker_screen_pos(
+                                c, &sk.points, n, &state.editor.camera, w, h,
+                            ) {
+                                let dx = cur.0 - mx;
+                                let dy = cur.1 - my;
+                                if (dx * dx + dy * dy).sqrt() < CONSTRAINT_SNAP_PX {
+                                    snapped_c = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                        state.snap_constraint = snapped_c;
+                    } else {
+                        state.snap_constraint = None;
+                    }
                 } else {
                     state.sketch_cursor = None;
                     state.snap_vertex = None;
                     state.snap_ref = None;
                     state.snap_segment = None;
+                    state.snap_constraint = None;
                 }
             }
 

@@ -42,6 +42,7 @@ pub fn build_ui(
     snap_vertex: Option<usize>,
     snap_segment: Option<usize>,
     snap_ref: Option<RefEntity>,
+    snap_constraint: Option<usize>,
     angle_dialog: Option<(usize, usize)>,
     length_dialog: Option<(LengthTarget, f64)>,
 ) -> Vec<UiAction> {
@@ -623,8 +624,10 @@ pub fn build_ui(
         }
 
         // Constraint markers.
-        for c in &sk.constraints {
-            draw_constraint_marker(&painter, c, &sk.points, n, &proj);
+        for (i, c) in sk.constraints.iter().enumerate() {
+            let selected = sk.constraint_selection.contains(&i);
+            let hovered  = snap_constraint == Some(i);
+            draw_constraint_marker(&painter, c, &sk.points, n, &proj, selected, hovered);
         }
         // Preview line from last placed point to cursor (only when loop is open).
         if !sk.closed {
@@ -1140,14 +1143,21 @@ fn draw_constraint_marker(
     points: &[brep_core::Point3],
     n: usize,
     proj: &impl Fn(brep_core::Point3) -> Option<egui::Pos2>,
+    selected: bool,
+    hovered: bool,
 ) {
     let midpoint = |seg: usize| -> Option<egui::Pos2> {
         let a = proj(points[seg])?;
         let b = proj(points[(seg + 1) % n])?;
         Some(egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5))
     };
-    // Subdued — same icons as the toolbar but smaller and less saturated.
-    let color = egui::Color32::from_rgb(160, 155, 55);
+    let color = if selected {
+        egui::Color32::from_rgb(255, 160, 60)   // orange — matches element selection
+    } else if hovered {
+        egui::Color32::from_rgb(220, 210, 100)  // bright yellow-gold on hover
+    } else {
+        egui::Color32::from_rgb(160, 155, 55)   // subdued default
+    };
     let font = egui::FontId::proportional(10.0);
     let draw = |seg: usize, sym: &str| {
         if let Some(m) = midpoint(seg) {
@@ -1288,15 +1298,26 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         .show(ui, |ui| {
                             for i in 0..n {
                                 let p = &sk.points[i];
-                                ui.label(format!(
-                                    "Point {}  ({:.2}, {:.2}, {:.2})",
-                                    i, p.x, p.y, p.z
-                                ));
+                                let selected = sk.pt_selection.contains(&i);
+                                let resp = ui.selectable_label(
+                                    selected,
+                                    format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z),
+                                );
+                                if resp.clicked() {
+                                    actions.push(UiAction::SketchSelectVertex(i));
+                                }
                             }
                             let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
                             for i in 0..n_segs {
                                 let j = (i + 1) % n;
-                                ui.label(format!("Segment {}  ({} → {})", i, i, j));
+                                let selected = sk.seg_selection.contains(&i);
+                                let resp = ui.selectable_label(
+                                    selected,
+                                    format!("Segment {}  ({} → {})", i, i, j),
+                                );
+                                if resp.clicked() {
+                                    actions.push(UiAction::SketchSelectSegment(i));
+                                }
                             }
                         });
                 }
@@ -1316,16 +1337,18 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                             for (i, c) in sk.constraints.iter().enumerate() {
                                 let is_violated =
                                     sk.violated_constraints.get(i).copied().unwrap_or(false);
+                                let is_selected = sk.constraint_selection.contains(&i);
                                 ui.horizontal(|ui| {
                                     ui.add(list_icon(constraint_icon(c)));
-                                    let label_text = constraint_text(c);
-                                    if is_violated {
-                                        ui.label(
-                                            egui::RichText::new(label_text)
-                                                .color(egui::Color32::RED),
-                                        );
+                                    let label_text = if is_violated {
+                                        egui::RichText::new(constraint_text(c))
+                                            .color(egui::Color32::RED)
                                     } else {
-                                        ui.label(label_text);
+                                        egui::RichText::new(constraint_text(c))
+                                    };
+                                    let resp = ui.selectable_label(is_selected, label_text);
+                                    if resp.clicked() {
+                                        actions.push(UiAction::SketchSelectConstraint(i));
                                     }
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
