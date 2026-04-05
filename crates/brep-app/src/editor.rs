@@ -92,6 +92,8 @@ pub enum LengthTarget {
 /// Live in-progress 2D sketch being drawn by the user.
 #[derive(Clone, Debug)]
 pub struct SketchState {
+    /// Display name for this sketch (editable before finishing).
+    pub name:                 String,
     pub plane:                SketchPlane,
     pub points:               Vec<Point3>,  // world-space vertices on the plane (placed in order)
     /// Whether the polyline has been closed (last point connected back to first).
@@ -462,6 +464,8 @@ pub enum UiAction {
     SketchCancelLengthInput,
     /// Re-open a finished sketch from the operations list for editing.
     OpenSketch(usize),
+    /// Rename the active sketch.
+    SketchRename(String),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -738,6 +742,7 @@ impl EditorState {
             // ── Sketch ────────────────────────────────────────────────────────
             UiAction::EnterSketch(plane) => {
                 self.sketch = Some(SketchState {
+                    name: format!("Sketch-{}", self.next_name()),
                     plane,
                     points: Vec::new(),
                     closed: false,
@@ -781,6 +786,7 @@ impl EditorState {
                 self.entries.remove(i);
                 self.selection.clear();
                 self.sketch = Some(SketchState {
+                    name:                 raw.name,
                     plane:                raw.plane,
                     points:               raw.points,
                     closed:               true,
@@ -806,6 +812,12 @@ impl EditorState {
                     started:   Instant::now(),
                     duration:  0.3,
                 });
+                false
+            }
+            UiAction::SketchRename(name) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.name = name;
+                }
                 false
             }
             UiAction::SketchAddPoint(p) => {
@@ -850,7 +862,7 @@ impl EditorState {
                     .cloned()
                     .collect();
                 let id = self.alloc_id();
-                let name = format!("Sketch-{}", self.next_name());
+                let name = sk.name.clone();
                 self.save_snapshot();
                 self.entries.push(SceneEntry::Sketch(RawSketch {
                     name,

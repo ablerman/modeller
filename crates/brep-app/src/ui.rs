@@ -507,6 +507,9 @@ pub fn build_ui(
         actions.push(snap);
     }
 
+    // ── Sketch info panel (top-left of viewport, sketch mode only) ────────────
+    actions.extend(draw_sketch_info_panel(ctx, editor));
+
     // ── Sketch overlay ────────────────────────────────────────────────────────
     if let Some(sk) = &editor.sketch {
         let (w, h) = viewport;
@@ -1225,6 +1228,124 @@ fn draw_constraint_marker(
             }
         }
     }
+}
+
+/// Floating sketch configuration panel — top-left of the viewport.
+fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAction> {
+    let mut actions: Vec<UiAction> = Vec::new();
+    let Some(sk) = &editor.sketch else { return actions };
+
+    // Position just inside the viewport area (below toolbar, right of left panel).
+    let avail = ctx.available_rect();
+    let pos = egui::pos2(avail.left() + 12.0, avail.top() + 12.0);
+
+    egui::Area::new(egui::Id::new("sketch_info_panel"))
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .movable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(220.0);
+
+                // ── Finish Sketch button ──────────────────────────────────
+                ui.add_enabled_ui(sk.points.len() >= 3, |ui| {
+                    if ui.button("✓  Finish Sketch").clicked() {
+                        actions.push(UiAction::SketchFinish);
+                    }
+                });
+
+                ui.separator();
+
+                // ── Editable name ─────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.strong("Name");
+                    let mut name_buf = sk.name.clone();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut name_buf).desired_width(140.0),
+                    );
+                    if resp.changed() {
+                        actions.push(UiAction::SketchRename(name_buf));
+                    }
+                });
+
+                // ── Plane (read-only) ─────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.strong("Plane");
+                    ui.label(format!("{:?}", sk.plane));
+                });
+
+                ui.separator();
+
+                // ── Elements ──────────────────────────────────────────────
+                ui.strong("Elements");
+                let n = sk.points.len();
+                if n == 0 {
+                    ui.label(egui::RichText::new("(none)").italics().weak());
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("sketch_elements_scroll")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for i in 0..n {
+                                let p = &sk.points[i];
+                                ui.label(format!(
+                                    "Point {}  ({:.2}, {:.2}, {:.2})",
+                                    i, p.x, p.y, p.z
+                                ));
+                            }
+                            let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
+                            for i in 0..n_segs {
+                                let j = (i + 1) % n;
+                                ui.label(format!("Segment {}  ({} → {})", i, i, j));
+                            }
+                        });
+                }
+
+                ui.separator();
+
+                // ── Constraints ───────────────────────────────────────────
+                ui.strong("Constraints");
+                if sk.constraints.is_empty() {
+                    ui.label(egui::RichText::new("(none)").italics().weak());
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("sketch_constraints_scroll")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            let mut remove_idx: Option<usize> = None;
+                            for (i, c) in sk.constraints.iter().enumerate() {
+                                let is_violated =
+                                    sk.violated_constraints.get(i).copied().unwrap_or(false);
+                                ui.horizontal(|ui| {
+                                    ui.add(list_icon(constraint_icon(c)));
+                                    let label_text = constraint_text(c);
+                                    if is_violated {
+                                        ui.label(
+                                            egui::RichText::new(label_text)
+                                                .color(egui::Color32::RED),
+                                        );
+                                    } else {
+                                        ui.label(label_text);
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("✕").clicked() {
+                                                remove_idx = Some(i);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                            if let Some(i) = remove_idx {
+                                actions.push(UiAction::SketchRemoveConstraint(i));
+                            }
+                        });
+                }
+            });
+        });
+
+    actions
 }
 
 /// Recursively render a history node as an operation row (used inside boolean subtrees).
