@@ -9,6 +9,7 @@ mod ui;
 use std::sync::Arc;
 
 use brep_algo::bvh::Ray;
+use brep_config::ConfigStore;
 use brep_core::{Point3, Vec3};
 use brep_render::gpu::GpuRenderer;
 use editor::{EditorState, UiAction};
@@ -24,10 +25,10 @@ use winit::{
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-// ── Window geometry persistence ───────────────────────────────────────────────
+// ── Window geometry ───────────────────────────────────────────────────────────
 
 /// Saved window position and size, in physical pixels.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct WindowGeometry {
     x: i32,
     y: i32,
@@ -35,61 +36,10 @@ struct WindowGeometry {
     height: u32,
 }
 
-impl WindowGeometry {
-    const DEFAULT: Self = Self { x: 100, y: 100, width: 1600, height: 1000 };
-}
-
-/// Return the path to `~/.config/brep-modeller/window.cfg` (or platform equivalent).
-fn window_config_path() -> Option<std::path::PathBuf> {
-    // Use $XDG_CONFIG_HOME on Linux, $HOME/.config otherwise; fallback to temp dir.
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".config"))
-        })
-        .or_else(|| {
-            std::env::var_os("APPDATA").map(std::path::PathBuf::from)
-        })?;
-    Some(base.join("brep-modeller").join("window.cfg"))
-}
-
-/// Load persisted window geometry, or return the default.
-fn load_window_geometry() -> WindowGeometry {
-    let path = match window_config_path() {
-        Some(p) => p,
-        None => return WindowGeometry::DEFAULT,
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return WindowGeometry::DEFAULT,
-    };
-    let nums: Vec<i64> = text
-        .split_whitespace()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if nums.len() >= 4 {
-        WindowGeometry {
-            x: nums[0] as i32,
-            y: nums[1] as i32,
-            width: nums[2].max(400) as u32,
-            height: nums[3].max(300) as u32,
-        }
-    } else {
-        WindowGeometry::DEFAULT
+impl Default for WindowGeometry {
+    fn default() -> Self {
+        Self { x: 100, y: 100, width: 1600, height: 1000 }
     }
-}
-
-/// Persist window geometry to disk (best-effort; silently ignores errors).
-fn save_window_geometry(g: WindowGeometry) {
-    let path = match window_config_path() {
-        Some(p) => p,
-        None => return,
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, format!("{} {} {} {}\n", g.x, g.y, g.width, g.height));
 }
 
 // ── GPU mesh cache ────────────────────────────────────────────────────────────
@@ -125,6 +75,7 @@ struct AppState {
 
     // application
     editor: EditorState,
+    current_file: Option<std::path::PathBuf>,
 
     // mouse state for orbit/pan/pick
     mouse_pressed: Option<MouseButton>,
@@ -137,11 +88,15 @@ struct AppState {
     snap_vertex: Option<usize>,
     /// Index of the sketch segment the cursor is hovering over (if any).
     snap_segment: Option<usize>,
+    /// Reference entity (origin / axis) the cursor is snapping to (if any).
+    snap_ref: Option<editor::RefEntity>,
     /// When Some((seg_a, seg_b)), the angle-input modal dialog is open.
     angle_dialog: Option<(usize, usize)>,
     /// When Some((target, initial_len)), the length-input modal dialog is open.
     /// `initial_len` is the measured length/distance at the moment the dialog was opened.
     length_dialog: Option<(editor::LengthTarget, f64)>,
+    /// Index of the vertex currently being dragged (set on mouse-press over a snap vertex).
+    drag_vertex: Option<usize>,
 }
 
 impl AppState {
@@ -205,6 +160,7 @@ impl AppState {
 
         // egui setup
         let egui_ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -231,14 +187,17 @@ impl AppState {
             egui_state,
             egui_renderer,
             editor,
+            current_file: None,
             mouse_pressed: None,
             last_cursor: None,
             mouse_press_origin: None,
             sketch_cursor: None,
             snap_vertex: None,
             snap_segment: None,
+            snap_ref: None,
             angle_dialog: None,
             length_dialog: None,
+            drag_vertex: None,
         }
     }
 
@@ -262,20 +221,16 @@ impl AppState {
         }
         self.editor.scene_dirty = false;
 
-        // Evict cache entries that no longer correspond to any live object.
+        // Evict cache entries for IDs no longer in the scene.
         let live_ids: std::collections::HashSet<u64> =
-            self.editor.objects.iter().map(|o| o.id).collect();
+            self.editor.entries.iter().map(|e| e.id()).collect();
         self.tess_cache.retain(|id, _| live_ids.contains(id));
 
         self.gpu_meshes.clear();
-        for (i, obj) in self.editor.objects.iter().enumerate() {
+        for (i, entry) in self.editor.entries.iter().enumerate() {
+            let obj = match entry { editor::SceneEntry::Solid(s) => s, _ => continue };
             let selected = self.editor.selection.contains(&i);
-            let base_color = if selected {
-                [0.90, 0.70, 0.20f32]
-            } else {
-                [0.38, 0.62, 0.90f32]
-            };
-            // Use cached tessellation if available; otherwise compute and cache.
+            let base_color = if selected { [0.90, 0.70, 0.20f32] } else { [0.38, 0.62, 0.90f32] };
             let cached = self.tess_cache.entry(obj.id).or_insert_with(|| {
                 brep_render::prepare_mesh_cpu(&obj.store)
             });
@@ -345,11 +300,12 @@ impl AppState {
         let sketch_cursor = self.sketch_cursor;
         let snap_vertex = self.snap_vertex;
         let snap_segment = self.snap_segment;
+        let snap_ref = self.snap_ref;
         let angle_dialog = self.angle_dialog;
         let length_dialog = self.length_dialog;  // Option<(LengthTarget, f64)>
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, angle_dialog, length_dialog);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, angle_dialog, length_dialog);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -408,8 +364,12 @@ impl AppState {
         // Apply UI actions after rendering (avoids borrow conflicts during egui run).
         let mut needs_mesh_update = false;
         for action in actions {
-            // Intercept app-level dialog actions before passing to the editor.
+            // Intercept app-level actions before passing to the editor.
             match &action {
+                UiAction::New  => { self.do_new();     continue; }
+                UiAction::Open => { self.do_open();    continue; }
+                UiAction::Save => { self.do_save();    continue; }
+                UiAction::SaveAs => { self.do_save_as(); continue; }
                 UiAction::SketchBeginAngleInput { seg_a, seg_b } => {
                     self.angle_dialog = Some((*seg_a, *seg_b));
                     continue;
@@ -446,6 +406,98 @@ impl AppState {
         }
 
         Ok(())
+    }
+}
+
+// ── File I/O ──────────────────────────────────────────────────────────────────
+
+impl AppState {
+    fn update_window_title(&self) {
+        let title = match &self.current_file {
+            Some(path) => {
+                let name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                format!("BRep Modeller — {name}")
+            }
+            None => "BRep Modeller".to_string(),
+        };
+        self.window.set_title(&title);
+    }
+
+    fn do_save_to(&mut self, path: std::path::PathBuf) {
+        let scene = self.editor.to_saved_scene();
+        match serde_json::to_string_pretty(&scene) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    eprintln!("save error: {e}");
+                } else {
+                    self.current_file = Some(path);
+                    self.update_window_title();
+                }
+            }
+            Err(e) => eprintln!("serialize error: {e}"),
+        }
+    }
+
+    fn do_save(&mut self) {
+        if let Some(path) = self.current_file.clone() {
+            self.do_save_to(path);
+        } else {
+            self.do_save_as();
+        }
+    }
+
+    fn do_save_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Save Scene")
+            .add_filter("Modeller scene", &["modl"])
+            .save_file()
+        {
+            let path = if path.extension().is_none() {
+                path.with_extension("modl")
+            } else {
+                path
+            };
+            self.do_save_to(path);
+        }
+    }
+
+    fn do_open(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Open Scene")
+            .add_filter("Modeller scene", &["modl"])
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(json) => match serde_json::from_str::<editor::SavedScene>(&json) {
+                    Ok(scene) => {
+                        self.editor.load_saved_scene(scene);
+                        self.tess_cache.clear();
+                        self.current_file = Some(path);
+                        self.update_window_title();
+                    }
+                    Err(e) => eprintln!("parse error: {e}"),
+                },
+                Err(e) => eprintln!("read error: {e}"),
+            }
+        }
+    }
+
+    fn do_new(&mut self) {
+        self.editor.load_saved_scene(editor::SavedScene {
+            version: 2,
+            entries: Vec::new(),
+            camera:  editor::SavedCamera {
+                target:    [0.0, 0.0, 0.0],
+                distance:  6.0,
+                azimuth:   0.8,
+                elevation: 0.5,
+            },
+        });
+        self.tess_cache.clear();
+        self.current_file = None;
+        self.update_window_title();
     }
 }
 
@@ -496,11 +548,16 @@ fn point_to_segment_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -
 
 struct App {
     state: Option<AppState>,
+    config: ConfigStore,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let geo = load_window_geometry();
+        let geo = self.config
+            .get::<WindowGeometry>("window.geometry")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let attrs = Window::default_attributes()
             .with_title("BRep Modeller")
             .with_inner_size(PhysicalSize::new(geo.width, geo.height))
@@ -542,6 +599,15 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::KeyY) => {
                                 state.editor.apply(UiAction::Redo);
                             }
+                            PhysicalKey::Code(KeyCode::KeyS) => {
+                                state.do_save();
+                            }
+                            PhysicalKey::Code(KeyCode::KeyO) => {
+                                state.do_open();
+                            }
+                            PhysicalKey::Code(KeyCode::KeyN) => {
+                                state.do_new();
+                            }
                             _ => {}
                         }
                     }
@@ -560,6 +626,13 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             state.mouse_pressed = Some(button);
                             state.mouse_press_origin = state.last_cursor;
+                            // Begin vertex drag if hovering over a sketch vertex.
+                            if button == MouseButton::Left
+                                && state.editor.sketch.is_some()
+                                && state.snap_vertex.is_some()
+                            {
+                                state.drag_vertex = state.snap_vertex;
+                            }
                         }
                         ElementState::Released => {
                             // If left button released with little movement → pick.
@@ -572,48 +645,59 @@ impl ApplicationHandler for App {
                                     }
                                     _ => false,
                                 };
-                                if is_click {
+
+                                if let Some(drag_vi) = state.drag_vertex.take() {
+                                    // We were dragging a vertex.  If the movement was tiny
+                                    // (< 4 px), treat it as a click.
+                                    if is_click {
+                                        let can_close = state.editor.sketch.as_ref()
+                                            .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
+                                        if drag_vi == 0 && can_close {
+                                            state.editor.apply(UiAction::SketchCloseLoop);
+                                        } else {
+                                            state.editor.apply(UiAction::SketchSelectVertex(drag_vi));
+                                        }
+                                    }
+                                    // Otherwise the drag already updated the positions;
+                                    // nothing more to do on release.
+                                } else if is_click {
                                     if let Some(_cur) = state.last_cursor {
                                         let w = state.surface_config.width;
                                         let h = state.surface_config.height;
                                         if state.editor.sketch.is_some() {
-                                            let pts_len = state.editor.sketch.as_ref()
-                                                .map_or(0, |s| s.points.len());
-                                            let is_closed = state.editor.sketch.as_ref()
-                                                .map_or(false, |s| s.closed);
-                                            if state.snap_vertex == Some(0) && pts_len >= 3 && !is_closed {
-                                                // Click on first vertex → close loop.
-                                                state.editor.apply(UiAction::SketchClose);
-                                            } else if let Some(vi) = state.snap_vertex {
-                                                // Click on any vertex (when closed, or after close) → select for constraints.
-                                                if is_closed {
+                                            if let Some(vi) = state.snap_vertex {
+                                                // Clicking vertex 0 with ≥3 pts closes the polyline loop.
+                                                let can_close = state.editor.sketch.as_ref()
+                                                    .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
+                                                if vi == 0 && can_close {
+                                                    state.editor.apply(UiAction::SketchCloseLoop);
+                                                } else {
                                                     state.editor.apply(UiAction::SketchSelectVertex(vi));
                                                 }
-                                                // When not closed and vi != 0, do nothing (can't interact with interior verts yet).
+                                            } else if let Some(r) = state.snap_ref {
+                                                state.editor.apply(UiAction::SketchSelectRef(r));
                                             } else if let Some(seg) = state.snap_segment {
-                                                // Click on a segment → select/deselect for constraints.
                                                 state.editor.apply(UiAction::SketchSelectSegment(seg));
-                                            } else if !is_closed {
-                                                // Free click on the workplane → add point.
+                                            } else {
                                                 if let Some(p) = state.sketch_cursor {
                                                     state.editor.apply(UiAction::SketchAddPoint(p));
                                                 }
                                             }
                                         } else {
-                                        let cur = _cur;
-                                        let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
-                                        if let Some(idx) = state.editor.pick_at_screen(cur.0, cur.1, w, h) {
-                                            if shift {
-                                                state.editor.apply(UiAction::ToggleSelectObject(idx));
-                                            } else {
-                                                state.editor.apply(UiAction::SelectObject(idx));
+                                            let cur = _cur;
+                                            let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                                            if let Some(idx) = state.editor.pick_at_screen(cur.0, cur.1, w, h) {
+                                                if shift {
+                                                    state.editor.apply(UiAction::ToggleSelectObject(idx));
+                                                } else {
+                                                    state.editor.apply(UiAction::SelectObject(idx));
+                                                }
+                                                state.editor.scene_dirty = true;
+                                            } else if !shift {
+                                                state.editor.apply(UiAction::ClearSelection);
+                                                state.editor.scene_dirty = true;
                                             }
-                                            state.editor.scene_dirty = true;
-                                        } else if !shift {
-                                            state.editor.apply(UiAction::ClearSelection);
-                                            state.editor.scene_dirty = true;
                                         }
-                                        } // end else (not in sketch mode)
                                     }
                                 }
                             }
@@ -631,49 +715,119 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let cur = (position.x as f32, position.y as f32);
-                if let (Some(btn), Some(last)) = (state.mouse_pressed, state.last_cursor) {
-                    let dx = cur.0 - last.0;
-                    let dy = cur.1 - last.1;
-                    let shift = state.egui_ctx.input(|i| i.modifiers.shift);
-                    match btn {
-                        MouseButton::Left if shift => state.editor.camera.pan(dx, dy),
-                        MouseButton::Left => state.editor.camera.orbit(dx, dy),
-                        MouseButton::Right | MouseButton::Middle => {
-                            state.editor.camera.pan(dx, dy)
+
+                // Orbit/pan only when not dragging a sketch vertex.
+                if state.drag_vertex.is_none() {
+                    if let (Some(btn), Some(last)) = (state.mouse_pressed, state.last_cursor) {
+                        let dx = cur.0 - last.0;
+                        let dy = cur.1 - last.1;
+                        let shift = state.egui_ctx.input(|i| i.modifiers.shift);
+                        match btn {
+                            MouseButton::Left if shift => state.editor.camera.pan(dx, dy),
+                            MouseButton::Left => state.editor.camera.orbit(dx, dy),
+                            MouseButton::Right | MouseButton::Middle => {
+                                state.editor.camera.pan(dx, dy)
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 state.last_cursor = Some(cur);
 
                 // Update sketch cursor: project mouse ray onto the sketch plane.
-                if let Some(sk) = &state.editor.sketch {
+                if state.editor.sketch.is_some() {
                     let w = state.surface_config.width;
                     let h = state.surface_config.height;
+                    let (plane_origin, plane_normal) = {
+                        let sk = state.editor.sketch.as_ref().unwrap();
+                        (sk.plane.origin(), sk.plane.normal())
+                    };
                     let ray = state.editor.camera.unproject_ray(cur.0, cur.1, w, h);
-                    state.sketch_cursor = ray_plane_intersect(&ray, &sk.plane.origin(), &sk.plane.normal());
+                    state.sketch_cursor = ray_plane_intersect(&ray, &plane_origin, &plane_normal);
 
-                    // Detect snap to nearest existing vertex (screen-space threshold).
-                    if !sk.closed {
-                        const SNAP_PX: f32 = 15.0;
-                        let mut snapped = None;
-                        for (i, &pt) in sk.points.iter().enumerate() {
-                            if let Some((px, py)) = state.editor.camera.project_to_screen(pt, w, h) {
-                                let dx = px - cur.0;
-                                let dy = py - cur.1;
-                                if (dx * dx + dy * dy).sqrt() < SNAP_PX {
-                                    snapped = Some(i);
-                                    break;
+                    // If dragging a vertex, apply position update immediately.
+                    if let Some(drag_vi) = state.drag_vertex {
+                        if state.mouse_pressed == Some(MouseButton::Left) {
+                            let has_moved = match state.mouse_press_origin {
+                                Some(origin) => {
+                                    let dx = cur.0 - origin.0;
+                                    let dy = cur.1 - origin.1;
+                                    (dx * dx + dy * dy).sqrt() > 2.0
+                                }
+                                None => false,
+                            };
+                            if has_moved {
+                                if let Some(cursor_pt) = state.sketch_cursor {
+                                    state.editor.drag_sketch_vertex(drag_vi, cursor_pt);
                                 }
                             }
                         }
-                        state.snap_vertex = snapped;
-                    } else {
-                        state.snap_vertex = None;
                     }
 
-                    // Segment hover — only when not hovering a vertex.
+                    // Snap to nearest vertex (works for both open and closed sketches).
+                    const SNAP_PX: f32 = 15.0;
+                    let mut snapped = None;
+                    let sk = state.editor.sketch.as_ref().unwrap();
+                    for (i, &pt) in sk.points.iter().enumerate() {
+                        if let Some((px, py)) = state.editor.camera.project_to_screen(pt, w, h) {
+                            let dx = px - cur.0;
+                            let dy = py - cur.1;
+                            if (dx * dx + dy * dy).sqrt() < SNAP_PX {
+                                snapped = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    state.snap_vertex = snapped;
+
+                    // Reference entity snap (origin / axes) — only when not snapping to a vertex.
                     if state.snap_vertex.is_none() {
+                        const REF_SNAP_PX: f32 = 12.0;
+                        let origin_world = sk.plane.origin();
+                        let (u_axis, v_axis) = sk.plane.uv_axes();
+                        let far = 500.0_f64;
+
+                        // Check origin first.
+                        let sr = state.editor.camera.project_to_screen(origin_world, w, h)
+                            .and_then(|(ox, oy)| {
+                                let dx = ox - cur.0;
+                                let dy = oy - cur.1;
+                                if (dx * dx + dy * dy).sqrt() < REF_SNAP_PX {
+                                    Some(editor::RefEntity::Origin)
+                                } else { None }
+                            });
+
+                        // Check X-axis.
+                        let sr = sr.or_else(|| {
+                            let pa = state.editor.camera.project_to_screen(origin_world + u_axis * far, w, h);
+                            let pb = state.editor.camera.project_to_screen(origin_world - u_axis * far, w, h);
+                            if let (Some((ax, ay)), Some((bx, by))) = (pa, pb) {
+                                if point_to_segment_dist(cur.0, cur.1, ax, ay, bx, by) < REF_SNAP_PX {
+                                    return Some(editor::RefEntity::XAxis);
+                                }
+                            }
+                            None
+                        });
+
+                        // Check Y-axis.
+                        let sr = sr.or_else(|| {
+                            let pa = state.editor.camera.project_to_screen(origin_world + v_axis * far, w, h);
+                            let pb = state.editor.camera.project_to_screen(origin_world - v_axis * far, w, h);
+                            if let (Some((ax, ay)), Some((bx, by))) = (pa, pb) {
+                                if point_to_segment_dist(cur.0, cur.1, ax, ay, bx, by) < REF_SNAP_PX {
+                                    return Some(editor::RefEntity::YAxis);
+                                }
+                            }
+                            None
+                        });
+
+                        state.snap_ref = sr;
+                    } else {
+                        state.snap_ref = None;
+                    }
+
+                    // Segment hover — only when not hovering a vertex or reference entity.
+                    if state.snap_vertex.is_none() && state.snap_ref.is_none() {
                         const SEG_SNAP_PX: f32 = 10.0;
                         let n = sk.points.len();
                         let seg_count = if sk.closed { n } else { n.saturating_sub(1) };
@@ -695,6 +849,7 @@ impl ApplicationHandler for App {
                 } else {
                     state.sketch_cursor = None;
                     state.snap_vertex = None;
+                    state.snap_ref = None;
                     state.snap_segment = None;
                 }
             }
@@ -717,7 +872,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 state.resize(new_size);
                 if let Ok(pos) = state.window.outer_position() {
-                    save_window_geometry(WindowGeometry {
+                    let _ = self.config.set("window.geometry", &WindowGeometry {
                         x: pos.x, y: pos.y,
                         width: new_size.width, height: new_size.height,
                     });
@@ -726,7 +881,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::Moved(pos) => {
                 let size = state.window.inner_size();
-                save_window_geometry(WindowGeometry {
+                let _ = self.config.set("window.geometry", &WindowGeometry {
                     x: pos.x, y: pos.y,
                     width: size.width, height: size.height,
                 });
@@ -753,8 +908,9 @@ impl ApplicationHandler for App {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    let config = ConfigStore::open().expect("failed to open config database");
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let mut app = App { state: None };
+    let mut app = App { state: None, config };
     event_loop.run_app(&mut app).unwrap();
 }

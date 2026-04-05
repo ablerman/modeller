@@ -5,17 +5,33 @@ use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, SketchPlane, UiAction};
+use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchPlane, UiAction};
 
-// ── Constraint icons (Unicode) ────────────────────────────────────────────────
-const ICON_PARALLEL:   &str = "∥";
-const ICON_PERP:       &str = "⊥";
-const ICON_ANGLE:      &str = "∠";
-const ICON_HORIZONTAL: &str = "↔";
-const ICON_VERTICAL:   &str = "↕";
-const ICON_EQUAL_LEN:  &str = "≡";
-const ICON_LENGTH:     &str = "⟺";
-const ICON_COINCIDENT: &str = "⊙";
+// ── Toolbar menu icons (image files) ─────────────────────────────────────────
+fn icon_file()       -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/file.svg") }
+fn icon_primitives() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/primitives.svg") }
+fn icon_sketch()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/sketch.svg") }
+fn icon_boolean()    -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/boolean.svg") }
+
+// ── Constraint icons (image files) ───────────────────────────────────────────
+fn icon_parallel()   -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/parallel.svg") }
+fn icon_perp()       -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/perpendicular.svg") }
+fn icon_angle()      -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/angle.svg") }
+fn icon_horizontal() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/horizontal.svg") }
+fn icon_vertical()   -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/vertical.svg") }
+fn icon_equal_len()  -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/equal_length.svg") }
+fn icon_length()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/length.svg") }
+fn icon_coincident() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/coincident.svg") }
+
+/// Icon image sized for use in toolbar buttons.
+fn toolbar_icon(src: egui::ImageSource<'static>) -> egui::Image<'static> {
+    egui::Image::new(src).fit_to_exact_size(egui::vec2(16.0, 16.0))
+}
+
+/// Icon image sized for use in constraint list labels.
+fn list_icon(src: egui::ImageSource<'static>) -> egui::Image<'static> {
+    egui::Image::new(src).fit_to_exact_size(egui::vec2(14.0, 14.0))
+}
 
 /// Render all egui panels.  Returns any actions the user triggered.
 pub fn build_ui(
@@ -25,6 +41,7 @@ pub fn build_ui(
     sketch_cursor: Option<Point3>,
     snap_vertex: Option<usize>,
     snap_segment: Option<usize>,
+    snap_ref: Option<RefEntity>,
     angle_dialog: Option<(usize, usize)>,
     length_dialog: Option<(LengthTarget, f64)>,
 ) -> Vec<UiAction> {
@@ -43,30 +60,14 @@ pub fn build_ui(
                 ui.label(format!("{} pts", sk.points.len()));
                 ui.separator();
 
-                if ui.button("Undo pt").clicked() {
+                if ui.button("Undo").clicked() {
                     actions.push(UiAction::SketchUndoPoint);
                 }
-                ui.add_enabled_ui(sk.points.len() >= 3 && !sk.closed, |ui| {
-                    if ui.button("Close Loop").clicked() {
-                        actions.push(UiAction::SketchClose);
+                ui.add_enabled_ui(sk.points.len() >= 3, |ui| {
+                    if ui.button("Finish").clicked() {
+                        actions.push(UiAction::SketchFinish);
                     }
                 });
-
-                if sk.closed {
-                    ui.separator();
-                    let mut d = sk.extrude_dist;
-                    if ui.add(
-                        egui::DragValue::new(&mut d)
-                            .speed(0.05)
-                            .range(0.001..=1000.0)
-                            .suffix(" u"),
-                    ).changed() {
-                        actions.push(UiAction::SketchSetDistance(d));
-                    }
-                    if ui.button("Extrude").clicked() {
-                        actions.push(UiAction::SketchExtrude(sk.extrude_dist));
-                    }
-                }
 
                 // ── Constraint dropdown ───────────────────────────────────
                 if !sk.points.is_empty() {
@@ -82,54 +83,90 @@ pub fn build_ui(
                         None
                     };
 
+                    // Precompute viewport-aligned perp directions and point pair for H/V constraints.
+                    let ((h_pu, h_pv), (v_pu, v_pv)) = editor.camera.sketch_align_dirs(sk.plane);
+                    let ref_sel = sk.ref_selection;
+                    let pt1 = sk.pt_selection.first().copied();
+
+                    // Build the constraint each button would apply, or None if not applicable.
+                    // H/V: pair of points (via segment or explicit), or 1 pt + origin/axis ref.
+                    let h_constraint: Option<SketchConstraint> = if n_sel == 1 {
+                        let s = sk.seg_selection[0];
+                        Some(SketchConstraint::HorizontalPair { pt_a: s, pt_b: (s + 1) % sk.points.len(), perp_u: h_pu, perp_v: h_pv })
+                    } else if n_pts == 2 {
+                        Some(SketchConstraint::HorizontalPair { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: h_pu, perp_v: h_pv })
+                    } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)) {
+                        Some(SketchConstraint::PointOnXAxis { pt: pt1.unwrap() })
+                    } else {
+                        None
+                    };
+                    let v_constraint: Option<SketchConstraint> = if n_sel == 1 {
+                        let s = sk.seg_selection[0];
+                        Some(SketchConstraint::VerticalPair { pt_a: s, pt_b: (s + 1) % sk.points.len(), perp_u: v_pu, perp_v: v_pv })
+                    } else if n_pts == 2 {
+                        Some(SketchConstraint::VerticalPair { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: v_pu, perp_v: v_pv })
+                    } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)) {
+                        Some(SketchConstraint::PointOnYAxis { pt: pt1.unwrap() })
+                    } else {
+                        None
+                    };
+                    let coincident_constraint: Option<SketchConstraint> = if n_pts == 2 && n_sel == 0 {
+                        Some(SketchConstraint::Coincident { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1] })
+                    } else if n_sel == 1 && n_pts == 1 {
+                        Some(SketchConstraint::PointOnLine { pt: sk.pt_selection[0], seg: sk.seg_selection[0] })
+                    } else if n_pts == 1 && ref_sel == Some(RefEntity::Origin) {
+                        Some(SketchConstraint::PointOnOrigin { pt: pt1.unwrap() })
+                    } else {
+                        None
+                    };
+
                     ui.menu_button("Constrain ▾", |ui| {
-                        ui.add_enabled_ui(n_sel == 1, |ui| {
-                            if ui.button(format!("{ICON_HORIZONTAL}  Horizontal")).clicked() {
-                                actions.push(UiAction::SketchAddConstraint(
-                                    SketchConstraint::Horizontal { seg: sk.seg_selection[0] }));
-                                actions.push(UiAction::SketchClearSegSelection);
+                        ui.add_enabled_ui(h_constraint.is_some(), |ui| {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_horizontal()), "Horizontal")).clicked() {
+                                if let Some(c) = h_constraint.clone() {
+                                    actions.push(UiAction::SketchAddConstraint(c));
+                                }
                                 ui.close_menu();
                             }
-                            if ui.button(format!("{ICON_VERTICAL}  Vertical")).clicked() {
-                                actions.push(UiAction::SketchAddConstraint(
-                                    SketchConstraint::Vertical { seg: sk.seg_selection[0] }));
-                                actions.push(UiAction::SketchClearSegSelection);
+                        });
+                        ui.add_enabled_ui(v_constraint.is_some(), |ui| {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_vertical()), "Vertical")).clicked() {
+                                if let Some(c) = v_constraint.clone() {
+                                    actions.push(UiAction::SketchAddConstraint(c));
+                                }
                                 ui.close_menu();
                             }
                         });
                         ui.separator();
                         ui.add_enabled_ui(n_sel == 2, |ui| {
-                            if ui.button(format!("{ICON_PARALLEL}  Parallel")).clicked() {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_parallel()), "Parallel")).clicked() {
                                 actions.push(UiAction::SketchAddConstraint(
                                     SketchConstraint::Parallel {
                                         seg_a: sk.seg_selection[0],
                                         seg_b: sk.seg_selection[1],
                                     }));
-                                actions.push(UiAction::SketchClearSegSelection);
                                 ui.close_menu();
                             }
-                            if ui.button(format!("{ICON_PERP}  Perpendicular")).clicked() {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_perp()), "Perpendicular")).clicked() {
                                 actions.push(UiAction::SketchAddConstraint(
                                     SketchConstraint::Perpendicular {
                                         seg_a: sk.seg_selection[0],
                                         seg_b: sk.seg_selection[1],
                                     }));
-                                actions.push(UiAction::SketchClearSegSelection);
                                 ui.close_menu();
                             }
-                            if ui.button(format!("{ICON_EQUAL_LEN}  Equal Length")).clicked() {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_equal_len()), "Equal Length")).clicked() {
                                 actions.push(UiAction::SketchAddConstraint(
                                     SketchConstraint::EqualLength {
                                         seg_a: sk.seg_selection[0],
                                         seg_b: sk.seg_selection[1],
                                     }));
-                                actions.push(UiAction::SketchClearSegSelection);
                                 ui.close_menu();
                             }
                         });
                         ui.separator();
                         ui.add_enabled_ui(n_sel == 2, |ui| {
-                            if ui.button(format!("{ICON_ANGLE}  Angle…")).clicked() {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_angle()), "Angle…")).clicked() {
                                 actions.push(UiAction::SketchBeginAngleInput {
                                     seg_a: sk.seg_selection[0],
                                     seg_b: sk.seg_selection[1],
@@ -138,9 +175,17 @@ pub fn build_ui(
                             }
                         });
                         ui.add_enabled_ui(length_target.is_some(), |ui| {
-                            if ui.button(format!("{ICON_LENGTH}  Length…")).clicked() {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_length()), "Length…")).clicked() {
                                 if let Some(t) = length_target {
                                     actions.push(UiAction::SketchBeginLengthInput(t));
+                                }
+                                ui.close_menu();
+                            }
+                        });
+                        ui.add_enabled_ui(coincident_constraint.is_some(), |ui| {
+                            if ui.add(egui::Button::image_and_text(toolbar_icon(icon_coincident()), "Coincident")).clicked() {
+                                if let Some(c) = coincident_constraint.clone() {
+                                    actions.push(UiAction::SketchAddConstraint(c));
                                 }
                                 ui.close_menu();
                             }
@@ -148,30 +193,82 @@ pub fn build_ui(
                     });
 
                     if sk.constraints_conflict {
-                        ui.colored_label(egui::Color32::RED, "⚠ conflict");
+                        let n_conflict = sk.violated_constraints.iter().filter(|&&v| v).count();
+                        let badge = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("⚠ conflict")
+                                    .color(egui::Color32::from_rgb(255, 80, 80))
+                                    .strong(),
+                            )
+                            .sense(egui::Sense::hover()),
+                        );
+                        badge.on_hover_ui(|ui| {
+                            ui.set_max_width(280.0);
+                            ui.label(egui::RichText::new("Constraint conflict").strong());
+                            ui.separator();
+                            if n_conflict > 0 {
+                                ui.label(format!(
+                                    "{} constraint{} cannot be satisfied together:",
+                                    n_conflict,
+                                    if n_conflict == 1 { "" } else { "s" }
+                                ));
+                                for (i, c) in sk.constraints.iter().enumerate() {
+                                    if sk.violated_constraints.get(i).copied().unwrap_or(false) {
+                                        ui.horizontal(|ui| {
+                                            ui.add(list_icon(constraint_icon(c)));
+                                            ui.label(
+                                                egui::RichText::new(constraint_text(c))
+                                                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                                            );
+                                        });
+                                    }
+                                }
+                            } else {
+                                ui.label("The solver could not converge. Try removing a constraint.");
+                            }
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Remove a highlighted constraint to resolve.")
+                                    .italics()
+                                    .weak(),
+                            );
+                        });
                     }
 
                     // Active constraints list.
                     if !sk.constraints.is_empty() {
                         ui.separator();
-                        ui.menu_button(
-                            format!("Constraints ({})", sk.constraints.len()),
-                            |ui| {
-                                let mut to_remove = None;
-                                for (i, c) in sk.constraints.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(constraint_label(c));
-                                        if ui.small_button("✕").clicked() {
-                                            to_remove = Some(i);
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
-                                if let Some(i) = to_remove {
-                                    actions.push(UiAction::SketchRemoveConstraint(i));
-                                }
-                            },
-                        );
+                        let list_label = if sk.constraints_conflict {
+                            egui::RichText::new(format!("Constraints ({}) ⚠", sk.constraints.len()))
+                                .color(egui::Color32::from_rgb(255, 80, 80))
+                        } else {
+                            egui::RichText::new(format!("Constraints ({})", sk.constraints.len()))
+                        };
+                        ui.menu_button(list_label, |ui| {
+                            let mut to_remove = None;
+                            for (i, c) in sk.constraints.iter().enumerate() {
+                                let is_violated = sk.violated_constraints.get(i).copied().unwrap_or(false);
+                                ui.horizontal(|ui| {
+                                    ui.add(list_icon(constraint_icon(c)));
+                                    let text = constraint_text(c);
+                                    if is_violated {
+                                        ui.label(
+                                            egui::RichText::new(text)
+                                                .color(egui::Color32::from_rgb(255, 100, 100)),
+                                        ).on_hover_text("This constraint contributes to the conflict");
+                                    } else {
+                                        ui.label(text);
+                                    }
+                                    if ui.small_button("✕").clicked() {
+                                        to_remove = Some(i);
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                            if let Some(i) = to_remove {
+                                actions.push(UiAction::SketchRemoveConstraint(i));
+                            }
+                        });
                     }
                 }
 
@@ -181,22 +278,56 @@ pub fn build_ui(
                 }
             } else {
                 // ── Normal toolbar ────────────────────────────────────────────
-                ui.strong("Add:");
-                if ui.button("Box").clicked() {
-                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Box));
-                }
-                if ui.button("Cylinder").clicked() {
-                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Cylinder));
-                }
-                if ui.button("Sphere").clicked() {
-                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Sphere));
-                }
-                if ui.button("Cone").clicked() {
-                    actions.push(UiAction::AddPrimitive(PrimitiveKind::Cone));
-                }
+                egui::menu::menu_custom_button(ui,
+                    egui::Button::image_and_text(toolbar_icon(icon_file()), "File")
+                        .image_tint_follows_text_color(true),
+                    |ui| {
+                    if ui.button("New").clicked() {
+                        actions.push(UiAction::New);
+                        ui.close_menu();
+                    }
+                    if ui.button("Open…").clicked() {
+                        actions.push(UiAction::Open);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Save").clicked() {
+                        actions.push(UiAction::Save);
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As…").clicked() {
+                        actions.push(UiAction::SaveAs);
+                        ui.close_menu();
+                    }
+                });
+                ui.separator();
+                egui::menu::menu_custom_button(ui,
+                    egui::Button::image_and_text(toolbar_icon(icon_primitives()), "Primitives")
+                        .image_tint_follows_text_color(true),
+                    |ui| {
+                    if ui.button("☐  Box").clicked() {
+                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Box));
+                        ui.close_menu();
+                    }
+                    if ui.button("◎  Cylinder").clicked() {
+                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Cylinder));
+                        ui.close_menu();
+                    }
+                    if ui.button("◉  Sphere").clicked() {
+                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Sphere));
+                        ui.close_menu();
+                    }
+                    if ui.button("△  Cone").clicked() {
+                        actions.push(UiAction::AddPrimitive(PrimitiveKind::Cone));
+                        ui.close_menu();
+                    }
+                });
 
                 ui.separator();
-                ui.menu_button("Sketch ▾", |ui| {
+                egui::menu::menu_custom_button(ui,
+                    egui::Button::image_and_text(toolbar_icon(icon_sketch()), "Sketch")
+                        .image_tint_follows_text_color(true),
+                    |ui| {
                     for (label, plane) in [
                         ("XY Plane", SketchPlane::XY),
                         ("XZ Plane", SketchPlane::XZ),
@@ -210,19 +341,28 @@ pub fn build_ui(
                 });
 
                 ui.separator();
-                ui.strong("Boolean:");
 
-                let two_sel = editor.selection.len() == 2;
+                let two_sel = editor.selection.iter()
+                    .filter(|&&i| matches!(editor.entries.get(i), Some(SceneEntry::Solid(_))))
+                    .count() == 2;
                 ui.add_enabled_ui(two_sel, |ui| {
-                    if ui.button("Union").clicked() {
-                        actions.push(UiAction::BooleanOp(BooleanKind::Union));
-                    }
-                    if ui.button("Difference").clicked() {
-                        actions.push(UiAction::BooleanOp(BooleanKind::Difference));
-                    }
-                    if ui.button("Intersection").clicked() {
-                        actions.push(UiAction::BooleanOp(BooleanKind::Intersection));
-                    }
+                    egui::menu::menu_custom_button(ui,
+                        egui::Button::image_and_text(toolbar_icon(icon_boolean()), "Boolean")
+                            .image_tint_follows_text_color(true),
+                        |ui| {
+                        if ui.button("⊕  Union").clicked() {
+                            actions.push(UiAction::BooleanOp(BooleanKind::Union));
+                            ui.close_menu();
+                        }
+                        if ui.button("⊖  Difference").clicked() {
+                            actions.push(UiAction::BooleanOp(BooleanKind::Difference));
+                            ui.close_menu();
+                        }
+                        if ui.button("⊗  Intersection").clicked() {
+                            actions.push(UiAction::BooleanOp(BooleanKind::Intersection));
+                            ui.close_menu();
+                        }
+                    });
                 });
 
                 ui.separator();
@@ -253,29 +393,88 @@ pub fn build_ui(
         });
     });
 
-    // ── Left panel: object list (operation tree) ──────────────────────────────
+    // ── Left panel: operations list ───────────────────────────────────────────
     egui::SidePanel::left("objects").min_width(180.0).show(ctx, |ui| {
-        ui.strong("Objects");
+        ui.strong("Operations");
         ui.separator();
-        for (i, obj) in editor.objects.iter().enumerate() {
+        for (i, entry) in editor.entries.iter().enumerate() {
             let selected = editor.selection.contains(&i);
-            // Top-level row: selectable label for the result object.
-            let resp = ui.selectable_label(selected, &obj.name);
-            if resp.clicked() {
-                if ui.input(|s| s.modifiers.shift || s.modifiers.ctrl) {
-                    actions.push(UiAction::ToggleSelectObject(i));
-                } else {
-                    actions.push(UiAction::SelectObject(i));
+            match entry {
+                SceneEntry::Sketch(sk) => {
+                    let resp = ui.selectable_label(
+                        selected,
+                        egui::RichText::new(format!("✏  {}  ({:?})", sk.name, sk.plane)).italics(),
+                    );
+                    if resp.double_clicked() {
+                        actions.push(UiAction::OpenSketch(i));
+                    } else if resp.clicked() {
+                        if ui.input(|s| s.modifiers.shift || s.modifiers.ctrl) {
+                            actions.push(UiAction::ToggleSelectObject(i));
+                        } else {
+                            actions.push(UiAction::SelectObject(i));
+                        }
+                    }
+                }
+                SceneEntry::Solid(obj) => {
+                    match &obj.history {
+                        ObjectHistory::Primitive(kind) => {
+                            let icon = match kind {
+                                PrimitiveKind::Box      => "☐",
+                                PrimitiveKind::Cylinder => "◎",
+                                PrimitiveKind::Sphere   => "◉",
+                                PrimitiveKind::Cone     => "△",
+                            };
+                            let resp = ui.selectable_label(selected, format!("{icon}  {}", obj.name));
+                            if resp.clicked() {
+                                if ui.input(|s| s.modifiers.shift || s.modifiers.ctrl) {
+                                    actions.push(UiAction::ToggleSelectObject(i));
+                                } else {
+                                    actions.push(UiAction::SelectObject(i));
+                                }
+                            }
+                        }
+                        ObjectHistory::Sketch { plane, extrude_dist, .. } => {
+                            // Legacy: sketch+extrude solids loaded from old saves.
+                            ui.horizontal(|ui| {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(format!("✏  Sketch  ({plane:?})")).weak().italics());
+                            });
+                            let resp = ui.selectable_label(
+                                selected,
+                                egui::RichText::new(format!("  ↑  Extrude  {extrude_dist:.2} u")),
+                            );
+                            if resp.clicked() {
+                                if ui.input(|s| s.modifiers.shift || s.modifiers.ctrl) {
+                                    actions.push(UiAction::ToggleSelectObject(i));
+                                } else {
+                                    actions.push(UiAction::SelectObject(i));
+                                }
+                            }
+                        }
+                        ObjectHistory::Boolean { kind, left, right } => {
+                            let icon = match kind {
+                                brep_bool::BooleanKind::Union        => "⊕",
+                                brep_bool::BooleanKind::Difference   => "⊖",
+                                brep_bool::BooleanKind::Intersection => "⊗",
+                            };
+                            let resp = ui.selectable_label(selected, format!("{icon}  {}", obj.name));
+                            if resp.clicked() {
+                                if ui.input(|s| s.modifiers.shift || s.modifiers.ctrl) {
+                                    actions.push(UiAction::ToggleSelectObject(i));
+                                } else {
+                                    actions.push(UiAction::SelectObject(i));
+                                }
+                            }
+                            ui.indent(format!("bool_{i}"), |ui| {
+                                show_history_op(ui, left);
+                                show_history_op(ui, right);
+                            });
+                        }
+                    }
                 }
             }
-            // Indented history subtree (only shown for boolean results).
-            if matches!(obj.history, ObjectHistory::Boolean { .. }) {
-                ui.indent(format!("hist_{i}"), |ui| {
-                    show_history(ui, &obj.history);
-                });
-            }
         }
-        if editor.objects.is_empty() {
+        if editor.entries.is_empty() {
             ui.label(egui::RichText::new("(empty scene)").italics().weak());
         }
 
@@ -328,6 +527,67 @@ pub fn build_ui(
             egui::Color32::from_rgba_unmultiplied(200, 230, 255, 140),
         );
 
+        // Draw origin and axis lines.
+        {
+            let origin_world = sk.plane.origin();
+            let (u_axis, v_axis) = sk.plane.uv_axes();
+            let far = 500.0_f64;
+
+            let x_selected = sk.ref_selection == Some(RefEntity::XAxis);
+            let y_selected = sk.ref_selection == Some(RefEntity::YAxis);
+            let o_selected = sk.ref_selection == Some(RefEntity::Origin);
+
+            let x_col = if x_selected {
+                egui::Color32::from_rgb(255, 100, 100)
+            } else if snap_ref == Some(RefEntity::XAxis) {
+                egui::Color32::from_rgb(255, 140, 140)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(180, 60, 60, 100)
+            };
+            let y_col = if y_selected {
+                egui::Color32::from_rgb(80, 210, 80)
+            } else if snap_ref == Some(RefEntity::YAxis) {
+                egui::Color32::from_rgb(120, 230, 120)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(50, 150, 50, 100)
+            };
+
+            // X-axis line
+            if let (Some(a), Some(b)) = (
+                proj(origin_world - u_axis * far),
+                proj(origin_world + u_axis * far),
+            ) {
+                painter.line_segment([a, b], egui::Stroke::new(if x_selected { 1.5 } else { 1.0 }, x_col));
+            }
+            // Y-axis line
+            if let (Some(a), Some(b)) = (
+                proj(origin_world - v_axis * far),
+                proj(origin_world + v_axis * far),
+            ) {
+                painter.line_segment([a, b], egui::Stroke::new(if y_selected { 1.5 } else { 1.0 }, y_col));
+            }
+            // Origin cross marker
+            if let Some(op) = proj(origin_world) {
+                let o_col = if o_selected {
+                    egui::Color32::from_rgb(255, 200, 60)
+                } else if snap_ref == Some(RefEntity::Origin) {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(200, 200, 200, 140)
+                };
+                let sz = if o_selected || snap_ref == Some(RefEntity::Origin) { 6.0 } else { 4.5 };
+                let w_px = if o_selected { 2.0 } else { 1.5 };
+                painter.line_segment(
+                    [op - egui::vec2(sz, 0.0), op + egui::vec2(sz, 0.0)],
+                    egui::Stroke::new(w_px, o_col),
+                );
+                painter.line_segment(
+                    [op - egui::vec2(0.0, sz), op + egui::vec2(0.0, sz)],
+                    egui::Stroke::new(w_px, o_col),
+                );
+            }
+        }
+
         // Draw placed edges.
         let n = sk.points.len();
         let seg_count = if sk.closed { n } else { n.saturating_sub(1) };
@@ -363,7 +623,7 @@ pub fn build_ui(
         for c in &sk.constraints {
             draw_constraint_marker(&painter, c, &sk.points, n, &proj);
         }
-        // Preview line from last placed point to cursor (snaps to vertex if applicable).
+        // Preview line from last placed point to cursor (only when loop is open).
         if !sk.closed {
             if let Some(last) = sk.points.last() {
                 let cursor_target = snap_vertex
@@ -377,21 +637,25 @@ pub fn build_ui(
             }
         }
         // Vertex dots — highlight snapped/selected vertices.
+        let can_close = !sk.closed && n >= 3;
         for (i, &pt) in sk.points.iter().enumerate() {
             if let Some(p) = proj(pt) {
                 let is_snap = snap_vertex == Some(i);
                 let is_selected = sk.pt_selection.contains(&i);
-                let is_close = i == 0 && is_snap && sk.points.len() >= 3 && !sk.closed;
-                if is_close {
-                    // Green ring = "click here to close the loop"
-                    painter.circle_stroke(p, 8.0, egui::Stroke::new(2.5, egui::Color32::from_rgb(80, 230, 80)));
-                    painter.circle_filled(p, 5.0, egui::Color32::YELLOW);
-                } else if is_selected {
-                    // Orange fill = selected for constraint
+                // Green ring on vertex 0 hints that clicking it will close the loop.
+                let is_close_hint = can_close && i == 0;
+                if is_selected {
                     painter.circle_filled(p, 6.0, egui::Color32::from_rgb(255, 160, 60));
+                } else if is_snap && is_close_hint {
+                    // Green ring when hovering the close-loop vertex.
+                    painter.circle_stroke(p, 8.0, egui::Stroke::new(2.5, egui::Color32::from_rgb(80, 220, 80)));
+                    painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
                 } else if is_snap {
-                    // White ring = hovering
                     painter.circle_stroke(p, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+                } else if is_close_hint {
+                    // Subtle green tint when not hovering but loop can be closed.
+                    painter.circle_stroke(p, 6.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 220, 80)));
                     painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
                 } else {
                     painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
@@ -403,6 +667,42 @@ pub fn build_ui(
             if let Some(c) = sketch_cursor {
                 if let Some(p) = proj(c) {
                     painter.circle_filled(p, 3.0, egui::Color32::WHITE);
+                }
+            }
+        }
+    }
+
+    // ── Finished sketch outlines (selected entries highlighted, others dimmed) ──
+    if editor.sketch.is_none() {
+        let (w, h) = viewport;
+        let cam = &editor.camera;
+        let ppp = ctx.pixels_per_point();
+        let proj = |p: Point3| -> Option<egui::Pos2> {
+            cam.project_to_screen(p, w, h).map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+        };
+        let painter = ctx.layer_painter(
+            egui::LayerId::new(egui::Order::Background, "sketch_outlines".into()),
+        );
+        for (i, entry) in editor.entries.iter().enumerate() {
+            if let SceneEntry::Sketch(sk) = entry {
+                let is_selected = editor.selection.contains(&i);
+                let stroke = if is_selected {
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255))
+                } else {
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 160, 200, 80))
+                };
+                let n = sk.points.len();
+                for j in 0..n {
+                    if let (Some(a), Some(b)) = (proj(sk.points[j]), proj(sk.points[(j + 1) % n])) {
+                        painter.line_segment([a, b], stroke);
+                    }
+                }
+                if is_selected {
+                    for &pt in &sk.points {
+                        if let Some(p) = proj(pt) {
+                            painter.circle_filled(p, 3.5, egui::Color32::from_rgb(100, 200, 255));
+                        }
+                    }
                 }
             }
         }
@@ -462,8 +762,6 @@ pub fn build_ui(
                             SketchConstraint::PointDistance { pt_a, pt_b, value },
                     };
                     actions.push(UiAction::SketchAddConstraint(c));
-                    actions.push(UiAction::SketchClearSegSelection);
-                    actions.push(UiAction::SketchClearPtSelection);
                 } else if dismiss {
                     ctx.data_mut(|d| d.remove::<bool>(len_init_id));
                     actions.push(UiAction::SketchCancelLengthInput);
@@ -509,7 +807,6 @@ pub fn build_ui(
                     actions.push(UiAction::SketchAddConstraint(SketchConstraint::Angle {
                         seg_a, seg_b, degrees,
                     }));
-                    actions.push(UiAction::SketchClearSegSelection);
                 }
                 if cancel.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     actions.push(UiAction::SketchCancelAngleInput);
@@ -780,27 +1077,56 @@ fn point_in_polygon2d(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
     true
 }
 
-/// Short display label for a constraint.
-fn constraint_label(c: &SketchConstraint) -> String {
+/// Icon image source for a constraint (used in the constraint list).
+fn constraint_icon(c: &SketchConstraint) -> egui::ImageSource<'static> {
+    match c {
+        SketchConstraint::Parallel { .. }     => icon_parallel(),
+        SketchConstraint::Perpendicular { .. } => icon_perp(),
+        SketchConstraint::Angle { .. }        => icon_angle(),
+        SketchConstraint::Horizontal { .. }   => icon_horizontal(),
+        SketchConstraint::Vertical { .. }     => icon_vertical(),
+        SketchConstraint::EqualLength { .. }  => icon_equal_len(),
+        SketchConstraint::Coincident { .. }   => icon_coincident(),
+        SketchConstraint::FixedLength { .. }  => icon_length(),
+        SketchConstraint::PointDistance { .. } => icon_length(),
+        SketchConstraint::PointFixed { .. }   => icon_coincident(),
+        SketchConstraint::PointOnOrigin { .. } => icon_coincident(),
+        SketchConstraint::PointOnXAxis { .. }  => icon_horizontal(),
+        SketchConstraint::PointOnYAxis { .. }  => icon_vertical(),
+        SketchConstraint::HorizontalPair { .. } => icon_horizontal(),
+        SketchConstraint::VerticalPair { .. }   => icon_vertical(),
+        SketchConstraint::PointOnLine { .. }    => icon_coincident(),
+    }
+}
+
+/// Short text description of a constraint (used alongside its icon in the constraint list).
+fn constraint_text(c: &SketchConstraint) -> String {
     match c {
         SketchConstraint::Parallel { seg_a, seg_b } =>
-            format!("{ICON_PARALLEL}  Parallel  {seg_a} ∥ {seg_b}"),
+            format!("Parallel  {seg_a} ∥ {seg_b}"),
         SketchConstraint::Perpendicular { seg_a, seg_b } =>
-            format!("{ICON_PERP}  Perpendicular  {seg_a} ⊥ {seg_b}"),
+            format!("Perpendicular  {seg_a} ⊥ {seg_b}"),
         SketchConstraint::Angle { seg_a, seg_b, degrees } =>
-            format!("{ICON_ANGLE}  Angle  {degrees:.0}°  ({seg_a}/{seg_b})"),
+            format!("Angle  {degrees:.0}°  ({seg_a}/{seg_b})"),
         SketchConstraint::Horizontal { seg } =>
-            format!("{ICON_HORIZONTAL}  Horizontal  seg {seg}"),
+            format!("Horizontal  seg {seg}"),
         SketchConstraint::Vertical { seg } =>
-            format!("{ICON_VERTICAL}  Vertical  seg {seg}"),
+            format!("Vertical  seg {seg}"),
         SketchConstraint::EqualLength { seg_a, seg_b } =>
-            format!("{ICON_EQUAL_LEN}  Equal Length  {seg_a} = {seg_b}"),
+            format!("Equal Length  {seg_a} = {seg_b}"),
         SketchConstraint::Coincident { pt_a, pt_b } =>
-            format!("{ICON_COINCIDENT}  Coincident  pt {pt_a} = {pt_b}"),
+            format!("Coincident  pt {pt_a} = {pt_b}"),
         SketchConstraint::FixedLength { seg, value } =>
-            format!("{ICON_LENGTH}  Length  seg {seg} = {value:.3}"),
+            format!("Length  seg {seg} = {value:.3}"),
         SketchConstraint::PointDistance { pt_a, pt_b, value } =>
-            format!("{ICON_LENGTH}  Distance  pt {pt_a}–{pt_b} = {value:.3}"),
+            format!("Distance  pt {pt_a}–{pt_b} = {value:.3}"),
+        SketchConstraint::PointFixed { .. }      => String::new(),
+        SketchConstraint::PointOnOrigin { pt }    => format!("On Origin  pt {pt}"),
+        SketchConstraint::PointOnXAxis { pt }     => format!("On X-axis  pt {pt}"),
+        SketchConstraint::PointOnYAxis { pt }     => format!("On Y-axis  pt {pt}"),
+        SketchConstraint::HorizontalPair { pt_a, pt_b, .. } => format!("Horizontal  pt {pt_a}–{pt_b}"),
+        SketchConstraint::VerticalPair   { pt_a, pt_b, .. } => format!("Vertical  pt {pt_a}–{pt_b}"),
+        SketchConstraint::PointOnLine { pt, seg }           => format!("On Line  pt {pt} on seg {seg}"),
     }
 }
 
@@ -827,18 +1153,18 @@ fn draw_constraint_marker(
     };
     match c {
         SketchConstraint::Parallel { seg_a, seg_b } => {
-            draw(*seg_a, ICON_PARALLEL); draw(*seg_b, ICON_PARALLEL);
+            draw(*seg_a, "∥"); draw(*seg_b, "∥");
         }
         SketchConstraint::Perpendicular { seg_a, seg_b } => {
-            draw(*seg_a, ICON_PERP); draw(*seg_b, ICON_PERP);
+            draw(*seg_a, "⊥"); draw(*seg_b, "⊥");
         }
         SketchConstraint::Angle { seg_a, degrees, .. } => {
-            draw(*seg_a, &format!("{ICON_ANGLE}{:.0}°", degrees));
+            draw(*seg_a, &format!("∠{:.0}°", degrees));
         }
-        SketchConstraint::Horizontal { seg } => { draw(*seg, ICON_HORIZONTAL); }
-        SketchConstraint::Vertical { seg } => { draw(*seg, ICON_VERTICAL); }
+        SketchConstraint::Horizontal { seg } => { draw(*seg, "↔"); }
+        SketchConstraint::Vertical { seg } => { draw(*seg, "↕"); }
         SketchConstraint::EqualLength { seg_a, seg_b } => {
-            draw(*seg_a, ICON_EQUAL_LEN); draw(*seg_b, ICON_EQUAL_LEN);
+            draw(*seg_a, "≡"); draw(*seg_b, "≡");
         }
         SketchConstraint::Coincident { pt_a, .. } => {
             if let Some(p) = proj(points[*pt_a]) {
@@ -846,7 +1172,7 @@ fn draw_constraint_marker(
             }
         }
         SketchConstraint::FixedLength { seg, value } => {
-            draw(*seg, &format!("{ICON_LENGTH}{value:.2}"));
+            draw(*seg, &format!("⟺{value:.2}"));
         }
         SketchConstraint::PointDistance { pt_a, pt_b, value } => {
             if let (Some(a), Some(b)) = (proj(points[*pt_a]), proj(points[*pt_b])) {
@@ -854,32 +1180,78 @@ fn draw_constraint_marker(
                 painter.text(
                     mid + egui::vec2(6.0, -6.0),
                     egui::Align2::LEFT_BOTTOM,
-                    &format!("{ICON_LENGTH}{value:.2}"),
+                    &format!("⟺{value:.2}"),
                     font.clone(),
                     color,
                 );
             }
         }
+        SketchConstraint::PointFixed { .. } => {} // internal drag pin — no overlay marker
+        SketchConstraint::PointOnOrigin { pt } => {
+            if let Some(p) = proj(points[*pt]) {
+                painter.text(p + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "⊙", font.clone(), color);
+            }
+        }
+        SketchConstraint::PointOnXAxis { pt } => {
+            if let Some(p) = proj(points[*pt]) {
+                painter.text(p + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "∈X", font.clone(), color);
+            }
+        }
+        SketchConstraint::PointOnYAxis { pt } => {
+            if let Some(p) = proj(points[*pt]) {
+                painter.text(p + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "∈Y", font.clone(), color);
+            }
+        }
+        SketchConstraint::HorizontalPair { pt_a, pt_b, .. } => {
+            if let (Some(a), Some(b)) = (proj(points[*pt_a]), proj(points[*pt_b])) {
+                let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                painter.text(mid + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "↔", font.clone(), color);
+            }
+        }
+        SketchConstraint::VerticalPair { pt_a, pt_b, .. } => {
+            if let (Some(a), Some(b)) = (proj(points[*pt_a]), proj(points[*pt_b])) {
+                let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                painter.text(mid + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "↕", font.clone(), color);
+            }
+        }
+        SketchConstraint::PointOnLine { pt, seg } => {
+            // Draw a small circle at the point to indicate it's constrained to the line.
+            if let Some(p) = proj(points[*pt]) {
+                painter.circle_stroke(p, 5.0, egui::Stroke::new(1.2, color));
+            }
+            if let (Some(a), Some(b)) = (proj(points[*seg]), proj(points[(*seg + 1) % n])) {
+                let m = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                painter.text(m + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "◯", font.clone(), color);
+            }
+        }
     }
 }
 
-/// Recursively render an operation history node as a collapsible tree.
-fn show_history(ui: &mut egui::Ui, node: &ObjectHistory) {
+/// Recursively render a history node as an operation row (used inside boolean subtrees).
+fn show_history_op(ui: &mut egui::Ui, node: &ObjectHistory) {
     match node {
-        ObjectHistory::Primitive(_) => {
-            ui.label(egui::RichText::new(node.label()).weak().italics());
+        ObjectHistory::Primitive(kind) => {
+            let icon = match kind {
+                PrimitiveKind::Box      => "☐",
+                PrimitiveKind::Cylinder => "◎",
+                PrimitiveKind::Sphere   => "◉",
+                PrimitiveKind::Cone     => "△",
+            };
+            ui.label(egui::RichText::new(format!("{icon}  {}", node.label())).weak().italics());
         }
-        ObjectHistory::Sketch { plane } => {
-            ui.label(
-                egui::RichText::new(format!("Sketch ({plane:?})"))
-                    .weak()
-                    .italics(),
-            );
+        ObjectHistory::Sketch { plane, extrude_dist, .. } => {
+            ui.label(egui::RichText::new(format!("✏  Sketch ({plane:?})")).weak().italics());
+            ui.label(egui::RichText::new(format!("  ↑  Extrude  {extrude_dist:.2} u")).weak().italics());
         }
-        ObjectHistory::Boolean { left, right, .. } => {
-            ui.collapsing(node.label(), |ui| {
-                show_history(ui, left);
-                show_history(ui, right);
+        ObjectHistory::Boolean { kind, left, right } => {
+            let icon = match kind {
+                brep_bool::BooleanKind::Union        => "⊕",
+                brep_bool::BooleanKind::Difference   => "⊖",
+                brep_bool::BooleanKind::Intersection => "⊗",
+            };
+            ui.collapsing(format!("{icon}  {}", node.label()), |ui| {
+                show_history_op(ui, left);
+                show_history_op(ui, right);
             });
         }
     }

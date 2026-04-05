@@ -16,10 +16,15 @@ use brep_topo::{
 // ── Operation history tree ────────────────────────────────────────────────────
 
 /// Records how an object was produced — forms a tree of operations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ObjectHistory {
     Primitive(PrimitiveKind),
-    Sketch { plane: SketchPlane },
+    Sketch {
+        plane:        SketchPlane,
+        points:       Vec<Point3>,
+        constraints:  Vec<SketchConstraint>,
+        extrude_dist: f64,
+    },
     Boolean {
         kind: BooleanKind,
         left:  Box<ObjectHistory>,
@@ -34,7 +39,7 @@ impl ObjectHistory {
             ObjectHistory::Primitive(PrimitiveKind::Cylinder) => "Cylinder",
             ObjectHistory::Primitive(PrimitiveKind::Sphere)   => "Sphere",
             ObjectHistory::Primitive(PrimitiveKind::Cone)     => "Cone",
-            ObjectHistory::Sketch { .. }                      => "Sketch",
+            ObjectHistory::Sketch { .. }              => "Sketch",
             ObjectHistory::Boolean { kind: BooleanKind::Union,        .. } => "Union",
             ObjectHistory::Boolean { kind: BooleanKind::Difference,   .. } => "Difference",
             ObjectHistory::Boolean { kind: BooleanKind::Intersection, .. } => "Intersection",
@@ -44,8 +49,19 @@ impl ObjectHistory {
 
 // ── Sketch ────────────────────────────────────────────────────────────────────
 
-/// Which principal plane the sketch lives on.
+/// A fixed reference entity in the sketch that points/segments can be constrained against.
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RefEntity {
+    /// The sketch origin (0, 0) in plane coordinates.
+    Origin,
+    /// The sketch X-axis (the U-axis, v = 0).
+    XAxis,
+    /// The sketch Y-axis (the V-axis, u = 0).
+    YAxis,
+}
+
+/// Which principal plane the sketch lives on.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SketchPlane { XY, XZ, YZ }
 
 impl SketchPlane {
@@ -78,16 +94,55 @@ pub enum LengthTarget {
 pub struct SketchState {
     pub plane:                SketchPlane,
     pub points:               Vec<Point3>,  // world-space vertices on the plane (placed in order)
+    /// Whether the polyline has been closed (last point connected back to first).
     pub closed:               bool,
-    pub extrude_dist:         f64,
     /// Active geometric constraints on this sketch.
     pub constraints:          Vec<SketchConstraint>,
     /// Indices of currently selected segments (max 2).
     pub seg_selection:        Vec<usize>,
     /// Indices of currently selected vertices (max 2, for length/distance constraints).
     pub pt_selection:         Vec<usize>,
+    /// Selected reference entity (origin / axis), if any.
+    pub ref_selection:        Option<RefEntity>,
     /// Set when the last constraint solve did not converge.
     pub constraints_conflict: bool,
+    /// Parallel to `constraints`: `true` if removing that constraint would let
+    /// the system converge (i.e., it is one of the conflicting constraints).
+    /// Empty when there is no conflict.
+    pub violated_constraints: Vec<bool>,
+    /// Independent undo/redo stack for sketch edits.
+    pub history: SketchHistory,
+}
+
+/// A closed 2D sketch profile stored in the operations list (no solid yet).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RawSketch {
+    pub name:        String,
+    pub plane:       SketchPlane,
+    pub points:      Vec<Point3>,
+    pub constraints: Vec<SketchConstraint>,
+    /// Stable identity (for future use, e.g. referencing by extrude ops).
+    pub id:          u64,
+}
+
+/// One entry in the operations list — either a closed sketch profile or a solid.
+#[derive(Clone)]
+pub enum SceneEntry {
+    Sketch(RawSketch),
+    Solid(SceneObject),
+}
+
+impl SceneEntry {
+    #[allow(dead_code)]
+    pub fn name(&self) -> &str {
+        match self { Self::Sketch(s) => &s.name, Self::Solid(s) => &s.name }
+    }
+    pub fn id(&self) -> u64 {
+        match self { Self::Sketch(s) => s.id, Self::Solid(s) => s.id }
+    }
+    pub fn as_solid(&self) -> Option<&SceneObject> {
+        match self { Self::Solid(s) => Some(s), _ => None }
+    }
 }
 
 // ── Scene object ──────────────────────────────────────────────────────────────
@@ -143,6 +198,29 @@ impl ViewportCamera {
     /// Up vector (always world-Z unless near a pole).
     pub fn up(&self) -> Vec3 {
         Vec3::z()
+    }
+
+    /// Returns the viewport-aligned perpendicular directions for horizontal and vertical
+    /// constraints on the given sketch plane, as unit (perp_u, perp_v) pairs in UV space.
+    ///
+    /// - `h_perp`: normal to the horizontal direction (= camera-up projected onto UV plane)
+    /// - `v_perp`: normal to the vertical direction (= camera-right projected onto UV plane)
+    pub fn sketch_align_dirs(&self, plane: SketchPlane) -> ((f64, f64), (f64, f64)) {
+        let eye = self.eye();
+        let f = (self.target - eye).normalize();
+        let right = f.cross(&Vec3::z()).normalize();
+        let up_cam = right.cross(&f);
+        let (u_axis, v_axis) = plane.uv_axes();
+
+        let h_pu = up_cam.dot(&u_axis);
+        let h_pv = up_cam.dot(&v_axis);
+        let h_len = (h_pu * h_pu + h_pv * h_pv).sqrt().max(1e-12);
+
+        let v_pu = right.dot(&u_axis);
+        let v_pv = right.dot(&v_axis);
+        let v_len = (v_pu * v_pu + v_pv * v_pv).sqrt().max(1e-12);
+
+        ((h_pu / h_len, h_pv / h_len), (v_pu / v_len, v_pv / v_len))
     }
 
     /// Orbit by screen-space deltas (pixels).
@@ -241,8 +319,8 @@ impl ViewportCamera {
 
 // ── Undo/redo ─────────────────────────────────────────────────────────────────
 
-/// A snapshot of the full scene, used for undo/redo.
-type SceneSnapshot = Vec<SceneObject>;
+/// A snapshot of the full operations list, used for undo/redo.
+type SceneSnapshot = Vec<SceneEntry>;
 
 /// Maintains an undo/redo stack of whole-scene snapshots.
 pub struct History {
@@ -284,9 +362,48 @@ impl History {
     pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
 }
 
+// ── Sketch undo/redo ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct SketchSnapshot {
+    points:      Vec<Point3>,
+    constraints: Vec<SketchConstraint>,
+    closed:      bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SketchHistory {
+    undo_stack: Vec<SketchSnapshot>,
+    redo_stack: Vec<SketchSnapshot>,
+}
+
+impl SketchHistory {
+    fn new() -> Self { Self { undo_stack: Vec::new(), redo_stack: Vec::new() } }
+
+    fn push(&mut self, snapshot: SketchSnapshot) {
+        self.undo_stack.push(snapshot);
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self, current: SketchSnapshot) -> Option<SketchSnapshot> {
+        let prev = self.undo_stack.pop()?;
+        self.redo_stack.push(current);
+        Some(prev)
+    }
+
+    fn redo(&mut self, current: SketchSnapshot) -> Option<SketchSnapshot> {
+        let next = self.redo_stack.pop()?;
+        self.undo_stack.push(current);
+        Some(next)
+    }
+
+    fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
+    fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
+}
+
 // ── Primitive kind ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PrimitiveKind {
     Box,
     Cylinder,
@@ -298,6 +415,12 @@ pub enum PrimitiveKind {
 
 /// An action the UI requests the editor to perform.
 pub enum UiAction {
+    // ── File actions ──────────────────────────────────────────────────────────
+    New,
+    Open,
+    Save,
+    SaveAs,
+    // ── Scene actions ─────────────────────────────────────────────────────────
     AddPrimitive(PrimitiveKind),
     DeleteSelected,
     BooleanOp(BooleanKind),
@@ -315,13 +438,13 @@ pub enum UiAction {
     ExitSketch,
     SketchAddPoint(Point3),
     SketchUndoPoint,
-    SketchClose,
-    SketchSetDistance(f64),
-    SketchExtrude(f64),
+    /// Connect the last point back to the first, closing the polyline. Stays in sketch mode.
+    SketchCloseLoop,
+    /// Save the sketch to the operations list and exit sketch mode.
+    SketchFinish,
     // ── Sketch constraint actions ─────────────────────────────────────────────
     /// Toggle-select a segment by index (max 2 at a time).
     SketchSelectSegment(usize),
-    SketchClearSegSelection,
     SketchAddConstraint(SketchConstraint),
     /// Remove a constraint by its index in `SketchState::constraints`.
     SketchRemoveConstraint(usize),
@@ -331,11 +454,14 @@ pub enum UiAction {
     SketchCancelAngleInput,
     /// Toggle-select a vertex by index (max 2 at a time, clears seg_selection).
     SketchSelectVertex(usize),
-    SketchClearPtSelection,
+    /// Select (or toggle off) a reference entity (origin / axis).
+    SketchSelectRef(RefEntity),
     /// Open the length-input dialog.
     SketchBeginLengthInput(LengthTarget),
     /// Dismiss the length-input dialog without applying.
     SketchCancelLengthInput,
+    /// Re-open a finished sketch from the operations list for editing.
+    OpenSketch(usize),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -359,7 +485,7 @@ fn smoothstep(t: f64) -> f64 {
 
 /// All mutable application state outside of rendering.
 pub struct EditorState {
-    pub objects: Vec<SceneObject>,
+    pub entries: Vec<SceneEntry>,
     pub selection: std::collections::HashSet<usize>,
     pub camera: ViewportCamera,
     pub history: History,
@@ -387,16 +513,59 @@ fn apply_constraints(sk: &mut SketchState) {
     let result = solve_constraints(&mut pts2d, &sk.constraints, n);
     sk.constraints_conflict = result == SolveResult::Conflict;
     if result == SolveResult::Ok {
+        sk.violated_constraints.clear();
         for (i, p) in sk.points.iter_mut().enumerate() {
             *p = Point3::origin() + u * pts2d[i][0] + v * pts2d[i][1];
         }
+    } else {
+        // Identify which constraints are involved in the conflict: try removing
+        // each one in turn — if removal makes the system solvable, that constraint
+        // is a contributor.
+        sk.violated_constraints = find_conflicting_constraints(&pts2d, &sk.constraints, n);
+    }
+}
+
+/// For each constraint, check whether removing it allows the remaining system to
+/// converge.  Returns a parallel `Vec<bool>` — `true` means that constraint is
+/// involved in the conflict.
+fn find_conflicting_constraints(
+    pts: &[[f64; 2]],
+    constraints: &[SketchConstraint],
+    n_pts: usize,
+) -> Vec<bool> {
+    constraints
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let reduced: Vec<&SketchConstraint> = constraints
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, c)| c)
+                .collect();
+            if reduced.is_empty() {
+                // Removing the only constraint always succeeds.
+                return true;
+            }
+            let reduced_owned: Vec<SketchConstraint> = reduced.into_iter().cloned().collect();
+            let mut pts_copy: Vec<[f64; 2]> = pts.to_vec();
+            solve_constraints(&mut pts_copy, &reduced_owned, n_pts) == SolveResult::Ok
+        })
+        .collect()
+}
+
+fn sketch_snapshot(sk: &SketchState) -> SketchSnapshot {
+    SketchSnapshot {
+        points:      sk.points.clone(),
+        constraints: sk.constraints.clone(),
+        closed:      sk.closed,
     }
 }
 
 impl EditorState {
     pub fn new() -> Self {
         let mut s = Self {
-            objects: Vec::new(),
+            entries: Vec::new(),
             selection: std::collections::HashSet::new(),
             camera: ViewportCamera::default(),
             history: History::new(),
@@ -415,6 +584,8 @@ impl EditorState {
     /// Apply a UI action.  Returns `true` if the scene geometry changed.
     pub fn apply(&mut self, action: UiAction) -> bool {
         match action {
+            // File actions are handled at the app layer (main.rs).
+            UiAction::New | UiAction::Open | UiAction::Save | UiAction::SaveAs => false,
             UiAction::AddPrimitive(kind) => {
                 self.save_snapshot();
                 self.add_primitive(kind);
@@ -429,61 +600,60 @@ impl EditorState {
                 let mut indices: Vec<usize> = self.selection.iter().cloned().collect();
                 indices.sort_unstable_by(|a, b| b.cmp(a));
                 for i in indices {
-                    self.objects.remove(i);
+                    self.entries.remove(i);
                 }
                 self.selection.clear();
                 self.scene_dirty = true;
                 true
             }
             UiAction::BooleanOp(kind) => {
-                if self.selection.len() != 2 {
+                // Only operate on selected solid entries.
+                let solid_sel: Vec<usize> = self.selection.iter().cloned()
+                    .filter(|&i| matches!(self.entries.get(i), Some(SceneEntry::Solid(_))))
+                    .collect();
+                if solid_sel.len() != 2 {
                     return false;
                 }
-                let mut sel: Vec<usize> = self.selection.iter().cloned().collect();
+                let mut sel = solid_sel;
                 sel.sort_unstable();
                 let (a_idx, b_idx) = (sel[0], sel[1]);
+                // Clone all needed data before any mutable borrows.
+                let a_store    = self.entries[a_idx].as_solid().unwrap().store.clone();
+                let a_solid_id = self.entries[a_idx].as_solid().unwrap().solid_id;
+                let b_store    = self.entries[b_idx].as_solid().unwrap().store.clone();
+                let b_solid_id = self.entries[b_idx].as_solid().unwrap().solid_id;
+                let (hi, lo)   = if a_idx > b_idx { (a_idx, b_idx) } else { (b_idx, a_idx) };
+                let hi_hist    = self.entries[hi].as_solid().unwrap().history.clone();
+                let lo_hist    = self.entries[lo].as_solid().unwrap().history.clone();
                 self.save_snapshot();
-                let result = boolean_op(
-                    &self.objects[a_idx].store,
-                    self.objects[a_idx].solid_id,
-                    &self.objects[b_idx].store,
-                    self.objects[b_idx].solid_id,
-                    kind,
-                    1e-7,
-                );
+                let result = boolean_op(&a_store, a_solid_id, &b_store, b_solid_id, kind, 1e-7);
                 match result {
                     Ok(new_store) => {
-                        let new_solid = new_store
-                            .solid_ids()
-                            .next()
+                        let new_solid_id = new_store.solid_ids().next()
                             .expect("boolean result has a solid");
                         let name = format!("Bool-{}", self.next_name());
-                        // Remove in reverse order, capturing histories first.
-                        let (hi, lo) = if a_idx > b_idx { (a_idx, b_idx) } else { (b_idx, a_idx) };
-                        let hi_hist = self.objects[hi].history.clone();
-                        let lo_hist = self.objects[lo].history.clone();
                         let (left_hist, right_hist) = if a_idx < b_idx {
                             (lo_hist, hi_hist)
                         } else {
                             (hi_hist, lo_hist)
                         };
-                        self.objects.remove(hi);
-                        self.objects.remove(lo);
+                        self.entries.remove(hi);
+                        self.entries.remove(lo);
                         let history = ObjectHistory::Boolean {
                             kind,
                             left:  Box::new(left_hist),
                             right: Box::new(right_hist),
                         };
                         let id = self.alloc_id();
-                        self.objects.push(SceneObject {
+                        self.entries.push(SceneEntry::Solid(SceneObject {
                             store: new_store,
-                            solid_id: new_solid,
+                            solid_id: new_solid_id,
                             name,
                             history,
                             id,
-                        });
+                        }));
                         self.selection.clear();
-                        self.selection.insert(self.objects.len() - 1);
+                        self.selection.insert(self.entries.len() - 1);
                         self.scene_dirty = true;
                         true
                     }
@@ -508,8 +678,19 @@ impl EditorState {
                 false
             }
             UiAction::Undo => {
-                if let Some(prev) = self.history.undo(self.objects.clone()) {
-                    self.objects = prev;
+                if let Some(sk) = &mut self.sketch {
+                    if sk.history.can_undo() {
+                        let current = sketch_snapshot(sk);
+                        if let Some(prev) = sk.history.undo(current) {
+                            sk.points      = prev.points;
+                            sk.constraints = prev.constraints;
+                            sk.closed      = prev.closed;
+                            apply_constraints(sk);
+                        }
+                    }
+                    false
+                } else if let Some(prev) = self.history.undo(self.entries.clone()) {
+                    self.entries = prev;
                     self.selection.clear();
                     self.scene_dirty = true;
                     true
@@ -518,8 +699,19 @@ impl EditorState {
                 }
             }
             UiAction::Redo => {
-                if let Some(next) = self.history.redo(self.objects.clone()) {
-                    self.objects = next;
+                if let Some(sk) = &mut self.sketch {
+                    if sk.history.can_redo() {
+                        let current = sketch_snapshot(sk);
+                        if let Some(next) = sk.history.redo(current) {
+                            sk.points      = next.points;
+                            sk.constraints = next.constraints;
+                            sk.closed      = next.closed;
+                            apply_constraints(sk);
+                        }
+                    }
+                    false
+                } else if let Some(next) = self.history.redo(self.entries.clone()) {
+                    self.entries = next;
                     self.selection.clear();
                     self.scene_dirty = true;
                     true
@@ -549,16 +741,22 @@ impl EditorState {
                     plane,
                     points: Vec::new(),
                     closed: false,
-                    extrude_dist: 1.0,
                     constraints: Vec::new(),
                     seg_selection: Vec::new(),
                     pt_selection: Vec::new(),
+                    ref_selection: None,
                     constraints_conflict: false,
+                    violated_constraints: Vec::new(),
+                    history: SketchHistory::new(),
                 });
                 self.selection.clear();
-                // Animate the camera to look at the chosen plane.
+                // Animate the camera to look at the chosen plane with axes oriented
+                // so that the sketch U axis goes right and V axis goes up on screen.
+                // XY: U=X right, V=Y up  → look from +Z (az=-π/2, el≈π/2)
+                // XZ: U=X right, V=Z up  → look from -Y (az=-π/2, el=0)
+                // YZ: U=Y right, V=Z up  → look from +X (az=0,    el=0)
                 let (az, el) = match plane {
-                    SketchPlane::XY => (self.camera.azimuth, PI / 2.0 - 0.05),
+                    SketchPlane::XY => (-PI / 2.0, PI / 2.0 - 0.05),
                     SketchPlane::XZ => (-PI / 2.0, 0.0),
                     SketchPlane::YZ => (0.0, 0.0),
                 };
@@ -576,65 +774,149 @@ impl EditorState {
                 self.sketch = None;
                 false
             }
+            UiAction::OpenSketch(i) => {
+                let Some(SceneEntry::Sketch(raw)) = self.entries.get(i).cloned() else {
+                    return false;
+                };
+                self.entries.remove(i);
+                self.selection.clear();
+                self.sketch = Some(SketchState {
+                    plane:                raw.plane,
+                    points:               raw.points,
+                    closed:               true,
+                    constraints:          raw.constraints,
+                    seg_selection:        Vec::new(),
+                    pt_selection:         Vec::new(),
+                    ref_selection:        None,
+                    constraints_conflict: false,
+                    violated_constraints: Vec::new(),
+                    history:              SketchHistory::new(),
+                });
+                // Animate camera to face the sketch plane.
+                let (az, el) = match raw.plane {
+                    SketchPlane::XY => (-PI / 2.0, PI / 2.0 - 0.05),
+                    SketchPlane::XZ => (-PI / 2.0, 0.0),
+                    SketchPlane::YZ => (0.0, 0.0),
+                };
+                self.camera_anim = Some(CameraAnimation {
+                    start_az:  self.camera.azimuth,
+                    start_el:  self.camera.elevation,
+                    target_az: az,
+                    target_el: el,
+                    started:   Instant::now(),
+                    duration:  0.3,
+                });
+                false
+            }
             UiAction::SketchAddPoint(p) => {
                 if let Some(sk) = &mut self.sketch {
-                    if !sk.closed {
-                        sk.points.push(p);
-                        apply_constraints(sk);
-                    }
+                    if sk.closed { return false; }
+                    sk.history.push(sketch_snapshot(sk));
+                    sk.points.push(p);
+                    apply_constraints(sk);
                 }
                 false
             }
             UiAction::SketchUndoPoint => {
                 if let Some(sk) = &mut self.sketch {
-                    if sk.closed { sk.closed = false; } else { sk.points.pop(); }
+                    sk.history.push(sketch_snapshot(sk));
+                    if sk.closed {
+                        sk.closed = false;
+                    } else {
+                        sk.points.pop();
+                    }
                 }
                 false
             }
-            UiAction::SketchClose => {
+            UiAction::SketchCloseLoop => {
+                // Close the polyline loop; stay in sketch mode.
                 if let Some(sk) = &mut self.sketch {
-                    if sk.points.len() >= 3 { sk.closed = true; }
+                    if sk.points.len() >= 3 {
+                        sk.history.push(sketch_snapshot(sk));
+                        sk.closed = true;
+                    }
                 }
                 false
             }
-            UiAction::SketchSetDistance(d) => {
-                if let Some(sk) = &mut self.sketch { sk.extrude_dist = d; }
+            UiAction::SketchFinish => {
+                // Save to entries and exit sketch mode.
+                let Some(sk) = self.sketch.take() else { return false };
+                if sk.points.len() < 3 {
+                    self.sketch = Some(sk);
+                    return false;
+                }
+                let persistent_constraints: Vec<_> = sk.constraints.iter()
+                    .filter(|c| !matches!(c, SketchConstraint::PointFixed { .. }))
+                    .cloned()
+                    .collect();
+                let id = self.alloc_id();
+                let name = format!("Sketch-{}", self.next_name());
+                self.save_snapshot();
+                self.entries.push(SceneEntry::Sketch(RawSketch {
+                    name,
+                    plane:       sk.plane,
+                    points:      sk.points,
+                    constraints: persistent_constraints,
+                    id,
+                }));
+                // Sketch entries are not "selected" (no solid to operate on).
                 false
             }
             UiAction::SketchSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.pt_selection.clear(); // segment selection clears vertex selection
-                    if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
-                        sk.seg_selection.remove(pos);
-                    } else {
-                        if sk.seg_selection.len() >= 2 { sk.seg_selection.remove(0); }
+                    // Allow 1 seg + 1 pt to coexist (for PointOnLine / Coincident constraints).
+                    // If there's exactly 1 point selected and no segments yet, add the segment
+                    // alongside the point rather than clearing it.
+                    if sk.pt_selection.len() == 1 && sk.seg_selection.is_empty() {
+                        // Toggle the segment, keeping the point.
                         sk.seg_selection.push(i);
+                    } else {
+                        // Normal seg-only mode: clear points, toggle segment (max 2).
+                        sk.pt_selection.clear();
+                        if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
+                            sk.seg_selection.remove(pos);
+                        } else {
+                            if sk.seg_selection.len() >= 2 { sk.seg_selection.remove(0); }
+                            sk.seg_selection.push(i);
+                        }
                     }
                 }
-                false
-            }
-            UiAction::SketchClearSegSelection => {
-                if let Some(sk) = &mut self.sketch { sk.seg_selection.clear(); }
                 false
             }
             UiAction::SketchSelectVertex(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.seg_selection.clear(); // vertex selection clears segment selection
-                    if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
-                        sk.pt_selection.remove(pos);
-                    } else {
-                        if sk.pt_selection.len() >= 2 { sk.pt_selection.remove(0); }
+                    // Allow 1 seg + 1 pt to coexist (for PointOnLine / Coincident constraints).
+                    // If there's exactly 1 segment selected and no points yet, add the point
+                    // alongside the segment rather than clearing it.
+                    if sk.seg_selection.len() == 1 && sk.pt_selection.is_empty() {
+                        // Toggle the point, keeping the segment.
                         sk.pt_selection.push(i);
+                    } else {
+                        // Normal pt-only mode: clear segments, toggle point (max 2).
+                        sk.seg_selection.clear();
+                        if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
+                            sk.pt_selection.remove(pos);
+                        } else {
+                            if sk.pt_selection.len() >= 2 { sk.pt_selection.remove(0); }
+                            sk.pt_selection.push(i);
+                        }
                     }
                 }
                 false
             }
-            UiAction::SketchClearPtSelection => {
-                if let Some(sk) = &mut self.sketch { sk.pt_selection.clear(); }
+            UiAction::SketchSelectRef(r) => {
+                if let Some(sk) = &mut self.sketch {
+                    if sk.ref_selection == Some(r) {
+                        sk.ref_selection = None;
+                    } else {
+                        sk.ref_selection = Some(r);
+                    }
+                }
                 false
             }
             UiAction::SketchAddConstraint(c) => {
                 if let Some(sk) = &mut self.sketch {
+                    sk.history.push(sketch_snapshot(sk));
                     sk.constraints.push(c);
                     apply_constraints(sk);
                 }
@@ -649,42 +931,15 @@ impl EditorState {
             UiAction::SketchRemoveConstraint(idx) => {
                 if let Some(sk) = &mut self.sketch {
                     if idx < sk.constraints.len() {
+                        sk.history.push(sketch_snapshot(sk));
                         sk.constraints.remove(idx);
+                        if !sk.violated_constraints.is_empty() {
+                            sk.violated_constraints.remove(idx);
+                        }
                         apply_constraints(sk);
                     }
                 }
                 false
-            }
-
-            UiAction::SketchExtrude(dist) => {
-                let Some(sk) = self.sketch.take() else { return false };
-                if sk.points.len() < 3 { self.sketch = None; return false; }
-                use brep_param::{ExtrudeFeature, Feature};
-                use std::sync::Arc;
-                let feature = ExtrudeFeature {
-                    profile: sk.points,
-                    direction: sk.plane.normal(),
-                    distance: dist,
-                };
-                if let Ok(store_arc) = feature.compute(&[]) {
-                    let store: brep_topo::store::ShapeStore =
-                        Arc::try_unwrap(store_arc).unwrap_or_else(|a| (*a).clone());
-                    let solid_id = store.solid_ids().next().expect("extruded solid");
-                    let name = format!("Sketch-{}", self.next_name());
-                    let id = self.alloc_id();
-                    self.save_snapshot();
-                    self.objects.push(SceneObject {
-                        store,
-                        solid_id,
-                        name,
-                        history: ObjectHistory::Sketch { plane: sk.plane },
-                        id,
-                    });
-                    self.selection.clear();
-                    self.selection.insert(self.objects.len() - 1);
-                    self.scene_dirty = true;
-                }
-                true
             }
         }
     }
@@ -706,7 +961,7 @@ impl EditorState {
     }
 
     fn save_snapshot(&mut self) {
-        self.history.push(self.objects.clone());
+        self.history.push(self.entries.clone());
     }
 
     fn next_name(&mut self) -> u32 {
@@ -732,7 +987,39 @@ impl EditorState {
             let name = format!("{:?}-{}", kind, self.next_name());
             let history = ObjectHistory::Primitive(kind);
             let id = self.alloc_id();
-            self.objects.push(SceneObject { store, solid_id, name, history, id });
+            self.entries.push(SceneEntry::Solid(SceneObject { store, solid_id, name, history, id }));
+        }
+    }
+
+    /// Move a sketch vertex to `target` while respecting constraints.
+    ///
+    /// Temporarily injects a `PointFixed` pin constraint for the dragged vertex
+    /// so the solver holds it at the cursor position while adjusting other free
+    /// vertices to satisfy all other constraints.
+    pub fn drag_sketch_vertex(&mut self, idx: usize, target: Point3) {
+        let Some(sk) = &mut self.sketch else { return };
+        if idx >= sk.points.len() { return; }
+
+        let (u, v) = sk.plane.uv_axes();
+        let pin_x = target.coords.dot(&u);
+        let pin_y = target.coords.dot(&v);
+
+        if !sk.constraints.is_empty() && sk.points.len() >= 2 {
+            // Save positions so we can restore if the pin conflicts with existing constraints.
+            let pts_backup = sk.points.clone();
+            sk.points[idx] = target;
+            let pin_c = SketchConstraint::PointFixed { pt: idx, x: pin_x, y: pin_y };
+            sk.constraints.push(pin_c);
+            apply_constraints(sk);
+            let conflict = sk.constraints_conflict;
+            sk.constraints.pop();
+            if conflict {
+                // The cursor position is incompatible with existing constraints — snap back.
+                sk.points = pts_backup;
+                apply_constraints(sk);
+            }
+        } else {
+            sk.points[idx] = target;
         }
     }
 
@@ -750,11 +1037,11 @@ impl EditorState {
         let ray = self.camera.unproject_ray(screen_x, screen_y, viewport_w, viewport_h);
 
         let mut best: Option<(usize, f64)> = None;
-        for (i, obj) in self.objects.iter().enumerate() {
+        for (i, entry) in self.entries.iter().enumerate() {
+            let obj = match entry { SceneEntry::Solid(s) => s, _ => continue };
             let bvh = Bvh::build(&obj.store);
             let hits = bvh.intersect_ray(&ray);
             if !hits.is_empty() {
-                // Estimate distance as distance from eye to the nearest face centroid.
                 let eye = self.camera.eye();
                 let d = hits
                     .iter()
@@ -776,14 +1063,147 @@ impl EditorState {
         best.map(|(i, _)| i)
     }
 
-    /// Return (face count, edge count, vertex count) for the selected object(s).
+    /// Return (face count, edge count, vertex count) for the selected solid entry.
     pub fn selection_stats(&self) -> Option<(usize, usize, usize)> {
         let idx = self.selection.iter().next()?;
-        let obj = self.objects.get(*idx)?;
+        let obj = self.entries.get(*idx)?.as_solid()?;
         Some((
             obj.store.face_count(),
             obj.store.edge_count(),
             obj.store.vertex_count(),
         ))
+    }
+
+    /// Serialize the current scene to a `SavedScene`.
+    pub fn to_saved_scene(&self) -> SavedScene {
+        let entries = self.entries.iter().map(|e| match e {
+            SceneEntry::Sketch(s) => SavedEntry::Sketch {
+                name:        s.name.clone(),
+                plane:       s.plane,
+                points:      s.points.clone(),
+                constraints: s.constraints.clone(),
+            },
+            SceneEntry::Solid(o) => SavedEntry::Solid {
+                name:    o.name.clone(),
+                history: o.history.clone(),
+            },
+        }).collect();
+        SavedScene {
+            version: 2,
+            entries,
+            camera: SavedCamera {
+                target:    self.camera.target.coords.into(),
+                distance:  self.camera.distance,
+                azimuth:   self.camera.azimuth,
+                elevation: self.camera.elevation,
+            },
+        }
+    }
+
+    /// Rebuild the scene from a `SavedScene`, replacing all current entries.
+    pub fn load_saved_scene(&mut self, scene: SavedScene) {
+        self.entries.clear();
+        self.selection.clear();
+        self.history = History::new();
+        self.sketch = None;
+        self.name_counter = 0;
+
+        for saved in scene.entries {
+            match saved {
+                SavedEntry::Sketch { name, plane, points, constraints } => {
+                    let id = { let v = self.next_object_id; self.next_object_id += 1; v };
+                    self.entries.push(SceneEntry::Sketch(RawSketch { name, plane, points, constraints, id }));
+                }
+                SavedEntry::Solid { name, history } => {
+                    if let Some(obj) = rebuild_solid(name, &history, &mut self.next_object_id) {
+                        self.entries.push(SceneEntry::Solid(obj));
+                    }
+                }
+            }
+        }
+
+        self.camera.target    = Point3::new(scene.camera.target[0], scene.camera.target[1], scene.camera.target[2]);
+        self.camera.distance  = scene.camera.distance;
+        self.camera.azimuth   = scene.camera.azimuth;
+        self.camera.elevation = scene.camera.elevation;
+        self.scene_dirty = true;
+    }
+}
+
+// ── Saved-scene data types ───────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SavedScene {
+    pub version: u32,
+    pub entries: Vec<SavedEntry>,
+    pub camera:  SavedCamera,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum SavedEntry {
+    Sketch {
+        name:        String,
+        plane:       SketchPlane,
+        points:      Vec<Point3>,
+        constraints: Vec<SketchConstraint>,
+    },
+    Solid {
+        name:    String,
+        history: ObjectHistory,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SavedCamera {
+    pub target:    [f64; 3],
+    pub distance:  f64,
+    pub azimuth:   f64,
+    pub elevation: f64,
+}
+
+// ── Scene reconstruction ─────────────────────────────────────────────────────
+
+/// Recursively rebuild a solid `SceneObject` from a history tree.
+fn rebuild_solid(name: String, history: &ObjectHistory, next_id: &mut u64) -> Option<SceneObject> {
+    let id = { let v = *next_id; *next_id += 1; v };
+    match history {
+        ObjectHistory::Primitive(kind) => {
+            let mut store = ShapeStore::new();
+            let result = match kind {
+                PrimitiveKind::Box      => brep_topo::primitives::make_box(&mut store, 1.0, 1.0, 1.0),
+                PrimitiveKind::Cylinder => brep_topo::primitives::make_cylinder(&mut store, 0.5, 1.0),
+                PrimitiveKind::Sphere   => brep_topo::primitives::make_sphere(&mut store, 0.5),
+                PrimitiveKind::Cone     => brep_topo::primitives::make_cone(&mut store, 0.5, 1.0),
+            };
+            let solid_id = result.ok()?;
+            Some(SceneObject { store, solid_id, name, history: history.clone(), id })
+        }
+        ObjectHistory::Sketch { plane, points, constraints: _, extrude_dist } => {
+            use brep_param::{ExtrudeFeature, Feature};
+            use std::sync::Arc;
+            if points.len() < 3 { return None; }
+            let feature = ExtrudeFeature {
+                profile:   points.clone(),
+                direction: plane.normal(),
+                distance:  *extrude_dist,
+            };
+            let store_arc = feature.compute(&[]).ok()?;
+            let store: ShapeStore = Arc::try_unwrap(store_arc).unwrap_or_else(|a| (*a).clone());
+            let solid_id = store.solid_ids().next()?;
+            Some(SceneObject { store, solid_id, name, history: history.clone(), id })
+        }
+        ObjectHistory::Boolean { kind, left, right } => {
+            let mut scratch = u64::MAX / 2;
+            let left_obj  = rebuild_solid(String::new(), left,  &mut scratch)?;
+            let right_obj = rebuild_solid(String::new(), right, &mut scratch)?;
+            let result = brep_bool::boolean_op(
+                &left_obj.store,  left_obj.solid_id,
+                &right_obj.store, right_obj.solid_id,
+                *kind, 1e-7,
+            );
+            let new_store = result.ok()?;
+            let solid_id  = new_store.solid_ids().next()?;
+            Some(SceneObject { store: new_store, solid_id, name, history: history.clone(), id })
+        }
     }
 }

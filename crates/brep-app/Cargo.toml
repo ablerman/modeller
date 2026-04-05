@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 brep-core.workspace = true
+brep-config.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
 brep-sketch.workspace = true
 brep-topo.workspace = true
 brep-algo.workspace = true
@@ -29,3 +32,6 @@ pollster = "0.3"
 egui = "0.30"
 egui-wgpu = "0.30"
 egui-winit = "0.30"
+egui_extras = { version = "0.30", features = ["image", "svg"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd.workspace = true

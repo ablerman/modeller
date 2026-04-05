@@ -38,73 +38,54 @@ pub fn solve_constraints(
 
     // Flatten [u,v] pairs into a single Vec<f64>.
     let mut vars: Vec<f64> = pts.iter().flat_map(|p| [p[0], p[1]]).collect();
-    let original = vars.clone();
 
     const MAX_ITER: usize = 50;
     const CONVERGENCE_TOL: f64 = 1e-8;
     const LAMBDA: f64 = 1e-4;
-    const EPS: f64 = 1e-7;
+
+    let nv = vars.len();
+    let m = count_residuals(constraints);
+
+    // Pre-allocated working buffers — reused across iterations.
+    let mut r = vec![0.0_f64; m];
+    let mut j_flat = vec![0.0_f64; m * nv]; // row-major J[m × nv]
 
     for _ in 0..MAX_ITER {
-        let r = residuals(&vars, constraints, n_pts);
+        fill_residuals(&vars, constraints, n_pts, &mut r);
         let norm_sq: f64 = r.iter().map(|x| x * x).sum();
         if norm_sq.sqrt() < CONVERGENCE_TOL {
             break;
         }
 
-        let m = r.len();
-        let nv = vars.len();
+        // Build analytical Jacobian.
+        j_flat.fill(0.0);
+        fill_jacobian(&vars, constraints, n_pts, nv, &mut j_flat);
 
-        // Build numerical Jacobian J[m x nv].
-        let mut j_flat = vec![0.0_f64; m * nv];
-        for col in 0..nv {
-            vars[col] += EPS;
-            let r2 = residuals(&vars, constraints, n_pts);
-            vars[col] -= EPS;
-            for row in 0..m {
-                j_flat[row * nv + col] = (r2[row] - r[row]) / EPS;
-            }
+        // JᵀJ + λI and Jᵀr via nalgebra (optimised BLAS path).
+        let j = DMatrix::from_row_slice(m, nv, &j_flat);
+        let r_vec = DVector::from_row_slice(&r);
+        let jt_r: DVector<f64> = j.tr_mul(&r_vec);
+        let mut jt_j: DMatrix<f64> = j.tr_mul(&j);
+        for i in 0..nv {
+            jt_j[(i, i)] += LAMBDA;
         }
 
-        // JᵀJ + λI
-        let mut jt_j = vec![0.0_f64; nv * nv];
-        for c in 0..nv {
-            for d in 0..nv {
-                let mut sum = 0.0;
-                for i in 0..m {
-                    sum += j_flat[i * nv + c] * j_flat[i * nv + d];
-                }
-                jt_j[c * nv + d] = sum + if c == d { LAMBDA } else { 0.0 };
-            }
-        }
+        // JᵀJ + λI is symmetric positive definite; Cholesky is ~2× faster
+        // than full inversion and avoids computing the n×n inverse matrix.
+        let Some(chol) = nalgebra::linalg::Cholesky::new(jt_j) else { break };
+        let delta = chol.solve(&jt_r);
 
-        // Jᵀr
-        let mut jt_r = vec![0.0_f64; nv];
-        for c in 0..nv {
-            let mut sum = 0.0;
-            for i in 0..m {
-                sum += j_flat[i * nv + c] * r[i];
-            }
-            jt_r[c] = sum;
-        }
-
-        let mat = DMatrix::from_row_slice(nv, nv, &jt_j);
-        let rhs = DVector::from_vec(jt_r);
-        let Some(inv) = mat.try_inverse() else { break };
-        let delta = inv * rhs;
         for i in 0..nv {
             vars[i] -= delta[i];
         }
     }
 
-    let final_r = residuals(&vars, constraints, n_pts);
-    let final_norm: f64 = final_r.iter().map(|x| x * x).sum::<f64>().sqrt();
+    // Check final residual.
+    fill_residuals(&vars, constraints, n_pts, &mut r);
+    let final_norm: f64 = r.iter().map(|x| x * x).sum::<f64>().sqrt();
 
     if final_norm > 1e-4 {
-        // Restore original positions.
-        for (i, chunk) in original.chunks(2).enumerate() {
-            pts[i] = [chunk[0], chunk[1]];
-        }
+        // pts was never modified during the solve loop; no restore needed.
         return SolveResult::Conflict;
     }
 
@@ -115,9 +96,30 @@ pub fn solve_constraints(
     SolveResult::Ok
 }
 
-/// Evaluate all constraint residuals.  Returns a `Vec` of scalar errors;
-/// all entries should be zero when all constraints are satisfied.
-fn residuals(vars: &[f64], constraints: &[SketchConstraint], n: usize) -> Vec<f64> {
+/// Number of scalar residuals for the given constraint list.
+/// `Coincident` produces 2; every other constraint produces 1.
+fn count_residuals(constraints: &[SketchConstraint]) -> usize {
+    constraints
+        .iter()
+        .map(|c| match c {
+            SketchConstraint::Coincident { .. }
+            | SketchConstraint::PointFixed { .. }
+            | SketchConstraint::PointOnOrigin { .. } => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Fill the residual vector in-place.
+///
+/// The constraint order determines which `r[row]` each residual lands in.
+/// `fill_jacobian` must iterate constraints in the same order.
+fn fill_residuals(
+    vars: &[f64],
+    constraints: &[SketchConstraint],
+    n: usize,
+    r: &mut [f64],
+) {
     let pt = |i: usize| -> (f64, f64) { (vars[2 * i], vars[2 * i + 1]) };
     let seg_dir = |s: usize| -> (f64, f64) {
         let (ax, ay) = pt(s);
@@ -125,20 +127,20 @@ fn residuals(vars: &[f64], constraints: &[SketchConstraint], n: usize) -> Vec<f6
         (bx - ax, by - ay)
     };
 
-    let mut r = Vec::new();
+    let mut row = 0usize;
     for c in constraints {
         match c {
             SketchConstraint::Parallel { seg_a, seg_b } => {
                 let (ax, ay) = seg_dir(*seg_a);
                 let (bx, by) = seg_dir(*seg_b);
-                // cross product = 0  ↔  ax*by - ay*bx = 0
-                r.push(ax * by - ay * bx);
+                r[row] = ax * by - ay * bx;
+                row += 1;
             }
             SketchConstraint::Perpendicular { seg_a, seg_b } => {
                 let (ax, ay) = seg_dir(*seg_a);
                 let (bx, by) = seg_dir(*seg_b);
-                // dot product = 0
-                r.push(ax * bx + ay * by);
+                r[row] = ax * bx + ay * by;
+                row += 1;
             }
             SketchConstraint::Angle { seg_a, seg_b, degrees } => {
                 let (ax, ay) = seg_dir(*seg_a);
@@ -147,45 +149,338 @@ fn residuals(vars: &[f64], constraints: &[SketchConstraint], n: usize) -> Vec<f6
                 let lb = (bx * bx + by * by).sqrt().max(1e-12);
                 let cos_actual = (ax * bx + ay * by) / (la * lb);
                 let cos_target = degrees.to_radians().cos();
-                r.push(cos_actual - cos_target);
+                r[row] = cos_actual - cos_target;
+                row += 1;
             }
             SketchConstraint::Horizontal { seg } => {
-                // vertical component of direction = 0
                 let (_, dy) = seg_dir(*seg);
-                r.push(dy);
+                r[row] = dy;
+                row += 1;
             }
             SketchConstraint::Vertical { seg } => {
-                // horizontal component of direction = 0
                 let (dx, _) = seg_dir(*seg);
-                r.push(dx);
+                r[row] = dx;
+                row += 1;
             }
             SketchConstraint::EqualLength { seg_a, seg_b } => {
                 let (ax, ay) = seg_dir(*seg_a);
                 let (bx, by) = seg_dir(*seg_b);
-                // |a|² - |b|² = 0
-                r.push(ax * ax + ay * ay - bx * bx - by * by);
+                r[row] = ax * ax + ay * ay - bx * bx - by * by;
+                row += 1;
             }
             SketchConstraint::Coincident { pt_a, pt_b } => {
                 let (ax, ay) = pt(*pt_a);
                 let (bx, by) = pt(*pt_b);
-                r.push(ax - bx);
-                r.push(ay - by);
+                r[row] = ax - bx;
+                r[row + 1] = ay - by;
+                row += 2;
+            }
+            SketchConstraint::PointOnLine { pt: pi, seg } => {
+                // r = (u_pt - u_a)*(v_b - v_a) - (v_pt - v_a)*(u_b - u_a)
+                let (u_a, v_a) = pt(*seg);
+                let (u_b, v_b) = pt((*seg + 1) % n);
+                let (u_p, v_p) = pt(*pi);
+                r[row] = (u_p - u_a) * (v_b - v_a) - (v_p - v_a) * (u_b - u_a);
+                row += 1;
             }
             SketchConstraint::FixedLength { seg, value } => {
                 let (dx, dy) = seg_dir(*seg);
-                // |seg|² - value² = 0
-                r.push(dx * dx + dy * dy - value * value);
+                r[row] = dx * dx + dy * dy - value * value;
+                row += 1;
             }
             SketchConstraint::PointDistance { pt_a, pt_b, value } => {
                 let (ax, ay) = pt(*pt_a);
                 let (bx, by) = pt(*pt_b);
                 let dx = bx - ax;
                 let dy = by - ay;
-                r.push(dx * dx + dy * dy - value * value);
+                r[row] = dx * dx + dy * dy - value * value;
+                row += 1;
+            }
+            SketchConstraint::PointFixed { pt: pi, x, y } => {
+                let (pu, pv) = pt(*pi);
+                r[row] = pu - x;
+                r[row + 1] = pv - y;
+                row += 2;
+            }
+            SketchConstraint::PointOnOrigin { pt: pi } => {
+                let (pu, pv) = pt(*pi);
+                r[row] = pu;
+                r[row + 1] = pv;
+                row += 2;
+            }
+            SketchConstraint::PointOnXAxis { pt: pi } => {
+                let (_, pv) = pt(*pi);
+                r[row] = pv;
+                row += 1;
+            }
+            SketchConstraint::PointOnYAxis { pt: pi } => {
+                let (pu, _) = pt(*pi);
+                r[row] = pu;
+                row += 1;
+            }
+            SketchConstraint::HorizontalPair { pt_a, pt_b, perp_u, perp_v } => {
+                let (ax, ay) = pt(*pt_a);
+                let (bx, by) = pt(*pt_b);
+                r[row] = perp_u * (bx - ax) + perp_v * (by - ay);
+                row += 1;
+            }
+            SketchConstraint::VerticalPair { pt_a, pt_b, perp_u, perp_v } => {
+                let (ax, ay) = pt(*pt_a);
+                let (bx, by) = pt(*pt_b);
+                r[row] = perp_u * (bx - ax) + perp_v * (by - ay);
+                row += 1;
             }
         }
     }
-    r
+}
+
+/// Fill the Jacobian analytically (row-major J[m × nv], pre-zeroed).
+///
+/// For each constraint `c` mapped to residual row `row`, we write the
+/// partial derivative ∂r_row/∂vars[col] into `j_flat[row*nv + col]`.
+/// All partial derivatives are exact closed-form expressions — no
+/// finite-difference perturbation is needed.
+fn fill_jacobian(
+    vars: &[f64],
+    constraints: &[SketchConstraint],
+    n: usize,
+    nv: usize,
+    j_flat: &mut [f64],
+) {
+    let pt = |i: usize| -> (f64, f64) { (vars[2 * i], vars[2 * i + 1]) };
+    let seg_dir = |s: usize| -> (f64, f64) {
+        let (ax, ay) = pt(s);
+        let (bx, by) = pt((s + 1) % n);
+        (bx - ax, by - ay)
+    };
+
+    let mut row = 0usize;
+    for c in constraints {
+        match c {
+            SketchConstraint::Horizontal { seg } => {
+                // r = v[(s+1)%n] - v[s]
+                let s = *seg;
+                let sn = (s + 1) % n;
+                j_flat[row * nv + 2 * s + 1] = -1.0;
+                j_flat[row * nv + 2 * sn + 1] = 1.0;
+                row += 1;
+            }
+            SketchConstraint::Vertical { seg } => {
+                // r = u[(s+1)%n] - u[s]
+                let s = *seg;
+                let sn = (s + 1) % n;
+                j_flat[row * nv + 2 * s] = -1.0;
+                j_flat[row * nv + 2 * sn] = 1.0;
+                row += 1;
+            }
+            SketchConstraint::Parallel { seg_a, seg_b } => {
+                // r = dxa*dyb - dya*dxb
+                // ∂r/∂u[a]  = -dyb,  ∂r/∂u[an] = +dyb
+                // ∂r/∂v[a]  = +dxb,  ∂r/∂v[an] = -dxb
+                // ∂r/∂u[b]  = +dya,  ∂r/∂u[bn] = -dya
+                // ∂r/∂v[b]  = -dxa,  ∂r/∂v[bn] = +dxa
+                let (dxa, dya) = seg_dir(*seg_a);
+                let (dxb, dyb) = seg_dir(*seg_b);
+                let a = *seg_a;
+                let an = (a + 1) % n;
+                let b = *seg_b;
+                let bn = (b + 1) % n;
+                // Use += to handle the degenerate case seg_a == seg_b (shared indices).
+                j_flat[row * nv + 2 * a] += -dyb;
+                j_flat[row * nv + 2 * an] += dyb;
+                j_flat[row * nv + 2 * a + 1] += dxb;
+                j_flat[row * nv + 2 * an + 1] += -dxb;
+                j_flat[row * nv + 2 * b] += dya;
+                j_flat[row * nv + 2 * bn] += -dya;
+                j_flat[row * nv + 2 * b + 1] += -dxa;
+                j_flat[row * nv + 2 * bn + 1] += dxa;
+                row += 1;
+            }
+            SketchConstraint::Perpendicular { seg_a, seg_b } => {
+                // r = dxa*dxb + dya*dyb
+                // ∂r/∂u[a]  = -dxb,  ∂r/∂u[an] = +dxb
+                // ∂r/∂v[a]  = -dyb,  ∂r/∂v[an] = +dyb
+                // ∂r/∂u[b]  = -dxa,  ∂r/∂u[bn] = +dxa
+                // ∂r/∂v[b]  = -dya,  ∂r/∂v[bn] = +dya
+                let (dxa, dya) = seg_dir(*seg_a);
+                let (dxb, dyb) = seg_dir(*seg_b);
+                let a = *seg_a;
+                let an = (a + 1) % n;
+                let b = *seg_b;
+                let bn = (b + 1) % n;
+                j_flat[row * nv + 2 * a] += -dxb;
+                j_flat[row * nv + 2 * an] += dxb;
+                j_flat[row * nv + 2 * a + 1] += -dyb;
+                j_flat[row * nv + 2 * an + 1] += dyb;
+                j_flat[row * nv + 2 * b] += -dxa;
+                j_flat[row * nv + 2 * bn] += dxa;
+                j_flat[row * nv + 2 * b + 1] += -dya;
+                j_flat[row * nv + 2 * bn + 1] += dya;
+                row += 1;
+            }
+            SketchConstraint::Angle { seg_a, seg_b, degrees: _ } => {
+                // r = cos(actual) - cos(target);  cos(target) is constant.
+                // cos = dot / (la * lb)
+                // ∂cos/∂dxa = (dxb*la² - dot*dxa) / (la³*lb)
+                // ∂cos/∂dya = (dyb*la² - dot*dya) / (la³*lb)
+                // ∂cos/∂dxb = (dxa*lb² - dot*dxb) / (la*lb³)
+                // ∂cos/∂dyb = (dya*lb² - dot*dyb) / (la*lb³)
+                let (dxa, dya) = seg_dir(*seg_a);
+                let (dxb, dyb) = seg_dir(*seg_b);
+                let la2 = dxa * dxa + dya * dya;
+                let lb2 = dxb * dxb + dyb * dyb;
+                let la = la2.sqrt().max(1e-12);
+                let lb = lb2.sqrt().max(1e-12);
+                let dot = dxa * dxb + dya * dyb;
+                let la3lb = la2 * la * lb;
+                let lalb3 = la * lb2 * lb;
+                let d_dxa = (dxb * la2 - dot * dxa) / la3lb;
+                let d_dya = (dyb * la2 - dot * dya) / la3lb;
+                let d_dxb = (dxa * lb2 - dot * dxb) / lalb3;
+                let d_dyb = (dya * lb2 - dot * dyb) / lalb3;
+                let a = *seg_a;
+                let an = (a + 1) % n;
+                let b = *seg_b;
+                let bn = (b + 1) % n;
+                // dxa = u[an]-u[a]  →  ∂/∂u[a] = -1,  ∂/∂u[an] = +1
+                j_flat[row * nv + 2 * a] += -d_dxa;
+                j_flat[row * nv + 2 * an] += d_dxa;
+                j_flat[row * nv + 2 * a + 1] += -d_dya;
+                j_flat[row * nv + 2 * an + 1] += d_dya;
+                j_flat[row * nv + 2 * b] += -d_dxb;
+                j_flat[row * nv + 2 * bn] += d_dxb;
+                j_flat[row * nv + 2 * b + 1] += -d_dyb;
+                j_flat[row * nv + 2 * bn + 1] += d_dyb;
+                row += 1;
+            }
+            SketchConstraint::EqualLength { seg_a, seg_b } => {
+                // r = |a|² - |b|² = dxa²+dya² - dxb²-dyb²
+                // ∂r/∂u[a]  = -2*dxa,  ∂r/∂u[an] = +2*dxa
+                // ∂r/∂v[a]  = -2*dya,  ∂r/∂v[an] = +2*dya
+                // ∂r/∂u[b]  = +2*dxb,  ∂r/∂u[bn] = -2*dxb
+                // ∂r/∂v[b]  = +2*dyb,  ∂r/∂v[bn] = -2*dyb
+                let (dxa, dya) = seg_dir(*seg_a);
+                let (dxb, dyb) = seg_dir(*seg_b);
+                let a = *seg_a;
+                let an = (a + 1) % n;
+                let b = *seg_b;
+                let bn = (b + 1) % n;
+                j_flat[row * nv + 2 * a] += -2.0 * dxa;
+                j_flat[row * nv + 2 * an] += 2.0 * dxa;
+                j_flat[row * nv + 2 * a + 1] += -2.0 * dya;
+                j_flat[row * nv + 2 * an + 1] += 2.0 * dya;
+                j_flat[row * nv + 2 * b] += 2.0 * dxb;
+                j_flat[row * nv + 2 * bn] += -2.0 * dxb;
+                j_flat[row * nv + 2 * b + 1] += 2.0 * dyb;
+                j_flat[row * nv + 2 * bn + 1] += -2.0 * dyb;
+                row += 1;
+            }
+            SketchConstraint::Coincident { pt_a, pt_b } => {
+                // r0 = u[a] - u[b],  r1 = v[a] - v[b]
+                let a = *pt_a;
+                let b = *pt_b;
+                j_flat[row * nv + 2 * a] = 1.0;
+                j_flat[row * nv + 2 * b] = -1.0;
+                j_flat[(row + 1) * nv + 2 * a + 1] = 1.0;
+                j_flat[(row + 1) * nv + 2 * b + 1] = -1.0;
+                row += 2;
+            }
+            SketchConstraint::PointOnLine { pt: pi, seg } => {
+                // r = (u_p - u_a)*(v_b - v_a) - (v_p - v_a)*(u_b - u_a)
+                // Let: dx = u_b - u_a, dy = v_b - v_a, px = u_p - u_a, py = v_p - v_a
+                // ∂r/∂u_p  =  dy          ∂r/∂v_p  = -dx
+                // ∂r/∂u_a  = -dy + py     ∂r/∂v_a  = -px + dx
+                // ∂r/∂u_b  = -py          ∂r/∂v_b  =  px
+                let s  = *seg;
+                let sn = (s + 1) % n;
+                let p  = *pi;
+                let (u_a, v_a) = pt(s);
+                let (u_b, v_b) = pt(sn);
+                let (u_p, v_p) = pt(p);
+                let dx = u_b - u_a;
+                let dy = v_b - v_a;
+                let px = u_p - u_a;
+                let py = v_p - v_a;
+                // Use += to handle degenerate case where p == s or p == sn.
+                j_flat[row * nv + 2 * p]      +=  dy;
+                j_flat[row * nv + 2 * p + 1]  += -dx;
+                j_flat[row * nv + 2 * s]      += -dy + py;
+                j_flat[row * nv + 2 * s + 1]  += -px + dx;
+                j_flat[row * nv + 2 * sn]     += -py;
+                j_flat[row * nv + 2 * sn + 1] +=  px;
+                row += 1;
+            }
+            SketchConstraint::FixedLength { seg, value: _ } => {
+                // r = dx²+dy² - L²
+                // ∂r/∂u[s]  = -2*dx,  ∂r/∂u[sn] = +2*dx
+                // ∂r/∂v[s]  = -2*dy,  ∂r/∂v[sn] = +2*dy
+                let s = *seg;
+                let sn = (s + 1) % n;
+                let (dx, dy) = seg_dir(s);
+                j_flat[row * nv + 2 * s] = -2.0 * dx;
+                j_flat[row * nv + 2 * sn] = 2.0 * dx;
+                j_flat[row * nv + 2 * s + 1] = -2.0 * dy;
+                j_flat[row * nv + 2 * sn + 1] = 2.0 * dy;
+                row += 1;
+            }
+            SketchConstraint::PointDistance { pt_a, pt_b, value: _ } => {
+                // r = (u[b]-u[a])²+(v[b]-v[a])² - D²
+                // ∂r/∂u[a] = -2*dx,  ∂r/∂u[b] = +2*dx
+                // ∂r/∂v[a] = -2*dy,  ∂r/∂v[b] = +2*dy
+                let a = *pt_a;
+                let b = *pt_b;
+                let (ax, ay) = pt(a);
+                let (bx, by) = pt(b);
+                let dx = bx - ax;
+                let dy = by - ay;
+                j_flat[row * nv + 2 * a] = -2.0 * dx;
+                j_flat[row * nv + 2 * b] = 2.0 * dx;
+                j_flat[row * nv + 2 * a + 1] = -2.0 * dy;
+                j_flat[row * nv + 2 * b + 1] = 2.0 * dy;
+                row += 1;
+            }
+            SketchConstraint::PointFixed { pt: pi, .. } => {
+                // r0 = u[pi] - x,  r1 = v[pi] - y   (x, y are constants)
+                // ∂r0/∂u[pi] = 1,  ∂r1/∂v[pi] = 1
+                let p = *pi;
+                j_flat[row * nv + 2 * p] = 1.0;
+                j_flat[(row + 1) * nv + 2 * p + 1] = 1.0;
+                row += 2;
+            }
+            SketchConstraint::PointOnOrigin { pt: pi } => {
+                // r0 = u[p],  r1 = v[p]
+                let p = *pi;
+                j_flat[row * nv + 2 * p] = 1.0;
+                j_flat[(row + 1) * nv + 2 * p + 1] = 1.0;
+                row += 2;
+            }
+            SketchConstraint::PointOnXAxis { pt: pi } => {
+                // r = v[p]   →   ∂r/∂v[p] = 1
+                let p = *pi;
+                j_flat[row * nv + 2 * p + 1] = 1.0;
+                row += 1;
+            }
+            SketchConstraint::PointOnYAxis { pt: pi } => {
+                // r = u[p]   →   ∂r/∂u[p] = 1
+                let p = *pi;
+                j_flat[row * nv + 2 * p] = 1.0;
+                row += 1;
+            }
+            SketchConstraint::HorizontalPair { pt_a, pt_b, perp_u, perp_v }
+            | SketchConstraint::VerticalPair { pt_a, pt_b, perp_u, perp_v } => {
+                // r = perp_u*(u[b]-u[a]) + perp_v*(v[b]-v[a])
+                // ∂r/∂u[a] = -perp_u,  ∂r/∂v[a] = -perp_v
+                // ∂r/∂u[b] = +perp_u,  ∂r/∂v[b] = +perp_v
+                let a = *pt_a;
+                let b = *pt_b;
+                j_flat[row * nv + 2 * a]     = -perp_u;
+                j_flat[row * nv + 2 * a + 1] = -perp_v;
+                j_flat[row * nv + 2 * b]     = *perp_u;
+                j_flat[row * nv + 2 * b + 1] = *perp_v;
+                row += 1;
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
