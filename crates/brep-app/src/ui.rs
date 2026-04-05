@@ -1435,6 +1435,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        ui.add_space(12.0); // keep clear of the scrollbar
                                         let trash = egui::ImageButton::new(
                                             egui::Image::new(icon_trash())
                                                 .fit_to_exact_size(egui::vec2(14.0, 14.0))

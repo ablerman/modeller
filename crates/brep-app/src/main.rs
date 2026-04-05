@@ -444,6 +444,7 @@ impl AppState {
         }
     }
 
+
     fn do_save(&mut self) {
         if let Some(path) = self.current_file.clone() {
             self.do_save_to(path);
@@ -467,24 +468,28 @@ impl AppState {
         }
     }
 
+    fn do_open_file(&mut self, path: std::path::PathBuf) {
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<editor::SavedScene>(&json) {
+                Ok(scene) => {
+                    self.editor.load_saved_scene(scene);
+                    self.tess_cache.clear();
+                    self.current_file = Some(path);
+                    self.update_window_title();
+                }
+                Err(e) => eprintln!("parse error: {e}"),
+            },
+            Err(e) => eprintln!("read error: {e}"),
+        }
+    }
+
     fn do_open(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open Scene")
             .add_filter("Modeller scene", &["modl"])
             .pick_file()
         {
-            match std::fs::read_to_string(&path) {
-                Ok(json) => match serde_json::from_str::<editor::SavedScene>(&json) {
-                    Ok(scene) => {
-                        self.editor.load_saved_scene(scene);
-                        self.tess_cache.clear();
-                        self.current_file = Some(path);
-                        self.update_window_title();
-                    }
-                    Err(e) => eprintln!("parse error: {e}"),
-                },
-                Err(e) => eprintln!("read error: {e}"),
-            }
+            self.do_open_file(path);
         }
     }
 
@@ -609,7 +614,16 @@ impl ApplicationHandler for App {
             .with_inner_size(PhysicalSize::new(geo.width, geo.height))
             .with_position(PhysicalPosition::new(geo.x, geo.y));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        let state = pollster::block_on(AppState::new(window));
+        let mut state = pollster::block_on(AppState::new(window));
+
+        // Reopen the last file that was open when the app was closed.
+        if let Ok(Some(path_str)) = self.config.get::<String>("last_file") {
+            let path = std::path::PathBuf::from(path_str);
+            if path.exists() {
+                state.do_open_file(path);
+            }
+        }
+
         self.state = Some(state);
     }
 
@@ -631,7 +645,15 @@ impl ApplicationHandler for App {
             .consumed;
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Persist the currently open file path so we can reopen it next launch.
+                if let Some(path) = &state.current_file {
+                    if let Some(s) = path.to_str() {
+                        let _ = self.config.set("last_file", &s.to_string());
+                    }
+                }
+                event_loop.exit();
+            }
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if !egui_consumed && key_event.state == ElementState::Pressed {
