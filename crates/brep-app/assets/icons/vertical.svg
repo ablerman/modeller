@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Vertical line -->
+  <line x1="10" y1="3" x2="10" y2="17" stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Top arrowhead -->
+  <polyline points="6,7 10,3 14,7" fill="none" stroke="#DEDEDE" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- Bottom arrowhead -->
+  <polyline points="6,13 10,17 14,13" fill="none" stroke="#DEDEDE" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Two overlapping circles (Venn diagram) -->
+  <circle cx="8" cy="10" r="5.5" fill="none" stroke="#DEDEDE" stroke-width="1.5"/>
+  <circle cx="12" cy="10" r="5.5" fill="none" stroke="#DEDEDE" stroke-width="1.5"/>
+</svg>

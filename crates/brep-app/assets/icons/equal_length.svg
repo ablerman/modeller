@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Top segment -->
+  <line x1="3" y1="7"  x2="17" y2="7"  stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Bottom segment -->
+  <line x1="3" y1="13" x2="17" y2="13" stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Tick mark on top segment (centre) -->
+  <line x1="10" y1="4.5" x2="10" y2="9.5" stroke="#DEDEDE" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Tick mark on bottom segment (centre) -->
+  <line x1="10" y1="10.5" x2="10" y2="15.5" stroke="#DEDEDE" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

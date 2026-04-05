@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Pencil body -->
+  <path d="M15,2 L18,5 L6,17 L3,17 L3,14 Z" fill="none" stroke="#DEDEDE" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- Eraser divider line -->
+  <line x1="14" y1="3" x2="17" y2="6" stroke="#DEDEDE" stroke-width="1" stroke-linecap="round"/>
+  <!-- Tip -->
+  <line x1="3" y1="17" x2="5" y2="15" stroke="#DEDEDE" stroke-width="1" stroke-linecap="round"/>
+</svg>

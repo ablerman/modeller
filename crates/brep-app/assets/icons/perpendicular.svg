@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Horizontal baseline -->
+  <line x1="3" y1="15" x2="17" y2="15" stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Vertical rising from centre -->
+  <line x1="10" y1="15" x2="10" y2="3"  stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Right-angle square at corner -->
+  <polyline points="10,11 14,11 14,15" fill="none" stroke="#DEDEDE" stroke-width="1.5" stroke-linejoin="miter" stroke-linecap="round"/>
+</svg>

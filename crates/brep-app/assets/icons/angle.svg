@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Left ray -->
+  <line x1="3" y1="17" x2="17" y2="17" stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Right ray angled up-right -->
+  <line x1="3" y1="17" x2="14" y2="5"  stroke="#DEDEDE" stroke-width="2" stroke-linecap="round"/>
+  <!-- Arc between the two rays -->
+  <path d="M 10 17 A 7 7 0 0 1 6.5 11" fill="none" stroke="#DEDEDE" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

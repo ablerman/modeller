@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+  <!-- Isometric cube — top face -->
+  <polygon points="10,3 17,7 10,11 3,7" fill="none" stroke="#DEDEDE" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Left face -->
+  <polygon points="3,7 10,11 10,17 3,13" fill="none" stroke="#DEDEDE" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Right face -->
+  <polygon points="17,7 10,11 10,17 17,13" fill="none" stroke="#DEDEDE" stroke-width="1.5" stroke-linejoin="round"/>
+</svg>
