@@ -15,6 +15,7 @@ pub fn build_ui(
     sketch_cursor: Option<Point3>,
     snap_vertex: Option<usize>,
     snap_segment: Option<usize>,
+    angle_dialog: Option<(usize, usize)>,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
@@ -107,31 +108,15 @@ pub fn build_ui(
                         }
                     });
 
-                    // Angle: 2 segments + degree input.
-                    if n_sel == 2 {
-                        let angle_id = egui::Id::new("sketch_angle_deg");
-                        let mut deg: f64 = ctx.data_mut(|d| {
-                            *d.get_temp_mut_or(angle_id, 90.0_f64)
-                        });
-                        ui.add(
-                            egui::DragValue::new(&mut deg)
-                                .speed(1.0)
-                                .range(1.0..=179.0)
-                                .suffix("°"),
-                        );
-                        ctx.data_mut(|d| {
-                            *d.get_temp_mut_or::<f64>(angle_id, 90.0) = deg;
-                        });
-                        if ui.button("Angle").clicked() {
-                            actions.push(UiAction::SketchAddConstraint(
-                                SketchConstraint::Angle {
-                                    seg_a: sk.seg_selection[0],
-                                    seg_b: sk.seg_selection[1],
-                                    degrees: deg,
-                                }));
-                            actions.push(UiAction::SketchClearSegSelection);
+                    // Angle: opens a modal dialog to enter degrees.
+                    ui.add_enabled_ui(n_sel == 2, |ui| {
+                        if ui.button("Angle…").clicked() {
+                            actions.push(UiAction::SketchBeginAngleInput {
+                                seg_a: sk.seg_selection[0],
+                                seg_b: sk.seg_selection[1],
+                            });
                         }
-                    }
+                    });
 
                     if sk.constraints_conflict {
                         ui.colored_label(egui::Color32::RED, "⚠ conflict");
@@ -387,6 +372,51 @@ pub fn build_ui(
                     painter.circle_filled(p, 3.0, egui::Color32::WHITE);
                 }
             }
+        }
+    }
+
+    // ── Angle input modal ─────────────────────────────────────────────────────
+    if let Some((seg_a, seg_b)) = angle_dialog {
+        let angle_id = egui::Id::new("sketch_angle_deg");
+
+        let modal = egui::Modal::new(egui::Id::new("angle_input_modal")).show(ctx, |ui| {
+            ui.set_min_width(220.0);
+            ui.heading("Set Angle");
+            ui.add_space(4.0);
+            ui.label(format!("Angle between segment {seg_a} and segment {seg_b}:"));
+            ui.add_space(6.0);
+
+            let mut deg: f64 = ctx.data_mut(|d| *d.get_temp_mut_or(angle_id, 90.0_f64));
+            let resp = ui.add(
+                egui::DragValue::new(&mut deg)
+                    .speed(1.0)
+                    .range(1.0..=179.0)
+                    .suffix(" °"),
+            );
+            if resp.changed() {
+                ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(angle_id, 90.0) = deg);
+            }
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let apply = ui.button("Apply");
+                let cancel = ui.button("Cancel");
+
+                if apply.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let degrees = ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(angle_id, 90.0));
+                    actions.push(UiAction::SketchAddConstraint(SketchConstraint::Angle {
+                        seg_a, seg_b, degrees,
+                    }));
+                    actions.push(UiAction::SketchClearSegSelection);
+                }
+                if cancel.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    actions.push(UiAction::SketchCancelAngleInput);
+                }
+            });
+        });
+
+        if modal.should_close() {
+            actions.push(UiAction::SketchCancelAngleInput);
         }
     }
 

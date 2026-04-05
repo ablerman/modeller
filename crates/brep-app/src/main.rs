@@ -69,6 +69,8 @@ struct AppState {
     snap_vertex: Option<usize>,
     /// Index of the sketch segment the cursor is hovering over (if any).
     snap_segment: Option<usize>,
+    /// When Some((seg_a, seg_b)), the angle-input modal dialog is open.
+    angle_dialog: Option<(usize, usize)>,
 }
 
 impl AppState {
@@ -164,6 +166,7 @@ impl AppState {
             sketch_cursor: None,
             snap_vertex: None,
             snap_segment: None,
+            angle_dialog: None,
         }
     }
 
@@ -270,9 +273,10 @@ impl AppState {
         let sketch_cursor = self.sketch_cursor;
         let snap_vertex = self.snap_vertex;
         let snap_segment = self.snap_segment;
+        let angle_dialog = self.angle_dialog;
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, angle_dialog);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -331,6 +335,25 @@ impl AppState {
         // Apply UI actions after rendering (avoids borrow conflicts during egui run).
         let mut needs_mesh_update = false;
         for action in actions {
+            // Intercept app-level dialog actions before passing to the editor.
+            match &action {
+                UiAction::SketchBeginAngleInput { seg_a, seg_b } => {
+                    self.angle_dialog = Some((*seg_a, *seg_b));
+                    continue;
+                }
+                UiAction::SketchCancelAngleInput => {
+                    self.angle_dialog = None;
+                    continue;
+                }
+                // Confirm (SketchAddConstraint) or clearing selection closes the dialog.
+                UiAction::SketchAddConstraint(_) => {
+                    self.angle_dialog = None;
+                }
+                UiAction::ExitSketch => {
+                    self.angle_dialog = None;
+                }
+                _ => {}
+            }
             let changed = self.editor.apply(action);
             needs_mesh_update |= changed;
         }

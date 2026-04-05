@@ -314,6 +314,10 @@ pub enum UiAction {
     SketchAddConstraint(SketchConstraint),
     /// Remove a constraint by its index in `SketchState::constraints`.
     SketchRemoveConstraint(usize),
+    /// Open the angle-input dialog for two selected segments.
+    SketchBeginAngleInput { seg_a: usize, seg_b: usize },
+    /// Dismiss the angle-input dialog without applying.
+    SketchCancelAngleInput,
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -600,6 +604,9 @@ impl EditorState {
                 }
                 false
             }
+            // Handled at the app layer (main.rs); editor is not involved.
+            UiAction::SketchBeginAngleInput { .. } | UiAction::SketchCancelAngleInput => false,
+
             UiAction::SketchRemoveConstraint(idx) => {
                 if let Some(sk) = &mut self.sketch {
                     if idx < sk.constraints.len() {
