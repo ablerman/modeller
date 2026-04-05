@@ -5,7 +5,7 @@ use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{EditorState, ObjectHistory, PrimitiveKind, SketchPlane, UiAction};
+use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, SketchPlane, UiAction};
 
 /// Render all egui panels.  Returns any actions the user triggered.
 pub fn build_ui(
@@ -16,6 +16,7 @@ pub fn build_ui(
     snap_vertex: Option<usize>,
     snap_segment: Option<usize>,
     angle_dialog: Option<(usize, usize)>,
+    length_dialog: Option<LengthTarget>,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
@@ -115,6 +116,23 @@ pub fn build_ui(
                                 seg_a: sk.seg_selection[0],
                                 seg_b: sk.seg_selection[1],
                             });
+                        }
+                    });
+
+                    // Length: 1 segment OR 2 vertices selected.
+                    let n_pts = sk.pt_selection.len();
+                    let length_target: Option<LengthTarget> = if n_sel == 1 {
+                        Some(LengthTarget::Segment(sk.seg_selection[0]))
+                    } else if n_pts == 2 {
+                        Some(LengthTarget::Points(sk.pt_selection[0], sk.pt_selection[1]))
+                    } else {
+                        None
+                    };
+                    ui.add_enabled_ui(length_target.is_some(), |ui| {
+                        if ui.button("Length…").clicked() {
+                            if let Some(t) = length_target {
+                                actions.push(UiAction::SketchBeginLengthInput(t));
+                            }
                         }
                     });
 
@@ -347,17 +365,21 @@ pub fn build_ui(
                 }
             }
         }
-        // Vertex dots — highlight snapped vertex.
+        // Vertex dots — highlight snapped/selected vertices.
         for (i, &pt) in sk.points.iter().enumerate() {
             if let Some(p) = proj(pt) {
                 let is_snap = snap_vertex == Some(i);
-                let is_close = i == 0 && is_snap && sk.points.len() >= 3;
+                let is_selected = sk.pt_selection.contains(&i);
+                let is_close = i == 0 && is_snap && sk.points.len() >= 3 && !sk.closed;
                 if is_close {
                     // Green ring = "click here to close the loop"
                     painter.circle_stroke(p, 8.0, egui::Stroke::new(2.5, egui::Color32::from_rgb(80, 230, 80)));
                     painter.circle_filled(p, 5.0, egui::Color32::YELLOW);
+                } else if is_selected {
+                    // Orange fill = selected for constraint
+                    painter.circle_filled(p, 6.0, egui::Color32::from_rgb(255, 160, 60));
                 } else if is_snap {
-                    // White ring = hovering another vertex
+                    // White ring = hovering
                     painter.circle_stroke(p, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
                     painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
                 } else {
@@ -372,6 +394,60 @@ pub fn build_ui(
                     painter.circle_filled(p, 3.0, egui::Color32::WHITE);
                 }
             }
+        }
+    }
+
+    // ── Length input modal ────────────────────────────────────────────────────
+    if let Some(target) = length_dialog {
+        let len_id = egui::Id::new("sketch_length_value");
+        let description = match target {
+            LengthTarget::Segment(seg) => format!("Length of segment {seg}:"),
+            LengthTarget::Points(a, b) => format!("Distance between vertex {a} and vertex {b}:"),
+        };
+
+        let modal = egui::Modal::new(egui::Id::new("length_input_modal")).show(ctx, |ui| {
+            ui.set_min_width(240.0);
+            ui.heading("Set Length");
+            ui.add_space(4.0);
+            ui.label(&description);
+            ui.add_space(6.0);
+
+            let mut val: f64 = ctx.data_mut(|d| *d.get_temp_mut_or(len_id, 1.0_f64));
+            let resp = ui.add(
+                egui::DragValue::new(&mut val)
+                    .speed(0.01)
+                    .range(1e-3..=1e6)
+                    .min_decimals(3),
+            );
+            if resp.changed() {
+                ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(len_id, 1.0) = val);
+            }
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let apply = ui.button("Apply");
+                let cancel = ui.button("Cancel");
+
+                if apply.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let value = ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(len_id, 1.0));
+                    let c = match target {
+                        LengthTarget::Segment(seg) =>
+                            SketchConstraint::FixedLength { seg, value },
+                        LengthTarget::Points(pt_a, pt_b) =>
+                            SketchConstraint::PointDistance { pt_a, pt_b, value },
+                    };
+                    actions.push(UiAction::SketchAddConstraint(c));
+                    actions.push(UiAction::SketchClearSegSelection);
+                    actions.push(UiAction::SketchClearPtSelection);
+                }
+                if cancel.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    actions.push(UiAction::SketchCancelLengthInput);
+                }
+            });
+        });
+
+        if modal.should_close() {
+            actions.push(UiAction::SketchCancelLengthInput);
         }
     }
 
@@ -695,6 +771,10 @@ fn constraint_label(c: &SketchConstraint) -> String {
             format!("Equal len  seg {seg_a} = {seg_b}"),
         SketchConstraint::Coincident { pt_a, pt_b } =>
             format!("Coincident  pt {pt_a} = {pt_b}"),
+        SketchConstraint::FixedLength { seg, value } =>
+            format!("Length  seg {seg} = {value:.3}"),
+        SketchConstraint::PointDistance { pt_a, pt_b, value } =>
+            format!("Distance  pt {pt_a}–{pt_b} = {value:.3}"),
     }
 }
 
@@ -736,6 +816,25 @@ fn draw_constraint_marker(
         SketchConstraint::Coincident { pt_a, .. } => {
             if let Some(p) = proj(points[*pt_a]) {
                 painter.circle_stroke(p, 6.0, egui::Stroke::new(1.5, color));
+            }
+        }
+        SketchConstraint::FixedLength { seg, value } => {
+            draw(
+                *seg,
+                &format!("{value:.2}"),
+            );
+        }
+        SketchConstraint::PointDistance { pt_a, pt_b, value } => {
+            // Draw marker near the midpoint between the two points.
+            if let (Some(a), Some(b)) = (proj(points[*pt_a]), proj(points[*pt_b])) {
+                let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                painter.text(
+                    mid + egui::vec2(6.0, -6.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &format!("{value:.2}"),
+                    egui::FontId::proportional(11.0),
+                    color,
+                );
             }
         }
     }

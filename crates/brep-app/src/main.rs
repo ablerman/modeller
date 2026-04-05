@@ -71,6 +71,8 @@ struct AppState {
     snap_segment: Option<usize>,
     /// When Some((seg_a, seg_b)), the angle-input modal dialog is open.
     angle_dialog: Option<(usize, usize)>,
+    /// When Some(target), the length-input modal dialog is open.
+    length_dialog: Option<editor::LengthTarget>,
 }
 
 impl AppState {
@@ -167,6 +169,7 @@ impl AppState {
             snap_vertex: None,
             snap_segment: None,
             angle_dialog: None,
+            length_dialog: None,
         }
     }
 
@@ -274,9 +277,10 @@ impl AppState {
         let snap_vertex = self.snap_vertex;
         let snap_segment = self.snap_segment;
         let angle_dialog = self.angle_dialog;
+        let length_dialog = self.length_dialog;
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, angle_dialog);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, angle_dialog, length_dialog);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -345,12 +349,22 @@ impl AppState {
                     self.angle_dialog = None;
                     continue;
                 }
-                // Confirm (SketchAddConstraint) or clearing selection closes the dialog.
+                UiAction::SketchBeginLengthInput(target) => {
+                    self.length_dialog = Some(*target);
+                    continue;
+                }
+                UiAction::SketchCancelLengthInput => {
+                    self.length_dialog = None;
+                    continue;
+                }
+                // Confirm (SketchAddConstraint) closes both dialogs.
                 UiAction::SketchAddConstraint(_) => {
                     self.angle_dialog = None;
+                    self.length_dialog = None;
                 }
                 UiAction::ExitSketch => {
                     self.angle_dialog = None;
+                    self.length_dialog = None;
                 }
                 _ => {}
             }
@@ -480,10 +494,16 @@ impl ApplicationHandler for App {
                                             if state.snap_vertex == Some(0) && pts_len >= 3 && !is_closed {
                                                 // Click on first vertex → close loop.
                                                 state.editor.apply(UiAction::SketchClose);
+                                            } else if let Some(vi) = state.snap_vertex {
+                                                // Click on any vertex (when closed, or after close) → select for constraints.
+                                                if is_closed {
+                                                    state.editor.apply(UiAction::SketchSelectVertex(vi));
+                                                }
+                                                // When not closed and vi != 0, do nothing (can't interact with interior verts yet).
                                             } else if let Some(seg) = state.snap_segment {
                                                 // Click on a segment → select/deselect for constraints.
                                                 state.editor.apply(UiAction::SketchSelectSegment(seg));
-                                            } else if state.snap_vertex.is_none() && !is_closed {
+                                            } else if !is_closed {
                                                 // Free click on the workplane → add point.
                                                 if let Some(p) = state.sketch_cursor {
                                                     state.editor.apply(UiAction::SketchAddPoint(p));

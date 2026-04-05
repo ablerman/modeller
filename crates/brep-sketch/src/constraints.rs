@@ -29,4 +29,10 @@ pub enum SketchConstraint {
 
     /// Two points must be coincident (same position).
     Coincident { pt_a: usize, pt_b: usize },
+
+    /// A segment must have a specific length.
+    FixedLength { seg: usize, value: f64 },
+
+    /// Two (possibly non-adjacent) points must be a specific distance apart.
+    PointDistance { pt_a: usize, pt_b: usize, value: f64 },
 }

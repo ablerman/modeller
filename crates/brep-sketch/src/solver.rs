@@ -171,6 +171,18 @@ fn residuals(vars: &[f64], constraints: &[SketchConstraint], n: usize) -> Vec<f6
                 r.push(ax - bx);
                 r.push(ay - by);
             }
+            SketchConstraint::FixedLength { seg, value } => {
+                let (dx, dy) = seg_dir(*seg);
+                // |seg|² - value² = 0
+                r.push(dx * dx + dy * dy - value * value);
+            }
+            SketchConstraint::PointDistance { pt_a, pt_b, value } => {
+                let (ax, ay) = pt(*pt_a);
+                let (bx, by) = pt(*pt_b);
+                let dx = bx - ax;
+                let dy = by - ay;
+                r.push(dx * dx + dy * dy - value * value);
+            }
         }
     }
     r
@@ -256,6 +268,29 @@ mod tests {
         let (bx, by) = dir(&pts, 1);
         let dot = ax * bx + ay * by;
         assert!(dot.abs() < 1e-4, "90° angle ↔ dot ≈ 0, got {dot}");
+    }
+
+    #[test]
+    fn fixed_length_segment() {
+        // Segment 0 starts as length 2.0; constrain to 1.0.
+        let mut pts = vec![[0.0, 0.0], [2.0, 0.0]];
+        let cs = vec![SketchConstraint::FixedLength { seg: 0, value: 1.0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        let (dx, dy) = dir(&pts, 0);
+        let len = (dx * dx + dy * dy).sqrt();
+        assert!(approx_eq(len, 1.0), "length should be 1.0, got {len}");
+    }
+
+    #[test]
+    fn point_distance_constraint() {
+        // Two independent points; constrain their distance to 2.0.
+        let mut pts = vec![[0.0, 0.0], [3.0, 0.0]];
+        let cs = vec![SketchConstraint::PointDistance { pt_a: 0, pt_b: 1, value: 2.0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        let dx = pts[1][0] - pts[0][0];
+        let dy = pts[1][1] - pts[0][1];
+        let dist = (dx * dx + dy * dy).sqrt();
+        assert!(approx_eq(dist, 2.0), "distance should be 2.0, got {dist}");
     }
 
     #[test]

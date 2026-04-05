@@ -64,6 +64,15 @@ impl SketchPlane {
     }
 }
 
+/// What a length constraint applies to — used for the modal dialog.
+#[derive(Clone, Copy, Debug)]
+pub enum LengthTarget {
+    /// Constrain a single segment to a fixed length.
+    Segment(usize),
+    /// Constrain the distance between two (possibly non-adjacent) vertices.
+    Points(usize, usize),
+}
+
 /// Live in-progress 2D sketch being drawn by the user.
 #[derive(Clone, Debug)]
 pub struct SketchState {
@@ -75,6 +84,8 @@ pub struct SketchState {
     pub constraints:          Vec<SketchConstraint>,
     /// Indices of currently selected segments (max 2).
     pub seg_selection:        Vec<usize>,
+    /// Indices of currently selected vertices (max 2, for length/distance constraints).
+    pub pt_selection:         Vec<usize>,
     /// Set when the last constraint solve did not converge.
     pub constraints_conflict: bool,
 }
@@ -318,6 +329,13 @@ pub enum UiAction {
     SketchBeginAngleInput { seg_a: usize, seg_b: usize },
     /// Dismiss the angle-input dialog without applying.
     SketchCancelAngleInput,
+    /// Toggle-select a vertex by index (max 2 at a time, clears seg_selection).
+    SketchSelectVertex(usize),
+    SketchClearPtSelection,
+    /// Open the length-input dialog.
+    SketchBeginLengthInput(LengthTarget),
+    /// Dismiss the length-input dialog without applying.
+    SketchCancelLengthInput,
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -534,6 +552,7 @@ impl EditorState {
                     extrude_dist: 1.0,
                     constraints: Vec::new(),
                     seg_selection: Vec::new(),
+                    pt_selection: Vec::new(),
                     constraints_conflict: false,
                 });
                 self.selection.clear();
@@ -584,6 +603,7 @@ impl EditorState {
             }
             UiAction::SketchSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
+                    sk.pt_selection.clear(); // segment selection clears vertex selection
                     if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
                         sk.seg_selection.remove(pos);
                     } else {
@@ -597,6 +617,22 @@ impl EditorState {
                 if let Some(sk) = &mut self.sketch { sk.seg_selection.clear(); }
                 false
             }
+            UiAction::SketchSelectVertex(i) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.seg_selection.clear(); // vertex selection clears segment selection
+                    if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
+                        sk.pt_selection.remove(pos);
+                    } else {
+                        if sk.pt_selection.len() >= 2 { sk.pt_selection.remove(0); }
+                        sk.pt_selection.push(i);
+                    }
+                }
+                false
+            }
+            UiAction::SketchClearPtSelection => {
+                if let Some(sk) = &mut self.sketch { sk.pt_selection.clear(); }
+                false
+            }
             UiAction::SketchAddConstraint(c) => {
                 if let Some(sk) = &mut self.sketch {
                     sk.constraints.push(c);
@@ -605,7 +641,10 @@ impl EditorState {
                 false
             }
             // Handled at the app layer (main.rs); editor is not involved.
-            UiAction::SketchBeginAngleInput { .. } | UiAction::SketchCancelAngleInput => false,
+            UiAction::SketchBeginAngleInput { .. }
+            | UiAction::SketchCancelAngleInput
+            | UiAction::SketchBeginLengthInput(_)
+            | UiAction::SketchCancelLengthInput => false,
 
             UiAction::SketchRemoveConstraint(idx) => {
                 if let Some(sk) = &mut self.sketch {
