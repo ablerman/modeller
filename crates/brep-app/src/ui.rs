@@ -1437,7 +1437,8 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                     |ui| {
                                         let trash = egui::ImageButton::new(
                                             egui::Image::new(icon_trash())
-                                                .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                                                .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                                .tint(egui::Color32::from_rgb(210, 60, 60)),
                                         );
                                         if ui.add(trash).on_hover_text("Remove constraint").clicked() {
                                             remove_idx = Some(i);
