@@ -1353,6 +1353,12 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                 if n == 0 {
                     ui.label(egui::RichText::new("(none)").italics().weak());
                 } else {
+                    // Detect selection changes so we can scroll the new item into view.
+                    let prev_sel_id = panel_id.with("prev_seg_sel");
+                    let prev_sel: Vec<usize> = ctx.data(|d| d.get_temp(prev_sel_id).unwrap_or_default());
+                    let sel_changed = prev_sel != sk.seg_selection;
+                    ctx.data_mut(|d| d.insert_temp(prev_sel_id, sk.seg_selection.clone()));
+
                     egui::ScrollArea::vertical()
                         .id_salt("sketch_elements_scroll")
                         .max_height(120.0)
@@ -1378,6 +1384,10 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                 );
                                 if resp.clicked() {
                                     actions.push(UiAction::SketchPanelSelectSegment(i));
+                                }
+                                // Scroll to the first newly-selected segment.
+                                if selected && sel_changed && !prev_sel.contains(&i) {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
                                 }
                             }
                         });
