@@ -195,9 +195,9 @@ pub(crate) fn project_center_to_arc_bisector(
     plane_to_world(mx + t * px, my + t * py, plane)
 }
 
-/// Tessellate a circular arc defined by start, end, and arc-center points.
-/// The center must already lie on the perpendicular bisector of (start, end_pt)
-/// — use `project_center_to_arc_bisector` before storing.
+/// Tessellate a circular arc defined by start, end, and a center hint.
+/// The center is projected onto the perpendicular bisector of (start, end_pt)
+/// so the arc passes through both endpoints exactly.
 /// The arc sweeps the shorter path (|span| ≤ π).
 pub(crate) fn tessellate_arc_from_center(
     start: Point3, end_pt: Point3, center: Point3, plane: SketchPlane,
@@ -205,7 +205,23 @@ pub(crate) fn tessellate_arc_from_center(
     use std::f64::consts::PI;
     let s = world_to_plane(start,  plane);
     let e = world_to_plane(end_pt, plane);
-    let c = world_to_plane(center, plane);
+
+    // Project the center onto the perpendicular bisector so both endpoints
+    // are exactly at `radius` from `c`, regardless of where the click landed.
+    let mx = (s.0 + e.0) * 0.5;
+    let my = (s.1 + e.1) * 0.5;
+    let chord_dx = e.0 - s.0;
+    let chord_dy = e.1 - s.1;
+    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
+    let c_raw = world_to_plane(center, plane);
+    let c = if chord_len < 1e-10 {
+        c_raw
+    } else {
+        let px = -chord_dy / chord_len;
+        let py =  chord_dx / chord_len;
+        let t = (c_raw.0 - mx) * px + (c_raw.1 - my) * py;
+        (mx + t * px, my + t * py)
+    };
 
     let radius = ((s.0 - c.0).powi(2) + (s.1 - c.1).powi(2)).sqrt();
     if radius < 1e-10 { return vec![start, end_pt]; }
@@ -219,10 +235,14 @@ pub(crate) fn tessellate_arc_from_center(
     if span > PI { span -= 2.0 * PI; }
 
     let n = ((32.0 * span.abs() / (2.0 * PI)).ceil() as usize).max(4);
-    (0..=n).map(|i| {
+    // Force exact endpoints to avoid any floating-point drift.
+    let mut pts: Vec<Point3> = (0..=n).map(|i| {
         let theta = theta_s + span * (i as f64 / n as f64);
         plane_to_world(c.0 + radius * theta.cos(), c.1 + radius * theta.sin(), plane)
-    }).collect()
+    }).collect();
+    if let Some(first) = pts.first_mut() { *first = start; }
+    if let Some(last)  = pts.last_mut()  { *last  = end_pt; }
+    pts
 }
 
 /// Tessellate a full circle (center → radius point) into `n` world-space points.
@@ -294,6 +314,9 @@ pub struct SketchState {
     pub committed_profiles: Vec<CommittedProfile>,
     /// Index of the committed profile currently selected (for constraints like PointOnCircle).
     pub committed_selection: Option<usize>,
+    /// A specific control point within a committed profile that is selected (profile_idx, vertex_idx).
+    /// Used for arc/circle center point selection — separate from curve selection.
+    pub committed_pt_selection: Option<(usize, usize)>,
 }
 
 /// How the points of a `CommittedProfile` should be interpreted geometrically.
@@ -699,6 +722,8 @@ pub enum UiAction {
     SketchCommitPolyline,
     /// Select (or deselect) a committed profile by index, for use with constraints.
     SketchSelectCommitted(Option<usize>),
+    /// Select a specific control point within a committed profile (profile_idx, vertex_idx).
+    SketchSelectCommittedPoint(Option<(usize, usize)>),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -996,6 +1021,7 @@ impl EditorState {
                     tool_in_progress:   None,
                     committed_profiles: Vec::new(),
                     committed_selection: None,
+                    committed_pt_selection: None,
                 });
                 self.selection.clear();
                 // Animate the camera to look at the chosen plane with axes oriented
@@ -1049,7 +1075,8 @@ impl EditorState {
                     active_tool:          DrawTool::Polyline,
                     tool_in_progress:     None,
                     committed_profiles,
-                    committed_selection:  None,
+                    committed_selection:    None,
+                    committed_pt_selection: None,
                 });
                 // Animate camera to face the sketch plane.
                 let (az, el) = match raw.plane {
@@ -1118,6 +1145,7 @@ impl EditorState {
                     sk.seg_selection.clear();
                     sk.pt_selection.clear();
                     sk.committed_selection = None;
+                    sk.committed_pt_selection = None;
                 }
                 false
             }
@@ -1144,6 +1172,14 @@ impl EditorState {
             UiAction::SketchSelectCommitted(idx) => {
                 if let Some(sk) = &mut self.sketch {
                     sk.committed_selection = idx;
+                    sk.committed_pt_selection = None;
+                }
+                false
+            }
+            UiAction::SketchSelectCommittedPoint(idx) => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.committed_pt_selection = idx;
+                    sk.committed_selection = None;
                 }
                 false
             }

@@ -784,8 +784,15 @@ impl ApplicationHandler for App {
                                         let is_pointer = state.editor.sketch.as_ref()
                                             .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
                                         if is_pointer {
-                                            // Pointer tool: click on committed vertex → select profile.
-                                            state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
+                                            let shape = state.editor.sketch.as_ref()
+                                                .and_then(|sk| sk.committed_profiles.get(pi))
+                                                .map(|cp| cp.shape.clone());
+                                            // Arc center (vi==2) → point selection; everything else → profile selection.
+                                            if matches!(shape, Some(editor::ProfileShape::Arc)) && vi == 2 {
+                                                state.editor.apply(UiAction::SketchSelectCommittedPoint(Some((pi, vi))));
+                                            } else {
+                                                state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
+                                            }
                                         } else {
                                             // Drawing tool: click on committed vertex → add point there (snap to it).
                                             let pt = state.editor.sketch.as_ref()
@@ -934,28 +941,27 @@ impl ApplicationHandler for App {
                     let ray = state.editor.camera.unproject_ray(cur.0, cur.1, w, h);
                     state.sketch_cursor = ray_plane_intersect(&ray, &plane_origin, &plane_normal);
 
+                    let has_moved = match state.mouse_press_origin {
+                        Some(origin) => {
+                            let dx = cur.0 - origin.0;
+                            let dy = cur.1 - origin.1;
+                            (dx * dx + dy * dy).sqrt() > 2.0
+                        }
+                        None => false,
+                    };
+
                     // If dragging a vertex, apply position update immediately.
                     if let Some(drag_vi) = state.drag_vertex {
-                        if state.mouse_pressed == Some(MouseButton::Left) {
-                            let has_moved = match state.mouse_press_origin {
-                                Some(origin) => {
-                                    let dx = cur.0 - origin.0;
-                                    let dy = cur.1 - origin.1;
-                                    (dx * dx + dy * dy).sqrt() > 2.0
-                                }
-                                None => false,
-                            };
-                            if has_moved {
-                                if let Some(cursor_pt) = state.sketch_cursor {
-                                    state.editor.drag_sketch_vertex(drag_vi, cursor_pt);
-                                }
+                        if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
+                            if let Some(cursor_pt) = state.sketch_cursor {
+                                state.editor.drag_sketch_vertex(drag_vi, cursor_pt);
                             }
                         }
                     }
 
                     // Drag committed profile vertex if one is being held.
                     if let Some((pi, vi)) = state.drag_committed {
-                        if state.mouse_pressed == Some(MouseButton::Left) {
+                        if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
                             if let Some(cursor_pt) = state.sketch_cursor {
                                 if let Some(sk) = &mut state.editor.sketch {
                                     if let Some(cp) = sk.committed_profiles.get_mut(pi) {
@@ -988,6 +994,16 @@ impl ApplicationHandler for App {
                                                     }
                                                 }
                                             }
+                                            editor::ProfileShape::Arc if vi == 2 => {
+                                                // Dragging center moves the whole arc (translate start, end, center).
+                                                let old_center = cp.points.get(2).copied();
+                                                if let Some(old_c) = old_center {
+                                                    let delta = cursor_pt - old_c;
+                                                    for pt in cp.points.iter_mut() {
+                                                        *pt += delta;
+                                                    }
+                                                }
+                                            }
                                             _ => {
                                                 if let Some(pt) = cp.points.get_mut(vi) {
                                                     *pt = cursor_pt;
@@ -1002,7 +1018,7 @@ impl ApplicationHandler for App {
 
                     // Drag committed curve: for circles move boundary point (vi=1) = resize.
                     if let Some(pi) = state.drag_committed_curve {
-                        if state.mouse_pressed == Some(MouseButton::Left) {
+                        if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
                             if let Some(cursor_pt) = state.sketch_cursor {
                                 if let Some(sk) = &mut state.editor.sketch {
                                     if let Some(cp) = sk.committed_profiles.get_mut(pi) {
@@ -1013,9 +1029,15 @@ impl ApplicationHandler for App {
                                                 }
                                             }
                                             editor::ProfileShape::Arc => {
-                                                // Dragging arc curve moves the center (vi=2).
-                                                if let Some(pt) = cp.points.get_mut(2) {
-                                                    *pt = cursor_pt;
+                                                // Dragging arc curve: project cursor onto bisector before storing,
+                                                // so the arc doesn't flip when cursor is off-bisector.
+                                                if let (Some(&s), Some(&e), Some(plane)) = (
+                                                    cp.points.get(0), cp.points.get(1), cp.plane,
+                                                ) {
+                                                    let projected = editor::project_center_to_arc_bisector(s, e, cursor_pt, plane);
+                                                    if let Some(pt) = cp.points.get_mut(2) {
+                                                        *pt = projected;
+                                                    }
                                                 }
                                             }
                                             _ => {}

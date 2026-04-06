@@ -340,6 +340,16 @@ pub fn build_ui(
                 }
             }
         }
+        // Selected committed point (e.g. arc center) — highlighted like a regular vertex.
+        if let Some((sel_pi, sel_vi)) = sk.committed_pt_selection {
+            if let Some(cp) = sk.committed_profiles.get(sel_pi) {
+                if let Some(&sel_pt) = cp.points.get(sel_vi) {
+                    if let Some(p) = proj(sel_pt) {
+                        painter.circle_filled(p, 6.0, egui::Color32::from_rgb(255, 160, 60));
+                    }
+                }
+            }
+        }
 
         // Draw active profile edges.
         let n = sk.points.len();
