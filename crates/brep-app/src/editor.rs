@@ -569,6 +569,8 @@ pub enum UiAction {
     SketchSelectCommittedPoint(Option<(usize, usize)>),
     /// Select a specific segment within a committed polyline (profile_idx, segment_idx).
     SketchSelectCommittedSeg(Option<(usize, usize)>),
+    /// Add a constraint to a specific committed profile and re-solve it.
+    SketchAddCommittedConstraint(usize, SketchConstraint),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -629,6 +631,22 @@ pub(crate) fn apply_constraints(sk: &mut SketchState) {
         // each one in turn — if removal makes the system solvable, that constraint
         // is a contributor.
         sk.violated_constraints = find_conflicting_constraints(&pts2d, &sk.constraints, n);
+    }
+}
+
+/// Run the constraint solver on a committed profile, updating its point positions in place.
+/// `plane` is the sketch plane the profile lives on (used for 3D↔2D conversion).
+pub(crate) fn apply_committed_profile_constraints(cp: &mut CommittedProfile, plane: SketchPlane) {
+    if cp.constraints.is_empty() || cp.points.len() < 2 { return; }
+    let (u, v) = plane.uv_axes();
+    let mut pts2d: Vec<[f64; 2]> = cp.points.iter()
+        .map(|p| [p.coords.dot(&u), p.coords.dot(&v)])
+        .collect();
+    let n = pts2d.len();
+    if solve_constraints(&mut pts2d, &cp.constraints, n) == SolveResult::Ok {
+        for (i, p) in cp.points.iter_mut().enumerate() {
+            *p = Point3::origin() + u * pts2d[i][0] + v * pts2d[i][1];
+        }
     }
 }
 
@@ -1201,6 +1219,17 @@ impl EditorState {
                             sk.violated_constraints.remove(idx);
                         }
                         apply_constraints(sk);
+                    }
+                }
+                false
+            }
+            UiAction::SketchAddCommittedConstraint(pi, c) => {
+                if let Some(sk) = &mut self.sketch {
+                    if pi < sk.committed_profiles.len() {
+                        sk.history.push(sketch_snapshot(sk));
+                        let plane = sk.committed_profiles[pi].plane.unwrap_or(sk.plane);
+                        sk.committed_profiles[pi].constraints.push(c);
+                        apply_committed_profile_constraints(&mut sk.committed_profiles[pi], plane);
                     }
                 }
                 false

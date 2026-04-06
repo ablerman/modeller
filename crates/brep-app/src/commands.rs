@@ -215,6 +215,24 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
             Some(c) => c,
             None => return vec![],
         }
+    } else if sk.committed_pt_selection.len() == 2 && sk.pt_selection.is_empty() && n_sel == 0 {
+        // Two committed vertices in the same profile → Coincident.
+        let (pi1, vi1) = sk.committed_pt_selection[0];
+        let (pi2, vi2) = sk.committed_pt_selection[1];
+        if pi1 != pi2 { return vec![]; }
+        return vec![UiAction::SketchAddCommittedConstraint(
+            pi1, SketchConstraint::Coincident { pt_a: vi1, pt_b: vi2 },
+        )];
+    } else if sk.committed_pt_selection.len() == 1 && sk.committed_seg_selection.len() == 1
+        && sk.pt_selection.is_empty() && n_sel == 0
+    {
+        // One committed vertex + one committed segment in the same profile → PointOnLine.
+        let (pi_pt, vi) = sk.committed_pt_selection[0];
+        let (pi_seg, si) = sk.committed_seg_selection[0];
+        if pi_pt != pi_seg { return vec![]; }
+        return vec![UiAction::SketchAddCommittedConstraint(
+            pi_pt, SketchConstraint::PointOnLine { pt: vi, seg: si },
+        )];
     } else {
         return vec![]
     };
@@ -438,6 +456,11 @@ pub fn has_coincident_target(ed: &EditorState) -> bool {
                 cp.shape.supports_point_on_curve()
             })
         }))
+        || (sk.committed_pt_selection.len() == 2 && n_pts == 0 && n_sel == 0
+            && sk.committed_pt_selection[0].0 == sk.committed_pt_selection[1].0)
+        || (sk.committed_pt_selection.len() == 1 && sk.committed_seg_selection.len() == 1
+            && n_pts == 0 && n_sel == 0
+            && sk.committed_pt_selection[0].0 == sk.committed_seg_selection[0].0)
 }
 
 pub fn two_solids_selected(ed: &EditorState) -> bool {
