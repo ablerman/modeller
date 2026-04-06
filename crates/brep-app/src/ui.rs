@@ -26,6 +26,7 @@ pub fn build_ui(
     snap_constraint: Option<usize>,
     snap_committed: Option<(usize, usize)>,
     snap_committed_curve: Option<usize>,
+    snap_committed_seg: Option<(usize, usize)>,
     angle_dialog: Option<(usize, usize)>,
     length_dialog: Option<(LengthTarget, f64)>,
 ) -> Vec<UiAction> {
@@ -340,12 +341,40 @@ pub fn build_ui(
                 }
             }
         }
-        // Selected committed point (e.g. arc center) — highlighted like a regular vertex.
-        if let Some((sel_pi, sel_vi)) = sk.committed_pt_selection {
+        // Selected committed points — highlighted as orange dots.
+        for &(sel_pi, sel_vi) in &sk.committed_pt_selection {
             if let Some(cp) = sk.committed_profiles.get(sel_pi) {
                 if let Some(&sel_pt) = cp.points.get(sel_vi) {
                     if let Some(p) = proj(sel_pt) {
                         painter.circle_filled(p, 6.0, egui::Color32::from_rgb(255, 160, 60));
+                    }
+                }
+            }
+        }
+        // Hovered committed polyline segment — blue highlight over the base rendering.
+        if let Some((hov_pi, hov_si)) = snap_committed_seg {
+            if let Some(cp) = sk.committed_profiles.get(hov_pi) {
+                let cn = cp.points.len();
+                if hov_si < cn {
+                    if let (Some(a), Some(b)) = (proj(cp.points[hov_si]), proj(cp.points[(hov_si + 1) % cn])) {
+                        painter.line_segment(
+                            [a, b],
+                            egui::Stroke::new(edge_stroke.width + 1.5, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 210)),
+                        );
+                    }
+                }
+            }
+        }
+        // Selected committed polyline segments — orange highlight.
+        for &(sel_pi, sel_si) in &sk.committed_seg_selection {
+            if let Some(cp) = sk.committed_profiles.get(sel_pi) {
+                let cn = cp.points.len();
+                if sel_si < cn {
+                    if let (Some(a), Some(b)) = (proj(cp.points[sel_si]), proj(cp.points[(sel_si + 1) % cn])) {
+                        painter.line_segment(
+                            [a, b],
+                            egui::Stroke::new(edge_stroke.width + 1.5, egui::Color32::from_rgb(255, 160, 60)),
+                        );
                     }
                 }
             }

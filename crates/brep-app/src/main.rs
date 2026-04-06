@@ -113,6 +113,8 @@ struct AppState {
     snap_committed_curve: Option<usize>,
     /// Index of committed circle/arc profile whose curve is being dragged (resize).
     drag_committed_curve: Option<usize>,
+    /// (profile_idx, segment_idx) of committed polyline segment the cursor is hovering over.
+    snap_committed_seg: Option<(usize, usize)>,
 }
 
 impl AppState {
@@ -219,6 +221,7 @@ impl AppState {
             drag_committed: None,
             snap_committed_curve: None,
             drag_committed_curve: None,
+            snap_committed_seg: None,
         }
     }
 
@@ -325,11 +328,12 @@ impl AppState {
         let snap_constraint = self.snap_constraint;
         let snap_committed = self.snap_committed;
         let snap_committed_curve = self.snap_committed_curve;
+        let snap_committed_seg = self.snap_committed_seg;
         let angle_dialog = self.angle_dialog;
         let length_dialog = self.length_dialog;  // Option<(LengthTarget, f64)>
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, snap_committed, snap_committed_curve, angle_dialog, length_dialog);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, snap_committed, snap_committed_curve, snap_committed_seg, angle_dialog, length_dialog);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -780,6 +784,16 @@ impl ApplicationHandler for App {
                                     }
                                     // Drag already moved the boundary point; nothing else needed.
                                 }
+                                // Committed polyline segment click.
+                                if is_click && state.drag_committed.is_none() {
+                                    if let Some((pi, si)) = state.snap_committed_seg {
+                                        let is_pointer = state.editor.sketch.as_ref()
+                                            .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                        if is_pointer {
+                                            state.editor.apply(UiAction::SketchSelectCommittedSeg(Some((pi, si))));
+                                        }
+                                    }
+                                }
                                 // Committed vertex drag released.
                                 if let Some((pi, vi)) = state.drag_committed.take() {
                                     if is_click {
@@ -1038,6 +1052,21 @@ impl ApplicationHandler for App {
                         }
                     }
                     state.snap_committed_curve = snap_curve;
+
+                    // Snap to committed polyline segments (only when no vertex or curve snap).
+                    let mut snap_seg: Option<(usize, usize)> = None;
+                    if snap_comm.is_none() && snap_curve.is_none() {
+                        for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            if let Some(si) = cp.shape.hit_test_segment(
+                                &cp.points, cp.closed, cur, CURVE_SNAP_PX,
+                                &|pt| state.editor.camera.project_to_screen(pt, w, h),
+                            ) {
+                                snap_seg = Some((pi, si));
+                                break;
+                            }
+                        }
+                    }
+                    state.snap_committed_seg = snap_seg;
 
                     // Reference entity snap (origin / axes) — only when not snapping to a vertex.
                     if state.snap_vertex.is_none() {

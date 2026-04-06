@@ -189,10 +189,10 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
         SketchConstraint::PointOnLine { pt: sk.pt_selection[0], seg: sk.seg_selection[0] }
     } else if n_pts == 1 && sk.ref_selection == Some(RefEntity::Origin) {
         SketchConstraint::PointOnOrigin { pt: sk.pt_selection[0] }
-    } else if n_pts == 1 && sk.committed_pt_selection.is_some() && n_sel == 0 {
+    } else if n_pts == 1 && !sk.committed_pt_selection.is_empty() && n_sel == 0 {
         // Active-profile vertex pinned to an arc control point (start, end, or center).
         let constraint = (|| -> Option<SketchConstraint> {
-            let (ci, vi) = sk.committed_pt_selection?;
+            let &(ci, vi) = sk.committed_pt_selection.first()?;
             let cp = sk.committed_profiles.get(ci)?;
             let p = cp.points.get(vi)?;
             let (u_axis, v_axis) = sk.plane.uv_axes();
@@ -432,7 +432,7 @@ pub fn has_coincident_target(ed: &EditorState) -> bool {
     (n_pts == 2 && n_sel == 0)
         || (n_sel == 1 && n_pts == 1)
         || (n_pts == 1 && sk.ref_selection == Some(RefEntity::Origin))
-        || (n_pts == 1 && n_sel == 0 && sk.committed_pt_selection.is_some())
+        || (n_pts == 1 && n_sel == 0 && !sk.committed_pt_selection.is_empty())
         || (n_pts == 1 && n_sel == 0 && sk.committed_selection.map_or(false, |ci| {
             sk.committed_profiles.get(ci).map_or(false, |cp| {
                 cp.shape.supports_point_on_curve()

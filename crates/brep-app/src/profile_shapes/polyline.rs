@@ -32,6 +32,39 @@ pub(crate) fn draw(
     }
 }
 
+// ── Hit-testing ───────────────────────────────────────────────────────────────
+
+/// Test whether the cursor (screen pixels) is within `threshold_px` of any segment.
+/// Returns the index of the first matching segment, or `None`.
+pub(crate) fn hit_test_segment(
+    points: &[Point3],
+    closed: bool,
+    cursor: (f32, f32),
+    threshold_px: f32,
+    project: &impl Fn(Point3) -> Option<(f32, f32)>,
+) -> Option<usize> {
+    let cn = points.len();
+    let seg_count = if closed { cn } else { cn.saturating_sub(1) };
+    for i in 0..seg_count {
+        if let (Some((ax, ay)), Some((bx, by))) = (project(points[i]), project(points[(i + 1) % cn])) {
+            let seg_dx = bx - ax;
+            let seg_dy = by - ay;
+            let seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
+            let dist = if seg_len2 < 1e-6 {
+                ((cursor.0 - ax).powi(2) + (cursor.1 - ay).powi(2)).sqrt()
+            } else {
+                let t = ((cursor.0 - ax) * seg_dx + (cursor.1 - ay) * seg_dy) / seg_len2;
+                let t = t.clamp(0.0, 1.0);
+                let px = ax + t * seg_dx;
+                let py = ay + t * seg_dy;
+                ((cursor.0 - px).powi(2) + (cursor.1 - py).powi(2)).sqrt()
+            };
+            if dist < threshold_px { return Some(i); }
+        }
+    }
+    None
+}
+
 // ── Drag handling ─────────────────────────────────────────────────────────────
 
 /// Apply a vertex drag: move the single vertex `vi` to `cursor_pt`.

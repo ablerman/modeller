@@ -43,10 +43,27 @@ impl ProfileShape {
     }
 
     /// Whether control point `vi` is individually selectable for constraints.
-    /// Arc: all three points (start, end, center) are individually selectable.
-    /// Other shapes use whole-profile selection.
+    /// Arc and Polyline: every vertex is individually selectable.
+    /// Circle uses whole-profile selection.
     pub fn vertex_selectable(&self, _vi: usize) -> bool {
-        matches!(self, ProfileShape::Arc)
+        matches!(self, ProfileShape::Arc | ProfileShape::Polyline)
+    }
+
+    /// Test whether the cursor is within `threshold_px` of a segment of this shape.
+    /// Returns `Some(segment_idx)` for the first matching segment, or `None`.
+    /// Only meaningful for `Polyline`; returns `None` for other shapes.
+    pub fn hit_test_segment(
+        &self,
+        points: &[brep_core::Point3],
+        closed: bool,
+        cursor: (f32, f32),
+        threshold_px: f32,
+        project: &impl Fn(brep_core::Point3) -> Option<(f32, f32)>,
+    ) -> Option<usize> {
+        match self {
+            ProfileShape::Polyline => polyline::hit_test_segment(points, closed, cursor, threshold_px, project),
+            _ => None,
+        }
     }
 
     /// Apply a vertex drag: mutate `points` after dragging vertex `vi` to `cursor_pt`.

@@ -166,9 +166,12 @@ pub struct SketchState {
     pub committed_profiles: Vec<CommittedProfile>,
     /// Index of the committed profile currently selected (for constraints like PointOnCircle).
     pub committed_selection: Option<usize>,
-    /// A specific control point within a committed profile that is selected (profile_idx, vertex_idx).
-    /// Used for arc/circle center point selection — separate from curve selection.
-    pub committed_pt_selection: Option<(usize, usize)>,
+    /// Selected control points within committed profiles (profile_idx, vertex_idx).
+    /// Supports up to 2 simultaneous selections (like active-profile pt_selection).
+    pub committed_pt_selection: Vec<(usize, usize)>,
+    /// Selected segments within committed polylines (profile_idx, segment_idx).
+    /// Supports up to 2 simultaneous selections (like active-profile seg_selection).
+    pub committed_seg_selection: Vec<(usize, usize)>,
 }
 
 pub use crate::profile_shapes::ProfileShape;
@@ -564,6 +567,8 @@ pub enum UiAction {
     SketchSelectCommitted(Option<usize>),
     /// Select a specific control point within a committed profile (profile_idx, vertex_idx).
     SketchSelectCommittedPoint(Option<(usize, usize)>),
+    /// Select a specific segment within a committed polyline (profile_idx, segment_idx).
+    SketchSelectCommittedSeg(Option<(usize, usize)>),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -861,7 +866,8 @@ impl EditorState {
                     tool_in_progress:   None,
                     committed_profiles: Vec::new(),
                     committed_selection: None,
-                    committed_pt_selection: None,
+                    committed_pt_selection: Vec::new(),
+                    committed_seg_selection: Vec::new(),
                 });
                 self.selection.clear();
                 // Animate the camera to look at the chosen plane with axes oriented
@@ -916,7 +922,8 @@ impl EditorState {
                     tool_in_progress:     None,
                     committed_profiles,
                     committed_selection:    None,
-                    committed_pt_selection: None,
+                    committed_pt_selection: Vec::new(),
+                    committed_seg_selection: Vec::new(),
                 });
                 // Animate camera to face the sketch plane.
                 let (az, el) = match raw.plane {
@@ -985,7 +992,8 @@ impl EditorState {
                     sk.seg_selection.clear();
                     sk.pt_selection.clear();
                     sk.committed_selection = None;
-                    sk.committed_pt_selection = None;
+                    sk.committed_pt_selection.clear();
+                    sk.committed_seg_selection.clear();
                 }
                 false
             }
@@ -1012,13 +1020,47 @@ impl EditorState {
             UiAction::SketchSelectCommitted(idx) => {
                 if let Some(sk) = &mut self.sketch {
                     sk.committed_selection = idx;
-                    sk.committed_pt_selection = None;
+                    sk.committed_pt_selection.clear();
+                    sk.committed_seg_selection.clear();
                 }
                 false
             }
             UiAction::SketchSelectCommittedPoint(idx) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.committed_pt_selection = idx;
+                    if let Some(item) = idx {
+                        // Toggle: remove if already selected, otherwise add (cap at 2).
+                        if let Some(pos) = sk.committed_pt_selection.iter().position(|&x| x == item) {
+                            sk.committed_pt_selection.remove(pos);
+                        } else {
+                            if sk.committed_pt_selection.len() >= 2 {
+                                sk.committed_pt_selection.remove(0);
+                            }
+                            sk.committed_pt_selection.push(item);
+                        }
+                    } else {
+                        sk.committed_pt_selection.clear();
+                        sk.committed_seg_selection.clear();
+                    }
+                    sk.committed_selection = None;
+                }
+                false
+            }
+            UiAction::SketchSelectCommittedSeg(idx) => {
+                if let Some(sk) = &mut self.sketch {
+                    if let Some(item) = idx {
+                        // Toggle: remove if already selected, otherwise add (cap at 2).
+                        if let Some(pos) = sk.committed_seg_selection.iter().position(|&x| x == item) {
+                            sk.committed_seg_selection.remove(pos);
+                        } else {
+                            if sk.committed_seg_selection.len() >= 2 {
+                                sk.committed_seg_selection.remove(0);
+                            }
+                            sk.committed_seg_selection.push(item);
+                        }
+                    } else {
+                        sk.committed_seg_selection.clear();
+                        sk.committed_pt_selection.clear();
+                    }
                     sk.committed_selection = None;
                 }
                 false
