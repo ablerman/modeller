@@ -694,6 +694,9 @@ pub enum UiAction {
     /// Cancel the current in-progress drawing operation and clear the active profile points.
     /// Committed profiles (circles, rectangles) are kept.
     SketchAbortActive,
+    /// Commit the active polyline points as an open committed profile, then reset the active profile.
+    /// Requires ≥2 points and no multi-step tool in progress.
+    SketchCommitPolyline,
     /// Select (or deselect) a committed profile by index, for use with constraints.
     SketchSelectCommitted(Option<usize>),
 }
@@ -1115,6 +1118,26 @@ impl EditorState {
                     sk.seg_selection.clear();
                     sk.pt_selection.clear();
                     sk.committed_selection = None;
+                }
+                false
+            }
+            UiAction::SketchCommitPolyline => {
+                if let Some(sk) = &mut self.sketch {
+                    if sk.points.len() >= 2 && sk.tool_in_progress.is_none() {
+                        sk.history.push(sketch_snapshot(sk));
+                        let pts = std::mem::take(&mut sk.points);
+                        let constraints = std::mem::take(&mut sk.constraints);
+                        sk.closed = false;
+                        sk.seg_selection.clear();
+                        sk.pt_selection.clear();
+                        sk.committed_profiles.push(CommittedProfile {
+                            points:      pts,
+                            closed:      false,
+                            shape:       ProfileShape::Polyline,
+                            plane:       None,
+                            constraints,
+                        });
+                    }
                 }
                 false
             }

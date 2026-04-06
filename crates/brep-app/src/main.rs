@@ -730,6 +730,12 @@ impl ApplicationHandler for App {
                     if matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Escape)) {
                         state.dispatch_action(UiAction::SketchAbortActive);
                     }
+                    // Enter: commit the active polyline as an open profile.
+                    if matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter)) {
+                        if state.editor.sketch.is_some() {
+                            state.dispatch_action(UiAction::SketchCommitPolyline);
+                        }
+                    }
                 }
             }
 
