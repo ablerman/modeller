@@ -4,7 +4,7 @@ use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{self, EditorState, LengthTarget, ObjectHistory, ProfileShape, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
+use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
 use crate::icons::{icon_angle, icon_coincident, icon_equal_len, icon_horizontal, icon_length, icon_parallel, icon_perp, icon_trash, icon_vertical};
 use crate::toolbar::IconSize;
 use crate::toolbar_defs;
@@ -421,7 +421,7 @@ pub fn build_ui(
                     // start + end placed; next click = arc center.
                     // Preview: arc from start to end_pt with cursor as center.
                     if let Some(cur) = cursor_snapped {
-                        draw_arc_preview(&painter, *start, *end_pt, cur, sk.plane, &proj, preview_stroke);
+                        crate::sketch_tools::arc::draw_preview(&painter, *start, *end_pt, cur, sk.plane, &proj, preview_stroke);
                     }
                     // Mark the end point.
                     if let Some(tp) = proj(*end_pt) {
@@ -434,13 +434,13 @@ pub fn build_ui(
                 Some(ToolInProgress::RectFirst { corner }) => {
                     // First corner placed: draw rectangle preview to cursor.
                     if let Some(cur) = cursor_snapped {
-                        draw_rect_preview(&painter, *corner, cur, sk.plane, &proj, preview_stroke);
+                        crate::sketch_tools::rectangle::draw_preview(&painter, *corner, cur, sk.plane, &proj, preview_stroke);
                     }
                 }
                 Some(ToolInProgress::CircleCenter { center }) => {
                     // Center placed: draw circle preview to cursor.
                     if let Some(cur) = cursor_snapped {
-                        draw_circle_preview(&painter, *center, cur, sk.plane, &proj, preview_stroke);
+                        crate::sketch_tools::circle::draw_preview(&painter, *center, cur, sk.plane, &proj, preview_stroke);
                     }
                 }
             }
@@ -1200,11 +1200,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         }
                         // Committed profiles (circles, arcs, rectangles).
                         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
-                            let label = match cp.shape {
-                                ProfileShape::Circle => format!("Circle {pi}"),
-                                ProfileShape::Arc    => format!("Arc {pi}"),
-                                ProfileShape::Polyline => format!("Rectangle {pi}"),
-                            };
+                            let label = cp.shape.label(pi);
                             let is_sel = sk.committed_selection == Some(pi);
                             let resp = ui.selectable_label(is_sel, label);
                             if resp.clicked() {
@@ -1306,68 +1302,6 @@ fn show_history_op(ui: &mut egui::Ui, node: &ObjectHistory) {
     }
 }
 
-// ── Tool preview helpers ──────────────────────────────────────────────────────
-
-/// Draw an arc preview: `start` → `end_pt`, with `center` as the arc center.
-fn draw_arc_preview(
-    painter: &egui::Painter,
-    start: Point3, end_pt: Point3, center: Point3,
-    plane: crate::editor::SketchPlane,
-    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
-    stroke: egui::Stroke,
-) {
-    let pts = editor::tessellate_arc_from_center(start, end_pt, center, plane);
-    for w in pts.windows(2) {
-        if let (Some(a), Some(b)) = (proj(w[0]), proj(w[1])) {
-            painter.line_segment([a, b], stroke);
-        }
-    }
-    // Mark the center with a small cross.
-    if let Some(cp) = proj(center) {
-        painter.line_segment(
-            [cp - egui::vec2(4.0, 0.0), cp + egui::vec2(4.0, 0.0)],
-            egui::Stroke::new(1.0, stroke.color),
-        );
-        painter.line_segment(
-            [cp - egui::vec2(0.0, 4.0), cp + egui::vec2(0.0, 4.0)],
-            egui::Stroke::new(1.0, stroke.color),
-        );
-    }
-}
-
-/// Draw a rectangle preview from `corner` to the opposite `cursor` corner.
-fn draw_rect_preview(
-    painter: &egui::Painter,
-    corner: Point3, cursor: Point3,
-    plane: crate::editor::SketchPlane,
-    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
-    stroke: egui::Stroke,
-) {
-    let corners = editor::rect_corners(corner, cursor, plane);
-    for i in 0..4 {
-        if let (Some(a), Some(b)) = (proj(corners[i]), proj(corners[(i + 1) % 4])) {
-            painter.line_segment([a, b], stroke);
-        }
-    }
-}
-
-/// Draw a circle preview centred at `center` passing through `radius_pt`.
-fn draw_circle_preview(
-    painter: &egui::Painter,
-    center: Point3, radius_pt: Point3,
-    plane: crate::editor::SketchPlane,
-    proj: &impl Fn(Point3) -> Option<egui::Pos2>,
-    stroke: egui::Stroke,
-) {
-    let pts = editor::tessellate_circle(center, radius_pt, plane, 64);
-    let n = pts.len();
-    for i in 0..n {
-        if let (Some(a), Some(b)) = (proj(pts[i]), proj(pts[(i + 1) % n])) {
-            painter.line_segment([a, b], stroke);
-        }
-    }
-}
-
 // ── Committed profile rendering ───────────────────────────────────────────────
 
 /// Render a committed profile (circle, arc, or polyline) using its stored shape.
@@ -1377,63 +1311,7 @@ fn draw_committed_profile(
     proj: &impl Fn(Point3) -> Option<egui::Pos2>,
     stroke: egui::Stroke,
 ) {
-    match &cp.shape {
-        ProfileShape::Circle => {
-            // points[0] = center, points[1] = boundary point.
-            if let (Some(&center), Some(&boundary)) = (cp.points.get(0), cp.points.get(1)) {
-                if let (Some(c_screen), Some(b_screen)) = (proj(center), proj(boundary)) {
-                    let radius = (b_screen - c_screen).length();
-                    painter.circle_stroke(c_screen, radius, stroke);
-                    // Small cross-hair at center — always dim so it doesn't look "selected".
-                    let dot_col = egui::Color32::from_rgba_unmultiplied(180, 180, 180, 120);
-                    painter.circle_filled(c_screen, 2.5, dot_col);
-                    // Boundary drag handle — also dim.
-                    painter.circle_filled(b_screen, 2.5, dot_col);
-                }
-            }
-        }
-        ProfileShape::Arc => {
-            // points[0] = start, points[1] = end_pt, points[2] = center.
-            if let (Some(&start), Some(&end_pt), Some(&center)) =
-                (cp.points.get(0), cp.points.get(1), cp.points.get(2))
-            {
-                if let Some(plane) = cp.plane {
-                    let pts = editor::tessellate_arc_from_center(start, end_pt, center, plane);
-                    for w in pts.windows(2) {
-                        if let (Some(a), Some(b)) = (proj(w[0]), proj(w[1])) {
-                            painter.line_segment([a, b], stroke);
-                        }
-                    }
-                } else {
-                    // Fallback: straight line.
-                    if let (Some(a), Some(b)) = (proj(start), proj(end_pt)) {
-                        painter.line_segment([a, b], stroke);
-                    }
-                }
-                // Mark start, end, and center as dots.
-                for pt in [start, end_pt, center] {
-                    if let Some(p) = proj(pt) {
-                        painter.circle_filled(p, 3.0, stroke.color);
-                    }
-                }
-            }
-        }
-        ProfileShape::Polyline => {
-            let cn = cp.points.len();
-            let seg_count = if cp.closed { cn } else { cn.saturating_sub(1) };
-            for i in 0..seg_count {
-                if let (Some(a), Some(b)) = (proj(cp.points[i]), proj(cp.points[(i + 1) % cn])) {
-                    painter.line_segment([a, b], stroke);
-                }
-            }
-            // Corner dots.
-            for &pt in &cp.points {
-                if let Some(p) = proj(pt) {
-                    painter.circle_filled(p, 3.0, stroke.color);
-                }
-            }
-        }
-    }
+    cp.shape.draw(&cp.points, cp.closed, cp.plane, painter, proj, stroke);
 }
 
 // ── Constraint conflict badge ─────────────────────────────────────────────────

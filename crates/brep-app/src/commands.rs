@@ -13,7 +13,7 @@
 use brep_bool::BooleanKind;
 use brep_sketch::SketchConstraint;
 
-use crate::editor::{DrawTool, EditorState, LengthTarget, ProfileShape, PrimitiveKind, RefEntity, SceneEntry, SketchPlane, UiAction};
+use crate::editor::{DrawTool, EditorState, LengthTarget, PrimitiveKind, RefEntity, SceneEntry, SketchPlane, UiAction};
 use crate::icons;
 
 // ── CommandId ─────────────────────────────────────────────────────────────────
@@ -189,37 +189,27 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
         SketchConstraint::PointOnLine { pt: sk.pt_selection[0], seg: sk.seg_selection[0] }
     } else if n_pts == 1 && sk.ref_selection == Some(RefEntity::Origin) {
         SketchConstraint::PointOnOrigin { pt: sk.pt_selection[0] }
+    } else if n_pts == 1 && sk.committed_pt_selection.is_some() && n_sel == 0 {
+        // Active-profile vertex pinned to an arc control point (start, end, or center).
+        let constraint = (|| -> Option<SketchConstraint> {
+            let (ci, vi) = sk.committed_pt_selection?;
+            let cp = sk.committed_profiles.get(ci)?;
+            let p = cp.points.get(vi)?;
+            let (u_axis, v_axis) = sk.plane.uv_axes();
+            let u = p.coords.dot(&u_axis);
+            let v = p.coords.dot(&v_axis);
+            Some(SketchConstraint::PointFixed { pt: sk.pt_selection[0], x: u, y: v })
+        })();
+        match constraint {
+            Some(c) => c,
+            None => return vec![],
+        }
     } else if n_pts == 1 && n_sel == 0 {
         // Point on committed arc or circle.
         let constraint = (|| -> Option<SketchConstraint> {
             let ci = sk.committed_selection?;
             let cp = sk.committed_profiles.get(ci)?;
-            let (u, v) = sk.plane.uv_axes();
-            let to_uv = |p: brep_core::Point3| (p.coords.dot(&u), p.coords.dot(&v));
-            match &cp.shape {
-                ProfileShape::Circle => {
-                    let center   = *cp.points.get(0)?;
-                    let boundary = *cp.points.get(1)?;
-                    let (cu, cv) = to_uv(center);
-                    let (bu, bv) = to_uv(boundary);
-                    let radius = ((bu - cu).powi(2) + (bv - cv).powi(2)).sqrt();
-                    Some(SketchConstraint::PointOnCircle {
-                        pt: sk.pt_selection[0], center_u: cu, center_v: cv, radius,
-                    })
-                }
-                ProfileShape::Arc => {
-                    // Arc stored as [start, end_pt, center]; radius = dist(center, start)
-                    let start  = *cp.points.get(0)?;
-                    let center = *cp.points.get(2)?;
-                    let (su, sv) = to_uv(start);
-                    let (cu, cv) = to_uv(center);
-                    let radius = ((su - cu).powi(2) + (sv - cv).powi(2)).sqrt();
-                    Some(SketchConstraint::PointOnCircle {
-                        pt: sk.pt_selection[0], center_u: cu, center_v: cv, radius,
-                    })
-                }
-                _ => None,
-            }
+            cp.shape.point_on_curve_constraint(&cp.points, sk.pt_selection[0], sk.plane)
         })();
         match constraint {
             Some(c) => c,
@@ -442,9 +432,10 @@ pub fn has_coincident_target(ed: &EditorState) -> bool {
     (n_pts == 2 && n_sel == 0)
         || (n_sel == 1 && n_pts == 1)
         || (n_pts == 1 && sk.ref_selection == Some(RefEntity::Origin))
+        || (n_pts == 1 && n_sel == 0 && sk.committed_pt_selection.is_some())
         || (n_pts == 1 && n_sel == 0 && sk.committed_selection.map_or(false, |ci| {
             sk.committed_profiles.get(ci).map_or(false, |cp| {
-                matches!(cp.shape, ProfileShape::Circle | ProfileShape::Arc)
+                cp.shape.supports_point_on_curve()
             })
         }))
 }

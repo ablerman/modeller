@@ -6,6 +6,8 @@
 mod commands;
 mod editor;
 mod icons;
+mod profile_shapes;
+mod sketch_tools;
 mod toolbar;
 mod toolbar_defs;
 mod ui;
@@ -787,8 +789,10 @@ impl ApplicationHandler for App {
                                             let shape = state.editor.sketch.as_ref()
                                                 .and_then(|sk| sk.committed_profiles.get(pi))
                                                 .map(|cp| cp.shape.clone());
-                                            // Arc center (vi==2) → point selection; everything else → profile selection.
-                                            if matches!(shape, Some(editor::ProfileShape::Arc)) && vi == 2 {
+                                            // Arc: all three control points (start, end, center) are
+                                            // individually selectable for constraints.
+                                            // Everything else → profile selection.
+                                            if shape.as_ref().map_or(false, |s| s.vertex_selectable(vi)) {
                                                 state.editor.apply(UiAction::SketchSelectCommittedPoint(Some((pi, vi))));
                                             } else {
                                                 state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
@@ -965,51 +969,8 @@ impl ApplicationHandler for App {
                             if let Some(cursor_pt) = state.sketch_cursor {
                                 if let Some(sk) = &mut state.editor.sketch {
                                     if let Some(cp) = sk.committed_profiles.get_mut(pi) {
-                                        match cp.shape {
-                                            editor::ProfileShape::Circle if vi == 0 => {
-                                                // Dragging the center moves the whole circle.
-                                                let old_center = cp.points.get(0).copied();
-                                                if let (Some(old_c), Some(boundary)) =
-                                                    (old_center, cp.points.get_mut(1))
-                                                {
-                                                    let delta = cursor_pt - old_c;
-                                                    *boundary += delta;
-                                                }
-                                                if let Some(c) = cp.points.get_mut(0) {
-                                                    *c = cursor_pt;
-                                                }
-                                            }
-                                            editor::ProfileShape::Arc if vi == 0 || vi == 1 => {
-                                                // Move the endpoint, then reproject center onto new bisector.
-                                                if let Some(pt) = cp.points.get_mut(vi) {
-                                                    *pt = cursor_pt;
-                                                }
-                                                if let (Some(&s), Some(&e), Some(&c), Some(plane)) = (
-                                                    cp.points.get(0), cp.points.get(1),
-                                                    cp.points.get(2), cp.plane,
-                                                ) {
-                                                    let new_c = editor::project_center_to_arc_bisector(s, e, c, plane);
-                                                    if let Some(center) = cp.points.get_mut(2) {
-                                                        *center = new_c;
-                                                    }
-                                                }
-                                            }
-                                            editor::ProfileShape::Arc if vi == 2 => {
-                                                // Dragging center moves the whole arc (translate start, end, center).
-                                                let old_center = cp.points.get(2).copied();
-                                                if let Some(old_c) = old_center {
-                                                    let delta = cursor_pt - old_c;
-                                                    for pt in cp.points.iter_mut() {
-                                                        *pt += delta;
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                if let Some(pt) = cp.points.get_mut(vi) {
-                                                    *pt = cursor_pt;
-                                                }
-                                            }
-                                        }
+                                        let plane = cp.plane;
+                        cp.shape.apply_vertex_drag(&mut cp.points, vi, cursor_pt, plane);
                                     }
                                 }
                             }
@@ -1022,26 +983,8 @@ impl ApplicationHandler for App {
                             if let Some(cursor_pt) = state.sketch_cursor {
                                 if let Some(sk) = &mut state.editor.sketch {
                                     if let Some(cp) = sk.committed_profiles.get_mut(pi) {
-                                        match cp.shape {
-                                            editor::ProfileShape::Circle => {
-                                                if let Some(pt) = cp.points.get_mut(1) {
-                                                    *pt = cursor_pt;
-                                                }
-                                            }
-                                            editor::ProfileShape::Arc => {
-                                                // Dragging arc curve: project cursor onto bisector before storing,
-                                                // so the arc doesn't flip when cursor is off-bisector.
-                                                if let (Some(&s), Some(&e), Some(plane)) = (
-                                                    cp.points.get(0), cp.points.get(1), cp.plane,
-                                                ) {
-                                                    let projected = editor::project_center_to_arc_bisector(s, e, cursor_pt, plane);
-                                                    if let Some(pt) = cp.points.get_mut(2) {
-                                                        *pt = projected;
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
+                                        let plane = cp.plane;
+                        cp.shape.apply_curve_drag(&mut cp.points, cursor_pt, plane);
                                     }
                                 }
                             }
@@ -1084,57 +1027,13 @@ impl ApplicationHandler for App {
                     const CURVE_SNAP_PX: f32 = 8.0;
                     let mut snap_curve: Option<usize> = None;
                     if snap_comm.is_none() {
-                        'curve_outer: for (pi, cp) in sk.committed_profiles.iter().enumerate() {
-                            match &cp.shape {
-                                editor::ProfileShape::Circle => {
-                                    if let (Some(&center), Some(&boundary)) =
-                                        (cp.points.get(0), cp.points.get(1))
-                                    {
-                                        if let (Some((cx, cy)), Some((bx, by))) = (
-                                            state.editor.camera.project_to_screen(center, w, h),
-                                            state.editor.camera.project_to_screen(boundary, w, h),
-                                        ) {
-                                            let radius = ((bx - cx).powi(2) + (by - cy).powi(2)).sqrt();
-                                            let dist_to_center = ((cur.0 - cx).powi(2) + (cur.1 - cy).powi(2)).sqrt();
-                                            if (dist_to_center - radius).abs() < CURVE_SNAP_PX {
-                                                snap_curve = Some(pi);
-                                                break 'curve_outer;
-                                            }
-                                        }
-                                    }
-                                }
-                                editor::ProfileShape::Arc => {
-                                    if let (Some(&start), Some(&end_pt), Some(&center), Some(plane)) =
-                                        (cp.points.get(0), cp.points.get(1), cp.points.get(2), cp.plane)
-                                    {
-                                        let pts = editor::tessellate_arc_from_center(start, end_pt, center, plane);
-                                        for pair in pts.windows(2) {
-                                            if let (Some((ax, ay)), Some((bx, by))) = (
-                                                state.editor.camera.project_to_screen(pair[0], w, h),
-                                                state.editor.camera.project_to_screen(pair[1], w, h),
-                                            ) {
-                                                // Distance from cursor to segment ab.
-                                                let seg_dx = bx - ax;
-                                                let seg_dy = by - ay;
-                                                let seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy;
-                                                let dist = if seg_len2 < 1e-6 {
-                                                    ((cur.0 - ax).powi(2) + (cur.1 - ay).powi(2)).sqrt()
-                                                } else {
-                                                    let t = ((cur.0 - ax) * seg_dx + (cur.1 - ay) * seg_dy) / seg_len2;
-                                                    let t = t.clamp(0.0, 1.0);
-                                                    let px = ax + t * seg_dx;
-                                                    let py = ay + t * seg_dy;
-                                                    ((cur.0 - px).powi(2) + (cur.1 - py).powi(2)).sqrt()
-                                                };
-                                                if dist < CURVE_SNAP_PX {
-                                                    snap_curve = Some(pi);
-                                                    break 'curve_outer;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
+                        for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            if cp.shape.hit_test_curve(
+                                &cp.points, cp.plane, cur, CURVE_SNAP_PX,
+                                &|pt| state.editor.camera.project_to_screen(pt, w, h),
+                            ) {
+                                snap_curve = Some(pi);
+                                break;
                             }
                         }
                     }
