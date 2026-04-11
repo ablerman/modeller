@@ -872,8 +872,16 @@ impl ApplicationHandler for App {
                                     let handled_as_double_click = if is_double_click {
                                         let should_commit = state.editor.sketch.as_ref().map_or(false, |sk| {
                                             sk.active_tool == editor::DrawTool::Polyline
-                                                && sk.tool_in_progress.is_none()
-                                                && !sk.points.is_empty()
+                                                && (
+                                                    // Legacy active-profile polyline.
+                                                    (sk.tool_in_progress.is_none() && !sk.points.is_empty())
+                                                    // Per-segment chain with at least one segment.
+                                                    || matches!(
+                                                        &sk.tool_in_progress,
+                                                        Some(editor::ToolInProgress::PolylineChain { segment_count, .. })
+                                                            if *segment_count > 0
+                                                    )
+                                                )
                                         });
                                         if should_commit {
                                             state.editor.apply(UiAction::SketchCommitPolyline);

@@ -107,6 +107,8 @@ pub enum ToolInProgress {
         pen_global_idx: usize,
         /// Number of segments committed so far (0 = only the start point was placed).
         segment_count: usize,
+        /// Length of `history.undo_stack` when this chain began (for abort clean-up).
+        chain_start_history_len: usize,
     },
 }
 
@@ -1102,10 +1104,13 @@ impl EditorState {
                         // If aborting a polyline chain, remove all profiles and global points
                         // added since the chain started.
                         if let Some(ToolInProgress::PolylineChain {
-                            chain_start_profile, chain_start_global_pt_idx, ..
+                            chain_start_profile, chain_start_global_pt_idx,
+                            chain_start_history_len, ..
                         }) = sk.tool_in_progress {
                             sk.committed_profiles.truncate(chain_start_profile);
                             sk.global_points.truncate(chain_start_global_pt_idx);
+                            sk.history.undo_stack.truncate(chain_start_history_len);
+                            sk.history.redo_stack.clear();
                         }
                         sk.tool_in_progress = None;
                         sk.points.clear();
@@ -1124,7 +1129,14 @@ impl EditorState {
             }
             UiAction::SketchCommitPolyline => {
                 if let Some(sk) = &mut self.sketch {
-                    if sk.points.len() >= 2 && sk.tool_in_progress.is_none() {
+                    // Per-segment chain: just end the chain (segments already committed).
+                    if matches!(
+                        sk.tool_in_progress,
+                        Some(ToolInProgress::PolylineChain { segment_count, .. }) if segment_count > 0
+                    ) {
+                        sk.tool_in_progress = None;
+                    } else if sk.points.len() >= 2 && sk.tool_in_progress.is_none() {
+                        // Legacy active-profile polyline.
                         sk.history.push("Commit polyline", sketch_snapshot(sk));
                         let pts = std::mem::take(&mut sk.points);
                         let constraints = std::mem::take(&mut sk.constraints);
@@ -1212,6 +1224,7 @@ impl EditorState {
                             chain_start_global_pt_idx,
                             pen_global_idx,
                             segment_count,
+                            chain_start_history_len,
                         }) => {
                             if segment_count == 0 {
                                 // Only the start point was placed — remove it.
@@ -1230,6 +1243,7 @@ impl EditorState {
                                     chain_start_global_pt_idx,
                                     pen_global_idx: prev_pen,
                                     segment_count: segment_count - 1,
+                                    chain_start_history_len,
                                 });
                             }
                         }
@@ -1269,6 +1283,7 @@ impl EditorState {
                         chain_start_global_pt_idx,
                         pen_global_idx,
                         segment_count,
+                        chain_start_history_len,
                     }) = sk.tool_in_progress.take() {
                         if segment_count >= 2 {
                             sk.history.push("Close loop", sketch_snapshot(sk));
@@ -1290,6 +1305,7 @@ impl EditorState {
                                 chain_start_global_pt_idx,
                                 pen_global_idx,
                                 segment_count,
+                                chain_start_history_len,
                             });
                         }
                     } else if sk.points.len() >= 3 && sk.tool_in_progress.is_none() {

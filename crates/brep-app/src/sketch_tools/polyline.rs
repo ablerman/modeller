@@ -41,6 +41,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
                 chain_start_global_pt_idx,
                 pen_global_idx,
                 segment_count: 0,
+                chain_start_history_len: sk.history.undo_stack.len(),
             });
             // No history push — first click doesn't create a segment yet.
         }
@@ -49,6 +50,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
             chain_start_global_pt_idx,
             pen_global_idx,
             segment_count,
+            chain_start_history_len,
         }) => {
             // Subsequent click: commit a 2-point segment sharing `pen_global_idx`.
             sk.history.push("Draw segment", sketch_snapshot(sk));
@@ -67,6 +69,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
                 chain_start_global_pt_idx,
                 pen_global_idx: end_idx,
                 segment_count: segment_count + 1,
+                chain_start_history_len,
             });
             apply_constraints(sk);
         }
