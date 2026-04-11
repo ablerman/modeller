@@ -14,6 +14,8 @@ pub fn icon_vertical()   -> egui::ImageSource<'static> { egui::include_image!(".
 pub fn icon_equal_len()  -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/equal_length.svg") }
 pub fn icon_length()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/length.svg") }
 pub fn icon_coincident() -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/coincident.svg") }
+pub fn icon_radius()     -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/radius.svg") }
+pub fn icon_symmetric()  -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/symmetric.svg") }
 pub fn icon_trash()      -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/trash.svg") }
 
 pub fn icon_undo()       -> egui::ImageSource<'static> { egui::include_image!("../assets/icons/undo.svg") }

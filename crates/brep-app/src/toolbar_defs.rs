@@ -92,6 +92,16 @@ pub static SKETCH_VIEWPORT_TOOLBAR: &[ToolbarItemKind] = &[
         is_active: None,
         is_enabled: Some(commands::has_coincident_target),
     },
+    ToolbarItemKind::Button {
+        spec: &SPEC_CONSTRAIN_RADIUS,
+        is_active: None,
+        is_enabled: Some(commands::has_radius_target),
+    },
+    ToolbarItemKind::Button {
+        spec: &SPEC_CONSTRAIN_SYMMETRIC,
+        is_active: None,
+        is_enabled: Some(commands::has_symmetric_target),
+    },
 ];
 
 // ── Main toolbar (3D mode, top bar) ───────────────────────────────────────────
@@ -239,5 +249,16 @@ pub static SKETCH_CONSTRAIN_MENU: &[ToolbarItemKind] = &[
         spec: &SPEC_CONSTRAIN_COINCIDENT,
         is_active: None,
         is_enabled: Some(commands::has_coincident_target),
+    },
+    ToolbarItemKind::Separator,
+    ToolbarItemKind::Button {
+        spec: &SPEC_CONSTRAIN_RADIUS,
+        is_active: None,
+        is_enabled: Some(commands::has_radius_target),
+    },
+    ToolbarItemKind::Button {
+        spec: &SPEC_CONSTRAIN_SYMMETRIC,
+        is_active: None,
+        is_enabled: Some(commands::has_symmetric_target),
     },
 ];

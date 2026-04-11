@@ -4,7 +4,7 @@ use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
+use crate::editor::{AngleDialogTarget, CommittedCrossConstraint, EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
 use crate::icons::{icon_angle, icon_coincident, icon_equal_len, icon_horizontal, icon_length, icon_parallel, icon_perp, icon_trash, icon_vertical};
 use crate::toolbar::IconSize;
 use crate::toolbar_defs;
@@ -27,7 +27,7 @@ pub fn build_ui(
     snap_committed: Option<(usize, usize)>,
     snap_committed_curve: Option<usize>,
     snap_committed_seg: Option<(usize, usize)>,
-    angle_dialog: Option<(usize, usize)>,
+    angle_dialog: Option<AngleDialogTarget>,
     length_dialog: Option<(LengthTarget, f64)>,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
@@ -573,6 +573,8 @@ pub fn build_ui(
         let description = match target {
             LengthTarget::Segment(seg) => format!("Length of segment {seg}:"),
             LengthTarget::Points(a, b) => format!("Distance between vertex {a} and vertex {b}:"),
+            LengthTarget::CommittedSegment(pi, si) => format!("Length of segment {si} on profile {pi}:"),
+            LengthTarget::CommittedRadius(pi) => format!("Radius of profile {pi}:"),
         };
 
         // Seed the input with the actual current length the first time this dialog opens.
@@ -634,6 +636,32 @@ pub fn build_ui(
                                 SketchConstraint::PointDistance { pt_a, pt_b, value }
                             ));
                         }
+                        LengthTarget::CommittedSegment(pi, si) => {
+                            actions.push(UiAction::SketchAddCommittedConstraint(
+                                pi, SketchConstraint::FixedLength { seg: si, value }
+                            ));
+                        }
+                        LengthTarget::CommittedRadius(pi) => {
+                            if let Some(sk) = &editor.sketch {
+                                if let Some(cp) = sk.committed_profiles.get(pi) {
+                                    use crate::editor::ProfileShape;
+                                    match &cp.shape {
+                                        ProfileShape::Circle => {
+                                            actions.push(UiAction::SketchAddCommittedConstraint(
+                                                pi, SketchConstraint::PointDistance { pt_a: 0, pt_b: 1, value }
+                                            ));
+                                        }
+                                        ProfileShape::Arc => {
+                                            // Arc: points[0]=start, points[2]=center; radius = dist(start, center)
+                                            actions.push(UiAction::SketchAddCommittedConstraint(
+                                                pi, SketchConstraint::PointDistance { pt_a: 0, pt_b: 2, value }
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if dismiss {
                     ctx.data_mut(|d| d.remove::<bool>(len_init_id));
@@ -649,14 +677,22 @@ pub fn build_ui(
     }
 
     // ── Angle input modal ─────────────────────────────────────────────────────
-    if let Some((seg_a, seg_b)) = angle_dialog {
+    if let Some(angle_target) = angle_dialog {
         let angle_id = egui::Id::new("sketch_angle_deg");
 
         let modal = egui::Modal::new(egui::Id::new("angle_input_modal")).show(ctx, |ui| {
             ui.set_min_width(220.0);
             ui.heading("Set Angle");
             ui.add_space(4.0);
-            ui.label(format!("Angle between segment {seg_a} and segment {seg_b}:"));
+            let desc = match angle_target {
+                AngleDialogTarget::ActiveProfile { seg_a, seg_b } =>
+                    format!("Angle between segment {seg_a} and segment {seg_b}:"),
+                AngleDialogTarget::CrossProfile { pi_a, si_a, pi_b, si_b } =>
+                    format!("Angle between profile {pi_a} seg {si_a} and profile {pi_b} seg {si_b}:"),
+                AngleDialogTarget::CommittedProfile { pi, si_a, si_b } =>
+                    format!("Angle between segment {si_a} and segment {si_b} on profile {pi}:"),
+            };
+            ui.label(desc);
             ui.add_space(6.0);
 
             let mut deg: f64 = ctx.data_mut(|d| *d.get_temp_mut_or(angle_id, 90.0_f64));
@@ -677,9 +713,23 @@ pub fn build_ui(
 
                 if apply.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let degrees = ctx.data_mut(|d| *d.get_temp_mut_or::<f64>(angle_id, 90.0));
-                    actions.push(UiAction::SketchAddConstraint(SketchConstraint::Angle {
-                        seg_a, seg_b, degrees,
-                    }));
+                    match angle_target {
+                        AngleDialogTarget::ActiveProfile { seg_a, seg_b } => {
+                            actions.push(UiAction::SketchAddConstraint(SketchConstraint::Angle {
+                                seg_a, seg_b, degrees,
+                            }));
+                        }
+                        AngleDialogTarget::CrossProfile { pi_a, si_a, pi_b, si_b } => {
+                            actions.push(UiAction::SketchAddCrossConstraint(
+                                CommittedCrossConstraint::Angle { pi_a, si_a, pi_b, si_b, degrees }
+                            ));
+                        }
+                        AngleDialogTarget::CommittedProfile { pi, si_a, si_b } => {
+                            actions.push(UiAction::SketchAddCommittedConstraint(
+                                pi, SketchConstraint::Angle { seg_a: si_a, seg_b: si_b, degrees }
+                            ));
+                        }
+                    }
                 }
                 if cancel.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     actions.push(UiAction::SketchCancelAngleInput);
@@ -1119,6 +1169,42 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         }
                         if let Some(i) = remove_idx {
                             actions.push(UiAction::SketchRemoveConstraint(i));
+                        }
+                    });
+            }
+
+            // ── Cross-profile constraints ─────────────────────────────
+            if !sk.cross_constraints.is_empty() {
+                ui.separator();
+                ui.strong("Cross-Profile Constraints");
+                egui::ScrollArea::vertical()
+                    .id_salt("sketch_cross_constraints_scroll")
+                    .max_height(120.0)
+                    .min_scrolled_height(40.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let mut remove_idx: Option<usize> = None;
+                        for (i, cc) in sk.cross_constraints.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(cc.label());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(12.0);
+                                        let trash = egui::ImageButton::new(
+                                            egui::Image::new(icon_trash())
+                                                .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                                .tint(egui::Color32::from_rgb(210, 60, 60)),
+                                        );
+                                        if ui.add(trash).on_hover_text("Remove constraint").clicked() {
+                                            remove_idx = Some(i);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        if let Some(i) = remove_idx {
+                            actions.push(UiAction::SketchRemoveCrossConstraint(i));
                         }
                     });
             }

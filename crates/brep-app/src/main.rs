@@ -97,8 +97,8 @@ struct AppState {
     snap_segment: Option<usize>,
     /// Reference entity (origin / axis) the cursor is snapping to (if any).
     snap_ref: Option<editor::RefEntity>,
-    /// When Some((seg_a, seg_b)), the angle-input modal dialog is open.
-    angle_dialog: Option<(usize, usize)>,
+    /// When Some(target), the angle-input modal dialog is open.
+    angle_dialog: Option<editor::AngleDialogTarget>,
     /// When Some((target, initial_len)), the length-input modal dialog is open.
     /// `initial_len` is the measured length/distance at the moment the dialog was opened.
     length_dialog: Option<(editor::LengthTarget, f64)>,
@@ -426,7 +426,13 @@ impl AppState {
             UiAction::Save   => { self.do_save();    return false; }
             UiAction::SaveAs => { self.do_save_as(); return false; }
             UiAction::SketchBeginAngleInput { seg_a, seg_b } => {
-                self.angle_dialog = Some((*seg_a, *seg_b));
+                self.angle_dialog = Some(editor::AngleDialogTarget::ActiveProfile {
+                    seg_a: *seg_a, seg_b: *seg_b,
+                });
+                return false;
+            }
+            UiAction::SketchBeginCommittedAngleInput(target) => {
+                self.angle_dialog = Some(*target);
                 return false;
             }
             UiAction::SketchCancelAngleInput => {
@@ -442,8 +448,10 @@ impl AppState {
                 self.length_dialog = None;
                 return false;
             }
-            // Confirm (SketchAddConstraint) closes both dialogs.
-            UiAction::SketchAddConstraint(_) => {
+            // Confirm (SketchAddConstraint / SketchAddCrossConstraint / SketchAddCommittedConstraint) closes both dialogs.
+            UiAction::SketchAddConstraint(_)
+            | UiAction::SketchAddCrossConstraint(_)
+            | UiAction::SketchAddCommittedConstraint(_, _) => {
                 self.angle_dialog = None;
                 self.length_dialog = None;
             }
@@ -582,15 +590,41 @@ fn ray_plane_intersect(ray: &Ray, plane_origin: &Point3, plane_normal: &Vec3) ->
 fn current_length(target: editor::LengthTarget, sketch: &Option<editor::SketchState>) -> f64 {
     let Some(sk) = sketch else { return 1.0 };
     let n = sk.points.len();
-    if n == 0 { return 1.0; }
     match target {
-        editor::LengthTarget::Segment(seg) if seg < n => {
+        editor::LengthTarget::Segment(seg) if seg < n && n > 0 => {
             let a = sk.points[seg];
             let b = sk.points[(seg + 1) % n];
             (b - a).norm()
         }
-        editor::LengthTarget::Points(pa, pb) if pa < n && pb < n => {
+        editor::LengthTarget::Points(pa, pb) if pa < n && pb < n && n > 0 => {
             (sk.points[pb] - sk.points[pa]).norm()
+        }
+        editor::LengthTarget::CommittedSegment(pi, si) => {
+            (|| -> Option<f64> {
+                let cp = sk.committed_profiles.get(pi)?;
+                let gi_a = *cp.point_indices.get(si)?;
+                let gi_b = *cp.point_indices.get(si + 1)?;
+                let a = sk.global_points.get(gi_a)?;
+                let b = sk.global_points.get(gi_b)?;
+                Some((b - a).norm())
+            })().unwrap_or(1.0)
+        }
+        editor::LengthTarget::CommittedRadius(pi) => {
+            (|| -> Option<f64> {
+                let cp = sk.committed_profiles.get(pi)?;
+                let (gi0, gi1) = match &cp.shape {
+                    editor::ProfileShape::Circle => {
+                        (*cp.point_indices.get(0)?, *cp.point_indices.get(1)?)
+                    }
+                    editor::ProfileShape::Arc => {
+                        (*cp.point_indices.get(0)?, *cp.point_indices.get(2)?)
+                    }
+                    _ => return None,
+                };
+                let a = sk.global_points.get(gi0)?;
+                let b = sk.global_points.get(gi1)?;
+                Some((b - a).norm())
+            })().unwrap_or(1.0)
         }
         _ => 1.0,
     }
@@ -742,7 +776,22 @@ impl ApplicationHandler for App {
                         key_event.physical_key,
                         PhysicalKey::Code(KeyCode::Delete | KeyCode::Backspace)
                     ) {
-                        state.dispatch_action(UiAction::DeleteSelected);
+                        // In sketch mode, delete selected committed profiles/segments.
+                        let in_sketch = state.editor.sketch.is_some();
+                        if in_sketch {
+                            let indices: Vec<usize> = {
+                                let sk = state.editor.sketch.as_ref().unwrap();
+                                let mut set = std::collections::BTreeSet::new();
+                                if let Some(pi) = sk.committed_selection { set.insert(pi); }
+                                for &(pi, _) in &sk.committed_seg_selection { set.insert(pi); }
+                                set.into_iter().rev().collect()
+                            };
+                            for pi in indices {
+                                state.dispatch_action(UiAction::SketchDeleteCommittedProfile(pi));
+                            }
+                        } else {
+                            state.dispatch_action(UiAction::DeleteSelected);
+                        }
                     }
                     if matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Escape)) {
                         state.dispatch_action(UiAction::SketchAbortActive);
@@ -1064,20 +1113,18 @@ impl ApplicationHandler for App {
                         None => false,
                     };
 
-                    // Save drag history on the first actual movement (not on press, to avoid
-                    // recording a "Move point" entry for plain clicks / selections).
-                    let is_dragging = state.drag_vertex.is_some()
-                        || state.drag_committed.is_some()
-                        || state.drag_committed_curve.is_some();
-                    if is_dragging && has_moved && !state.drag_history_saved {
-                        state.editor.apply(UiAction::SketchSaveDragHistory);
-                        state.drag_history_saved = true;
-                    }
 
                     // If dragging a vertex, apply position update immediately.
                     if let Some(drag_vi) = state.drag_vertex {
                         if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
                             if let Some(cursor_pt) = state.sketch_cursor {
+                                if !state.drag_history_saved {
+                                    state.drag_history_saved = true;
+                                    if let Some(sk) = &mut state.editor.sketch {
+                                        let snap = editor::sketch_snapshot(sk);
+                                        sk.history.push("Move point", snap);
+                                    }
+                                }
                                 state.editor.drag_sketch_vertex(drag_vi, cursor_pt);
                             }
                         }
@@ -1087,18 +1134,15 @@ impl ApplicationHandler for App {
                     if let Some((pi, vi)) = state.drag_committed {
                         if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
                             if let Some(cursor_pt) = state.sketch_cursor {
-                                if let Some(sk) = &mut state.editor.sketch {
-                                    if let Some(cp) = sk.committed_profiles.get(pi).cloned() {
-                                        let plane = cp.plane;
-                                        let mut pts: Vec<_> = cp.point_indices.iter()
-                                            .map(|&gi| sk.global_points[gi])
-                                            .collect();
-                                        cp.shape.apply_vertex_drag(&mut pts, vi, cursor_pt, plane);
-                                        for (&gi, p) in cp.point_indices.iter().zip(pts.iter()) {
-                                            sk.global_points[gi] = *p;
-                                        }
+                                // Push history entry once at the start of a real drag.
+                                if !state.drag_history_saved {
+                                    state.drag_history_saved = true;
+                                    if let Some(sk) = &mut state.editor.sketch {
+                                        let snap = editor::sketch_snapshot(sk);
+                                        sk.history.push("Move point", snap);
                                     }
                                 }
+                                state.editor.drag_committed_vertex(pi, vi, cursor_pt);
                             }
                         }
                     }
@@ -1118,6 +1162,9 @@ impl ApplicationHandler for App {
                                             sk.global_points[gi] = *p;
                                         }
                                     }
+                                }
+                                if let Some(sk) = &mut state.editor.sketch {
+                                    editor::apply_cross_constraints(sk);
                                 }
                             }
                         }
