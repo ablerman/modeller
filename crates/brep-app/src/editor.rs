@@ -6,7 +6,11 @@ use std::time::Instant;
 use brep_algo::bvh::{Bvh, Ray};
 use brep_bool::{boolean_op, BooleanKind};
 use brep_core::{Point3, Vec3};
-use brep_sketch::{apply_constraints as sketch_apply, solve_constraints, SketchConstraint, SolveResult};
+use brep_sketch::{
+    apply_constraints as sketch_apply, SketchConstraint,
+    Constraint as BConstraint, GlobalPointId as BGlobalPointId,
+    PointId as BPointId, ProfileId as BProfileId,
+};
 use brep_topo::{
     primitives::{make_box, make_cone, make_cylinder, make_sphere},
     store::ShapeStore,
@@ -739,6 +743,8 @@ pub enum UiAction {
     SketchSelectCommittedSeg(Option<(usize, usize)>),
     /// Add a constraint to a specific committed profile and re-solve it.
     SketchAddCommittedConstraint(usize, SketchConstraint),
+    /// Remove a constraint from a committed profile by (profile_idx, constraint_idx).
+    SketchRemoveCommittedConstraint(usize, usize),
     /// Delete the action-log entry at the given index, restoring the sketch to
     /// the state captured before that action (discards all subsequent actions).
     SketchDeleteHistoryEntry(usize),
@@ -812,26 +818,6 @@ pub(crate) fn apply_constraints(sk: &mut SketchState) {
     }
 }
 
-/// Run the constraint solver on a committed profile, writing updated positions
-/// back into `global_points`.  Uses local (0-based) constraint indices.
-pub(crate) fn apply_committed_profile_constraints(
-    cp: &CommittedProfile,
-    global_points: &mut Vec<Point3>,
-    plane: SketchPlane,
-) {
-    if cp.constraints.is_empty() || cp.point_indices.len() < 2 { return; }
-    let (u, v) = plane.uv_axes();
-    let mut pts2d: Vec<[f64; 2]> = cp.point_indices.iter()
-        .map(|&gi| { let p = global_points[gi]; [p.coords.dot(&u), p.coords.dot(&v)] })
-        .collect();
-    let n = pts2d.len();
-    if solve_constraints(&mut pts2d, &cp.constraints, n) == SolveResult::Ok {
-        for (&gi, p2) in cp.point_indices.iter().zip(pts2d.iter()) {
-            global_points[gi] = Point3::origin() + u * p2[0] + v * p2[1];
-        }
-    }
-}
-
 /// Resolve a committed profile's point indices to a `Vec<Point3>` for read-only use
 /// (rendering, hit-testing, constraint building).
 pub(crate) fn resolved_points(cp: &CommittedProfile, global_points: &[Point3]) -> Vec<Point3> {
@@ -843,6 +829,250 @@ pub(crate) fn push_to_global(pts: &[Point3], global_points: &mut Vec<Point3>) ->
     let start = global_points.len();
     global_points.extend_from_slice(pts);
     (start..global_points.len()).collect()
+}
+
+// ── brep_sketch bridge ────────────────────────────────────────────────────────
+
+/// Convert an app `SketchPlane` to a `brep_sketch::Plane`.
+fn sketch_plane_to_bplane(sp: SketchPlane) -> brep_sketch::Plane {
+    match sp {
+        SketchPlane::XY => brep_sketch::Plane::xy(),
+        SketchPlane::XZ => brep_sketch::Plane::xz(),
+        SketchPlane::YZ => brep_sketch::Plane::yz(),
+    }
+}
+
+/// Translate a single-profile `SketchConstraint` (which uses flat point/segment indices)
+/// into a `brep_sketch::Constraint` bound to `pid`.
+fn sketch_constraint_to_bconstraint(c: &SketchConstraint, pid: BProfileId) -> Option<BConstraint> {
+    Some(match *c {
+        SketchConstraint::Horizontal { seg }
+            => BConstraint::Horizontal { profile: pid, seg },
+        SketchConstraint::Vertical { seg }
+            => BConstraint::Vertical { profile: pid, seg },
+        SketchConstraint::FixedLength { seg, value }
+            => BConstraint::FixedLength { profile: pid, seg, value },
+        SketchConstraint::Parallel { seg_a, seg_b }
+            => BConstraint::Parallel { profile: pid, seg_a, seg_b },
+        SketchConstraint::Perpendicular { seg_a, seg_b }
+            => BConstraint::Perpendicular { profile: pid, seg_a, seg_b },
+        SketchConstraint::EqualLength { seg_a, seg_b }
+            => BConstraint::EqualLength { profile: pid, seg_a, seg_b },
+        SketchConstraint::Angle { seg_a, seg_b, degrees }
+            => BConstraint::Angle { profile: pid, seg_a, seg_b, degrees },
+        SketchConstraint::PointOnOrigin { pt }
+            => BConstraint::PointOnOrigin { profile: pid, pt: BPointId(pt) },
+        SketchConstraint::PointOnXAxis { pt }
+            => BConstraint::PointOnXAxis { profile: pid, pt: BPointId(pt) },
+        SketchConstraint::PointOnYAxis { pt }
+            => BConstraint::PointOnYAxis { profile: pid, pt: BPointId(pt) },
+        SketchConstraint::PointFixed { pt, x, y }
+            => BConstraint::PointFixed { profile: pid, pt: BPointId(pt), u: x, v: y },
+        SketchConstraint::Coincident { pt_a, pt_b }
+            => BConstraint::Coincident { profile: pid, pt_a: BPointId(pt_a), pt_b: BPointId(pt_b) },
+        SketchConstraint::PointOnLine { pt, seg }
+            => BConstraint::PointOnLine { profile: pid, pt: BPointId(pt), seg },
+        SketchConstraint::PointDistance { pt_a, pt_b, value }
+            => BConstraint::PointDistance { profile: pid, pt_a: BPointId(pt_a), pt_b: BPointId(pt_b), value },
+        SketchConstraint::PointOnCircle { pt, center_u, center_v, radius }
+            => BConstraint::PointOnCircle { profile: pid, pt: BPointId(pt), center_u, center_v, radius },
+        SketchConstraint::HorizontalPair { pt_a, pt_b, perp_u, perp_v }
+            => BConstraint::HorizontalPair { profile_a: pid, pt_a: BPointId(pt_a), profile_b: pid, pt_b: BPointId(pt_b), perp_u, perp_v },
+        SketchConstraint::VerticalPair { pt_a, pt_b, perp_u, perp_v }
+            => BConstraint::VerticalPair { profile_a: pid, pt_a: BPointId(pt_a), profile_b: pid, pt_b: BPointId(pt_b), perp_u, perp_v },
+    })
+}
+
+/// Translate a `CommittedCrossConstraint` into a `brep_sketch::Constraint`.
+///
+/// `pid_map[i]` is the `BProfileId` assigned to `committed_profiles[i]`.
+/// `gid_map[gi]` is the `BGlobalPointId` assigned to `global_points[gi]`.
+///
+/// Returns `None` if any referenced index is out of range.
+fn cross_constraint_to_bconstraint(
+    cc: &CommittedCrossConstraint,
+    pid_map: &[BProfileId],
+    gid_map: &[BGlobalPointId],
+    bsketch: &brep_sketch::Sketch,
+) -> Option<BConstraint> {
+    Some(match *cc {
+        CommittedCrossConstraint::Parallel { pi_a, si_a, pi_b, si_b } =>
+            BConstraint::CrossParallel {
+                profile_a: *pid_map.get(pi_a)?, seg_a: si_a,
+                profile_b: *pid_map.get(pi_b)?, seg_b: si_b,
+            },
+        CommittedCrossConstraint::Perpendicular { pi_a, si_a, pi_b, si_b } =>
+            BConstraint::CrossPerpendicular {
+                profile_a: *pid_map.get(pi_a)?, seg_a: si_a,
+                profile_b: *pid_map.get(pi_b)?, seg_b: si_b,
+            },
+        CommittedCrossConstraint::EqualLength { pi_a, si_a, pi_b, si_b } =>
+            BConstraint::CrossEqualLength {
+                profile_a: *pid_map.get(pi_a)?, seg_a: si_a,
+                profile_b: *pid_map.get(pi_b)?, seg_b: si_b,
+            },
+        CommittedCrossConstraint::Angle { pi_a, si_a, pi_b, si_b, degrees } =>
+            BConstraint::CrossAngle {
+                profile_a: *pid_map.get(pi_a)?, seg_a: si_a,
+                profile_b: *pid_map.get(pi_b)?, seg_b: si_b,
+                degrees,
+            },
+        CommittedCrossConstraint::HorizontalPair { pi_a, vi_a, pi_b, vi_b, perp_u, perp_v } =>
+            BConstraint::HorizontalPair {
+                profile_a: *pid_map.get(pi_a)?, pt_a: BPointId(vi_a),
+                profile_b: *pid_map.get(pi_b)?, pt_b: BPointId(vi_b),
+                perp_u, perp_v,
+            },
+        CommittedCrossConstraint::VerticalPair { pi_a, vi_a, pi_b, vi_b, perp_u, perp_v } =>
+            BConstraint::VerticalPair {
+                profile_a: *pid_map.get(pi_a)?, pt_a: BPointId(vi_a),
+                profile_b: *pid_map.get(pi_b)?, pt_b: BPointId(vi_b),
+                perp_u, perp_v,
+            },
+        CommittedCrossConstraint::Symmetric { pi_a, si_a, pi_b, si_b, gi_p } => {
+            let pa = *pid_map.get(pi_a)?;
+            let pb = *pid_map.get(pi_b)?;
+            let gid = *gid_map.get(gi_p)?;
+            // Find which profile/point has this global ID as its reference.
+            let (profile_pt, pt) = find_profile_for_global_id(bsketch, gid, pid_map)?;
+            BConstraint::Symmetric {
+                profile_seg_a: pa, seg_a: si_a,
+                profile_seg_b: pb, seg_b: si_b,
+                profile_pt, pt,
+            }
+        }
+        CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c } =>
+            BConstraint::SymmetricPoints {
+                profile_a: *pid_map.get(pi_a)?, pt_a: BPointId(vi_a),
+                profile_b: *pid_map.get(pi_b)?, pt_b: BPointId(vi_b),
+                profile_c: *pid_map.get(pi_c)?, pt_c: BPointId(vi_c),
+            },
+    })
+}
+
+/// Search `pid_map` profiles in `bsketch` for one that contains a point
+/// backed by `gid`.  Returns `(ProfileId, PointId)` of the first match.
+fn find_profile_for_global_id(
+    bsketch: &brep_sketch::Sketch,
+    gid: BGlobalPointId,
+    pid_map: &[BProfileId],
+) -> Option<(BProfileId, BPointId)> {
+    for &pid in pid_map {
+        if let Some(prof) = bsketch.profile(pid) {
+            for pt_id in prof.point_ids() {
+                if prof.global_id(pt_id) == Some(gid) {
+                    return Some((pid, pt_id));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Intermediate result of building a `brep_sketch::Sketch` from `SketchState`.
+struct CommittedSketchBuild {
+    sketch:  brep_sketch::Sketch,
+    pid_map: Vec<BProfileId>,      // committed_profiles[i] → ProfileId
+    gid_map: Vec<BGlobalPointId>,  // global_points[i] → GlobalPointId
+}
+
+/// Build a `brep_sketch::Sketch` from the committed profiles and global points.
+///
+/// Each committed profile is created with its points as shared global points.
+/// Per-profile constraints are added as `Constraint` variants.
+///
+/// The active profile (`sk.points` / `sk.constraints`) is **not** included —
+/// it is solved separately by `apply_constraints`.
+fn build_committed_sketch(sk: &SketchState) -> CommittedSketchBuild {
+    let (u, v) = sk.plane.uv_axes();
+    let to_uv = |p: Point3| -> (f64, f64) { (p.coords.dot(&u), p.coords.dot(&v)) };
+
+    let mut bsketch = brep_sketch::Sketch::new(sketch_plane_to_bplane(sk.plane), "");
+
+    // Register every global point; keep mapping gi → GlobalPointId.
+    let gid_map: Vec<BGlobalPointId> = sk.global_points.iter()
+        .map(|&p| { let (pu, pv) = to_uv(p); bsketch.alloc_global_point((pu, pv)) })
+        .collect();
+
+    // Register every committed profile; keep mapping pi → ProfileId.
+    let mut pid_map: Vec<BProfileId> = Vec::with_capacity(sk.committed_profiles.len());
+    for cp in &sk.committed_profiles {
+        let pid = match cp.shape {
+            ProfileShape::Polyline => bsketch.add_polyline_profile(cp.closed),
+            ProfileShape::Circle   => bsketch.alloc_circle_profile(),
+            ProfileShape::Arc      => bsketch.alloc_arc_profile(),
+        };
+        for &gi in &cp.point_indices {
+            if let Some(&gid) = gid_map.get(gi) {
+                let _ = bsketch.push_shared_point(pid, gid);
+            }
+        }
+        for c in &cp.constraints {
+            if let Some(bc) = sketch_constraint_to_bconstraint(c, pid) {
+                let _ = bsketch.add_constraint(bc);
+            }
+        }
+        pid_map.push(pid);
+    }
+
+    CommittedSketchBuild { sketch: bsketch, pid_map, gid_map }
+}
+
+/// Solve all committed-profile constraints and cross-profile constraints,
+/// writing updated positions back to `sk.global_points`.
+///
+/// This replaces `apply_committed_profile_constraints` +
+/// `apply_cross_constraints` with a unified call into `brep_sketch::Sketch`.
+pub(crate) fn apply_all_constraints(sk: &mut SketchState) {
+    if sk.committed_profiles.is_empty() { return; }
+
+    let mut build = build_committed_sketch(sk);
+
+    // Add cross-profile constraints.
+    let cross = sk.cross_constraints.clone();
+    for cc in &cross {
+        if let Some(bc) = cross_constraint_to_bconstraint(
+            cc, &build.pid_map, &build.gid_map, &build.sketch,
+        ) {
+            let _ = build.sketch.add_constraint(bc);
+        }
+    }
+
+    let report = build.sketch.solve();
+
+    // Even if not fully converged, write back whatever the solver produced
+    // for the global points that did converge.
+    let (u, v) = sk.plane.uv_axes();
+    let from_uv = |pu: f64, pv: f64| -> Point3 { Point3::origin() + u * pu + v * pv };
+
+    for (gi, &gid) in build.gid_map.iter().enumerate() {
+        if let Ok(uv) = build.sketch.global_point_uv(gid) {
+            sk.global_points[gi] = from_uv(uv[0], uv[1]);
+        }
+    }
+
+    // For profiles whose points aren't all global (e.g. future private-point
+    // profiles), also write back directly — currently all points are shared,
+    // so this is a no-op but kept for safety.
+    for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+        let pid = build.pid_map[pi];
+        if let Some(prof) = build.sketch.profile(pid) {
+            for (local_idx, &gi) in cp.point_indices.iter().enumerate() {
+                if let Some((pu, pv)) = prof.point(BPointId(local_idx)) {
+                    // Only update if this point has no GlobalPointId (private point).
+                    if prof.global_id(BPointId(local_idx)).is_none() {
+                        if gi < sk.global_points.len() {
+                            sk.global_points[gi] = from_uv(pu, pv);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !report.converged {
+        sk.constraints_conflict = true;
+    }
 }
 
 /// Attempt to assemble a simple head-to-tail chain of 2-point Polyline profiles into
@@ -889,149 +1119,6 @@ pub(crate) fn sketch_snapshot(sk: &SketchState) -> SketchSnapshot {
         committed_profiles: sk.committed_profiles.clone(),
         global_points:      sk.global_points.clone(),
         cross_constraints:  sk.cross_constraints.clone(),
-    }
-}
-
-/// Solve all cross-profile constraints, adjusting `global_points` in place.
-/// Uses a 4-point synthetic array per constraint so the existing solver can be reused.
-pub(crate) fn apply_cross_constraints(sk: &mut SketchState) {
-    if sk.cross_constraints.is_empty() { return; }
-    let plane = sk.plane;
-    let (u, v) = plane.uv_axes();
-
-    // Helper: get the two global point indices for a committed segment (pi, si).
-    let seg_gis = |profiles: &[CommittedProfile], pi: usize, si: usize| -> Option<(usize, usize)> {
-        let cp = profiles.get(pi)?;
-        let n = cp.point_indices.len();
-        if n == 0 { return None; }
-        let gi0 = cp.point_indices[si % n];
-        let gi1 = cp.point_indices[(si + 1) % n];
-        Some((gi0, gi1))
-    };
-
-    // Multiple solve passes so cross-constraints and per-profile constraints converge together.
-    for _ in 0..3 {
-        // Per-profile constraints first.
-        let profiles_snapshot = sk.committed_profiles.clone();
-        for cp in &profiles_snapshot {
-            apply_committed_profile_constraints(cp, &mut sk.global_points, plane);
-        }
-
-        // Then cross-profile constraints.
-        let cross = sk.cross_constraints.clone();
-        for cc in &cross {
-            match cc {
-                // ── Segment-based (4-point synthetic array) ───────────────────
-                CommittedCrossConstraint::Parallel { pi_a, si_a, pi_b, si_b }
-                | CommittedCrossConstraint::Perpendicular { pi_a, si_a, pi_b, si_b }
-                | CommittedCrossConstraint::EqualLength { pi_a, si_a, pi_b, si_b }
-                | CommittedCrossConstraint::Angle { pi_a, si_a, pi_b, si_b, .. } => {
-                    let Some((gi_a0, gi_a1)) = seg_gis(&sk.committed_profiles, *pi_a, *si_a) else { continue };
-                    let Some((gi_b0, gi_b1)) = seg_gis(&sk.committed_profiles, *pi_b, *si_b) else { continue };
-                    let constraint = match cc {
-                        CommittedCrossConstraint::Parallel      { .. } => SketchConstraint::Parallel { seg_a: 0, seg_b: 2 },
-                        CommittedCrossConstraint::Perpendicular { .. } => SketchConstraint::Perpendicular { seg_a: 0, seg_b: 2 },
-                        CommittedCrossConstraint::EqualLength   { .. } => SketchConstraint::EqualLength { seg_a: 0, seg_b: 2 },
-                        CommittedCrossConstraint::Angle { degrees, .. } => SketchConstraint::Angle { seg_a: 0, seg_b: 2, degrees: *degrees },
-                        _ => unreachable!(),
-                    };
-                    let gp = &sk.global_points;
-                    let pt = |gi: usize| -> [f64; 2] { let p = gp[gi]; [p.coords.dot(&u), p.coords.dot(&v)] };
-                    let mut pts = vec![pt(gi_a0), pt(gi_a1), pt(gi_b0), pt(gi_b1)];
-                    if solve_constraints(&mut pts, &[constraint], 4) == SolveResult::Ok {
-                        sk.global_points[gi_a0] = Point3::origin() + u * pts[0][0] + v * pts[0][1];
-                        sk.global_points[gi_a1] = Point3::origin() + u * pts[1][0] + v * pts[1][1];
-                        sk.global_points[gi_b0] = Point3::origin() + u * pts[2][0] + v * pts[2][1];
-                        sk.global_points[gi_b1] = Point3::origin() + u * pts[3][0] + v * pts[3][1];
-                    }
-                }
-                // ── Point-based (2-point synthetic array) ─────────────────────
-                CommittedCrossConstraint::HorizontalPair { pi_a, vi_a, pi_b, vi_b, .. }
-                | CommittedCrossConstraint::VerticalPair { pi_a, vi_a, pi_b, vi_b, .. } => {
-                    let gi_a = match sk.committed_profiles.get(*pi_a).and_then(|cp| cp.point_indices.get(*vi_a)) {
-                        Some(&gi) => gi, None => continue,
-                    };
-                    let gi_b = match sk.committed_profiles.get(*pi_b).and_then(|cp| cp.point_indices.get(*vi_b)) {
-                        Some(&gi) => gi, None => continue,
-                    };
-                    let constraint = match cc {
-                        CommittedCrossConstraint::HorizontalPair { perp_u, perp_v, .. } =>
-                            SketchConstraint::HorizontalPair { pt_a: 0, pt_b: 1, perp_u: *perp_u, perp_v: *perp_v },
-                        CommittedCrossConstraint::VerticalPair { perp_u, perp_v, .. } =>
-                            SketchConstraint::VerticalPair { pt_a: 0, pt_b: 1, perp_u: *perp_u, perp_v: *perp_v },
-                        _ => unreachable!(),
-                    };
-                    let gp = &sk.global_points;
-                    let pt = |gi: usize| -> [f64; 2] { let p = gp[gi]; [p.coords.dot(&u), p.coords.dot(&v)] };
-                    let mut pts = vec![pt(gi_a), pt(gi_b)];
-                    if solve_constraints(&mut pts, &[constraint], 2) == SolveResult::Ok {
-                        sk.global_points[gi_a] = Point3::origin() + u * pts[0][0] + v * pts[0][1];
-                        sk.global_points[gi_b] = Point3::origin() + u * pts[1][0] + v * pts[1][1];
-                    }
-                }
-                CommittedCrossConstraint::Symmetric { pi_a, si_a, pi_b, si_b, gi_p } => {
-                    let Some((gi_a0, gi_a1)) = seg_gis(&sk.committed_profiles, *pi_a, *si_a) else { continue };
-                    let Some((gi_b0, gi_b1)) = seg_gis(&sk.committed_profiles, *pi_b, *si_b) else { continue };
-                    let gi_p_val = *gi_p;
-                    if gi_p_val >= sk.global_points.len() { continue }
-                    let p2d = |p: Point3| -> (f64, f64) { (p.coords.dot(&u), p.coords.dot(&v)) };
-                    let (ax0, ay0) = p2d(sk.global_points[gi_a0]);
-                    let (ax1, ay1) = p2d(sk.global_points[gi_a1]);
-                    let (bx0, by0) = p2d(sk.global_points[gi_b0]);
-                    let (bx1, by1) = p2d(sk.global_points[gi_b1]);
-                    let (mut px, mut py) = p2d(sk.global_points[gi_p_val]);
-                    // Perpendicular unit normals to each segment.
-                    let (n1x, n1y) = {
-                        let (dx, dy) = (ax1 - ax0, ay1 - ay0);
-                        let l = (dx * dx + dy * dy).sqrt();
-                        if l < 1e-10 { continue } else { (-dy / l, dx / l) }
-                    };
-                    let (n2x, n2y) = {
-                        let (dx, dy) = (bx1 - bx0, by1 - by0);
-                        let l = (dx * dx + dy * dy).sqrt();
-                        if l < 1e-10 { continue } else { (-dy / l, dx / l) }
-                    };
-                    // Newton iterate: minimize f = d1² - d2²
-                    for _ in 0..20 {
-                        let d1 = n1x * (px - ax0) + n1y * (py - ay0);
-                        let d2 = n2x * (px - bx0) + n2y * (py - by0);
-                        let f = d1 * d1 - d2 * d2;
-                        if f.abs() < 1e-9 { break; }
-                        let (gx, gy) = (2.0 * d1 * n1x - 2.0 * d2 * n2x, 2.0 * d1 * n1y - 2.0 * d2 * n2y);
-                        let g2 = gx * gx + gy * gy;
-                        if g2 < 1e-12 { break; }
-                        px -= f / g2 * gx;
-                        py -= f / g2 * gy;
-                    }
-                    sk.global_points[gi_p_val] = Point3::origin() + u * px + v * py;
-                }
-                CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c } => {
-                    let Some(&gi_a) = sk.committed_profiles.get(*pi_a).and_then(|cp| cp.point_indices.get(*vi_a)) else { continue };
-                    let Some(&gi_b) = sk.committed_profiles.get(*pi_b).and_then(|cp| cp.point_indices.get(*vi_b)) else { continue };
-                    let Some(&gi_c) = sk.committed_profiles.get(*pi_c).and_then(|cp| cp.point_indices.get(*vi_c)) else { continue };
-                    if gi_a >= sk.global_points.len() || gi_b >= sk.global_points.len() || gi_c >= sk.global_points.len() { continue }
-                    let p2d = |p: Point3| -> (f64, f64) { (p.coords.dot(&u), p.coords.dot(&v)) };
-                    let (ax, ay) = p2d(sk.global_points[gi_a]);
-                    let (bx, by) = p2d(sk.global_points[gi_b]);
-                    let (mut cx, mut cy) = p2d(sk.global_points[gi_c]);
-                    // Newton iterate: minimize f = dist(A,C)² - dist(B,C)²
-                    // f  = (cx-ax)² + (cy-ay)² - (cx-bx)² - (cy-by)²
-                    // ∇f = [2(cx-ax) - 2(cx-bx), 2(cy-ay) - 2(cy-by)]
-                    for _ in 0..20 {
-                        let dax = cx - ax; let day = cy - ay;
-                        let dbx = cx - bx; let dby = cy - by;
-                        let f = dax*dax + day*day - dbx*dbx - dby*dby;
-                        if f.abs() < 1e-9 { break; }
-                        let (gx, gy) = (2.0*dax - 2.0*dbx, 2.0*day - 2.0*dby);
-                        let g2 = gx*gx + gy*gy;
-                        if g2 < 1e-12 { break; }
-                        cx -= f / g2 * gx;
-                        cy -= f / g2 * gy;
-                    }
-                    sk.global_points[gi_c] = Point3::origin() + u * cx + v * cy;
-                }
-            }
-        }
     }
 }
 
@@ -1203,7 +1290,7 @@ impl EditorState {
                             sk.cross_constraints   = prev.cross_constraints;
                             sk.tool_in_progress    = None;
                             apply_constraints(sk);
-                            apply_cross_constraints(sk);
+                            apply_all_constraints(sk);
                         }
                     }
                     false
@@ -1230,7 +1317,7 @@ impl EditorState {
                             sk.cross_constraints   = next.cross_constraints;
                             sk.tool_in_progress    = None;
                             apply_constraints(sk);
-                            apply_cross_constraints(sk);
+                            apply_all_constraints(sk);
                         }
                     }
                     false
@@ -1705,10 +1792,19 @@ impl EditorState {
                     if pi < sk.committed_profiles.len() {
                         let label = constraint_action_label(&c);
                         sk.history.push(label, sketch_snapshot(sk));
-                        let plane = sk.committed_profiles[pi].plane.unwrap_or(sk.plane);
                         sk.committed_profiles[pi].constraints.push(c);
-                        let cp = &sk.committed_profiles[pi];
-                        apply_committed_profile_constraints(cp, &mut sk.global_points, plane);
+                        apply_all_constraints(sk);
+                    }
+                }
+                false
+            }
+            UiAction::SketchRemoveCommittedConstraint(pi, ci) => {
+                if let Some(sk) = &mut self.sketch {
+                    let valid = sk.committed_profiles.get(pi)
+                        .map_or(false, |cp| ci < cp.constraints.len());
+                    if valid {
+                        sk.history.push("Remove constraint", sketch_snapshot(sk));
+                        sk.committed_profiles[pi].constraints.remove(ci);
                     }
                 }
                 false
@@ -1741,7 +1837,7 @@ impl EditorState {
                     sk.history.push(cc.label(), sketch_snapshot(sk));
                     sk.cross_constraints.push(cc);
                     sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedSegment(..)));
-                    apply_cross_constraints(sk);
+                    apply_all_constraints(sk);
                 }
                 false
             }
@@ -1821,7 +1917,7 @@ impl EditorState {
                         sk.cross_constraints  = snap.cross_constraints;
                         sk.tool_in_progress   = None;
                         apply_constraints(sk);
-                        apply_cross_constraints(sk);
+                        apply_all_constraints(sk);
                     }
                 }
                 false
@@ -1933,11 +2029,11 @@ impl EditorState {
             let pin_y = target.coords.dot(&v);
             let pin = SketchConstraint::PointFixed { pt: vi, x: pin_x, y: pin_y };
             sk.committed_profiles[pi].constraints.push(pin);
-            apply_committed_profile_constraints(&sk.committed_profiles[pi], &mut sk.global_points, plane);
+            apply_all_constraints(sk);
             sk.committed_profiles[pi].constraints.pop();
+        } else {
+            apply_all_constraints(sk);
         }
-
-        apply_cross_constraints(sk);
     }
 
     /// Cast a ray from the given screen pixel and return the index of the first
@@ -2247,5 +2343,55 @@ mod tests {
         // Undo inside the sketch: constraint should be removed.
         ed.apply(UiAction::Undo);
         assert_eq!(ed.sketch.as_ref().unwrap().constraints.len(), 0);
+    }
+
+    #[test]
+    fn arc_center_on_origin_holds_during_drag() {
+        let mut ed = EditorState::new_empty();
+
+        // Enter sketch and switch to arc tool.
+        ed.apply(UiAction::EnterSketch(SketchPlane::XY));
+        ed.apply(UiAction::SketchSetTool(DrawTool::Arc));
+
+        // Draw an arc with 3 clicks:
+        //   start (-1, 0), end (1, 0), third point (0, 1) which gets projected
+        //   onto the perpendicular bisector of the chord → center near (0, ~0.5).
+        ed.apply(UiAction::SketchAddPoint(Point3::new(-1.0, 0.0, 0.0)));
+        ed.apply(UiAction::SketchAddPoint(Point3::new( 1.0, 0.0, 0.0)));
+        ed.apply(UiAction::SketchAddPoint(Point3::new( 0.0, 1.0, 0.0)));
+
+        assert_eq!(
+            ed.sketch.as_ref().unwrap().committed_profiles.len(), 1,
+            "arc should be committed after 3 clicks"
+        );
+
+        // Apply PointOnOrigin to the center (vi=2).
+        ed.apply(UiAction::SketchAddCommittedConstraint(
+            0,
+            SketchConstraint::PointOnOrigin { pt: 2 },
+        ));
+
+        // Verify center snapped to origin.
+        {
+            let sk = ed.sketch.as_ref().unwrap();
+            let pts = resolved_points(&sk.committed_profiles[0], &sk.global_points);
+            assert!(
+                pts[2].coords.norm() < 1e-6,
+                "center should be at origin after constraint, got {:?}", pts[2]
+            );
+        }
+
+        // Drag the start handle (vi=0) to a new position.
+        ed.drag_committed_vertex(0, 0, Point3::new(-2.0, 0.0, 0.0));
+
+        // Center must remain at origin after the drag.
+        {
+            let sk = ed.sketch.as_ref().unwrap();
+            let pts = resolved_points(&sk.committed_profiles[0], &sk.global_points);
+            assert!(
+                pts[2].coords.norm() < 1e-6,
+                "center should remain at origin after dragging start handle, got {:?}", pts[2]
+            );
+        }
     }
 }

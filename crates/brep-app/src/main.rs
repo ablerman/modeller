@@ -1164,7 +1164,7 @@ impl ApplicationHandler for App {
                                     }
                                 }
                                 if let Some(sk) = &mut state.editor.sketch {
-                                    editor::apply_cross_constraints(sk);
+                                    editor::apply_all_constraints(sk);
                                 }
                             }
                         }

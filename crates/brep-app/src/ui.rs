@@ -1064,7 +1064,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
             // ── Elements ──────────────────────────────────────────────
             ui.strong("Elements");
             let n = sk.points.len();
-            if n == 0 {
+            if n == 0 && sk.committed_profiles.is_empty() {
                 ui.label(egui::RichText::new("(none)").italics().weak());
             } else {
                 // Detect selection changes so we can scroll the new item into view.
@@ -1126,7 +1126,9 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
 
             // ── Constraints ───────────────────────────────────────────
             ui.strong("Constraints");
-            if sk.constraints.is_empty() {
+            let has_any_constraints = !sk.constraints.is_empty()
+                || sk.committed_profiles.iter().any(|cp| !cp.constraints.is_empty());
+            if !has_any_constraints {
                 ui.label(egui::RichText::new("(none)").italics().weak());
             } else {
                 egui::ScrollArea::vertical()
@@ -1135,6 +1137,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                     .min_scrolled_height(60.0)
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
+                        // Active profile constraints.
                         let mut remove_idx: Option<usize> = None;
                         for (i, c) in sk.constraints.iter().enumerate() {
                             let is_violated =
@@ -1170,6 +1173,35 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         }
                         if let Some(i) = remove_idx {
                             actions.push(UiAction::SketchRemoveConstraint(i));
+                        }
+                        // Per-profile constraints (arcs, circles, rectangles).
+                        let mut remove_committed: Option<(usize, usize)> = None;
+                        for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            if cp.constraints.is_empty() { continue; }
+                            let profile_label = cp.shape.label(pi);
+                            for (ci, c) in cp.constraints.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add(list_icon(constraint_icon(c)));
+                                    ui.label(format!("{} — {}", constraint_text(c), profile_label));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_space(12.0);
+                                            let trash = egui::ImageButton::new(
+                                                egui::Image::new(icon_trash())
+                                                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                                    .tint(egui::Color32::from_rgb(210, 60, 60)),
+                                            );
+                                            if ui.add(trash).on_hover_text("Remove constraint").clicked() {
+                                                remove_committed = Some((pi, ci));
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        }
+                        if let Some((pi, ci)) = remove_committed {
+                            actions.push(UiAction::SketchRemoveCommittedConstraint(pi, ci));
                         }
                     });
             }
