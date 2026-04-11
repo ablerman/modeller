@@ -798,16 +798,6 @@ impl ApplicationHandler for App {
                                     }
                                     // Drag already moved the boundary point; nothing else needed.
                                 }
-                                // Committed polyline segment click.
-                                if is_click && state.drag_committed.is_none() {
-                                    if let Some((pi, si)) = state.snap_committed_seg {
-                                        let is_pointer = state.editor.sketch.as_ref()
-                                            .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
-                                        if is_pointer {
-                                            state.editor.apply(UiAction::SketchSelectCommittedSeg(Some((pi, si))));
-                                        }
-                                    }
-                                }
                                 // Committed vertex drag released.
                                 if let Some((pi, vi)) = state.drag_committed.take() {
                                     if is_click {
@@ -974,6 +964,13 @@ impl ApplicationHandler for App {
                                                     state.editor.apply(UiAction::SketchSelectConstraint(ci));
                                                 } else if let Some(seg) = state.snap_segment {
                                                     state.editor.apply(UiAction::SketchSelectSegment(seg));
+                                                } else if let Some((pi, si)) = state.snap_committed_seg {
+                                                    // Pointer + click on a committed polyline segment.
+                                                    let is_pointer = state.editor.sketch.as_ref()
+                                                        .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                                    if is_pointer {
+                                                        state.editor.apply(UiAction::SketchSelectCommittedSeg(Some((pi, si))));
+                                                    }
                                                 } else {
                                                     let is_pointer = state.editor.sketch.as_ref()
                                                         .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
