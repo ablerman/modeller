@@ -611,6 +611,11 @@ pub enum UiAction {
     /// Push the current sketch state onto the history stack with label "Move point".
     /// Called at the start of a vertex drag so the move is undoable.
     SketchSaveDragHistory,
+    /// Merge two global points: replace every occurrence of `gi_replace` in
+    /// `committed_profiles[*].point_indices` with `gi_keep`, then snap the kept
+    /// point to the average of the two positions.  Makes cross-profile endpoints
+    /// structurally coincident without a separate constraint.
+    SketchMergeGlobalPoints { gi_keep: usize, gi_replace: usize },
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -1446,6 +1451,29 @@ impl EditorState {
                     sk.history.push("Move point", sketch_snapshot(sk));
                 }
                 false
+            }
+            UiAction::SketchMergeGlobalPoints { gi_keep, gi_replace } => {
+                if let Some(sk) = &mut self.sketch {
+                    if gi_keep < sk.global_points.len() && gi_replace < sk.global_points.len()
+                        && gi_keep != gi_replace
+                    {
+                        sk.history.push("Merge points", sketch_snapshot(sk));
+                        // Snap gi_keep to the average of the two positions.
+                        let p_keep    = sk.global_points[gi_keep];
+                        let p_replace = sk.global_points[gi_replace];
+                        sk.global_points[gi_keep] = Point3::origin()
+                            + (p_keep.coords + p_replace.coords) * 0.5;
+                        // Repoint every profile that referenced gi_replace to gi_keep.
+                        for cp in &mut sk.committed_profiles {
+                            for gi in &mut cp.point_indices {
+                                if *gi == gi_replace { *gi = gi_keep; }
+                            }
+                        }
+                        sk.committed_pt_selection.clear();
+                        apply_constraints(sk);
+                    }
+                }
+                true
             }
             UiAction::SketchDeleteHistoryEntry(idx) => {
                 if let Some(sk) = &mut self.sketch {

@@ -218,13 +218,24 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
             None => return vec![],
         }
     } else if sk.committed_pt_selection.len() == 2 && sk.pt_selection.is_empty() && n_sel == 0 {
-        // Two committed vertices in the same profile → Coincident.
         let (pi1, vi1) = sk.committed_pt_selection[0];
         let (pi2, vi2) = sk.committed_pt_selection[1];
-        if pi1 != pi2 { return vec![]; }
-        return vec![UiAction::SketchAddCommittedConstraint(
-            pi1, SketchConstraint::Coincident { pt_a: vi1, pt_b: vi2 },
-        )];
+        if pi1 == pi2 {
+            // Same profile → per-profile Coincident constraint.
+            return vec![UiAction::SketchAddCommittedConstraint(
+                pi1, SketchConstraint::Coincident { pt_a: vi1, pt_b: vi2 },
+            )];
+        } else {
+            // Cross-profile → merge the two global points structurally.
+            let gi1 = sk.committed_profiles.get(pi1)
+                .and_then(|cp| cp.point_indices.get(vi1).copied());
+            let gi2 = sk.committed_profiles.get(pi2)
+                .and_then(|cp| cp.point_indices.get(vi2).copied());
+            if let (Some(gi_keep), Some(gi_replace)) = (gi1, gi2) {
+                return vec![UiAction::SketchMergeGlobalPoints { gi_keep, gi_replace }];
+            }
+            return vec![];
+        }
     } else if sk.committed_pt_selection.len() == 1 && sk.committed_seg_selection.len() == 1
         && sk.pt_selection.is_empty() && n_sel == 0
     {

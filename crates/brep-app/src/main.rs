@@ -5,6 +5,7 @@
 
 mod commands;
 mod editor;
+mod gizmo;
 mod icons;
 mod profile_shapes;
 mod sketch_tools;
@@ -119,6 +120,9 @@ struct AppState {
     last_click_time: Option<std::time::Instant>,
     /// Screen position of the most recent click (for double-click detection).
     last_click_pos: Option<(f32, f32)>,
+    /// Whether SketchSaveDragHistory has been pushed for the current drag gesture.
+    /// Reset to false on mouse-press; set to true on the first actual movement.
+    drag_history_saved: bool,
 }
 
 impl AppState {
@@ -228,6 +232,7 @@ impl AppState {
             snap_committed_seg: None,
             last_click_time: None,
             last_click_pos: None,
+            drag_history_saved: false,
         }
     }
 
@@ -763,15 +768,14 @@ impl ApplicationHandler for App {
                                     .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
                                 if is_pointer && state.snap_committed.is_some() {
                                     state.drag_committed = state.snap_committed;
-                                    // Push history before the first drag move so the action
-                                    // is undoable.  (The snapshot captures pre-drag state.)
-                                    state.editor.apply(UiAction::SketchSaveDragHistory);
+                                    state.drag_history_saved = false;
                                 } else if is_pointer && state.snap_committed_curve.is_some() {
                                     state.drag_committed_curve = state.snap_committed_curve;
+                                    state.drag_history_saved = false;
                                 } else if state.snap_vertex.is_some() {
                                     // Begin active-profile vertex drag.
                                     state.drag_vertex = state.snap_vertex;
-                                    state.editor.apply(UiAction::SketchSaveDragHistory);
+                                    state.drag_history_saved = false;
                                 }
                             }
                         }
@@ -1062,6 +1066,16 @@ impl ApplicationHandler for App {
                         }
                         None => false,
                     };
+
+                    // Save drag history on the first actual movement (not on press, to avoid
+                    // recording a "Move point" entry for plain clicks / selections).
+                    let is_dragging = state.drag_vertex.is_some()
+                        || state.drag_committed.is_some()
+                        || state.drag_committed_curve.is_some();
+                    if is_dragging && has_moved && !state.drag_history_saved {
+                        state.editor.apply(UiAction::SketchSaveDragHistory);
+                        state.drag_history_saved = true;
+                    }
 
                     // If dragging a vertex, apply position update immediately.
                     if let Some(drag_vi) = state.drag_vertex {
