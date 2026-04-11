@@ -7,7 +7,7 @@ use brep_algo::bvh::{Bvh, Ray};
 use brep_bool::{boolean_op, BooleanKind};
 use brep_core::{Point3, Vec3};
 use brep_sketch::{
-    apply_constraints as sketch_apply, SketchConstraint,
+    apply_constraints as sketch_apply, compute_dof, SketchConstraint,
     Constraint as BConstraint, GlobalPointId as BGlobalPointId,
     PointId as BPointId, ProfileId as BProfileId,
 };
@@ -238,6 +238,8 @@ pub struct SketchState {
     pub violated_constraints: Vec<bool>,
     /// Indices of currently selected constraints (for highlighting).
     pub constraint_selection: Vec<usize>,
+    /// Whether the sketch is fully constrained (DOF = 0) after the last solve.
+    pub fully_constrained: bool,
     /// Independent undo/redo stack for sketch edits.
     pub history: SketchHistory,
     /// Currently active drawing tool.
@@ -802,7 +804,7 @@ pub struct EditorState {
 
 /// Run the constraint solver on the sketch, updating point positions in place.
 pub(crate) fn apply_constraints(sk: &mut SketchState) {
-    if sk.constraints.is_empty() || sk.points.len() < 2 { return; }
+    if sk.constraints.is_empty() || sk.points.is_empty() { return; }
     let (u, v) = sk.plane.uv_axes();
     let mut pts2d: Vec<[f64; 2]> = sk.points.iter()
         .map(|p| [p.coords.dot(&u), p.coords.dot(&v)])
@@ -812,9 +814,12 @@ pub(crate) fn apply_constraints(sk: &mut SketchState) {
     sk.constraints_conflict = result.conflict;
     sk.violated_constraints = result.violated;
     if !result.conflict {
+        sk.fully_constrained = compute_dof(&pts2d, &sk.constraints, n) == 0;
         for (i, p) in sk.points.iter_mut().enumerate() {
             *p = Point3::origin() + u * pts2d[i][0] + v * pts2d[i][1];
         }
+    } else {
+        sk.fully_constrained = false;
     }
 }
 
@@ -1072,6 +1077,9 @@ pub(crate) fn apply_all_constraints(sk: &mut SketchState) {
 
     if !report.converged {
         sk.constraints_conflict = true;
+        sk.fully_constrained = false;
+    } else {
+        sk.fully_constrained = report.dof == Some(0);
     }
 }
 
@@ -1358,6 +1366,7 @@ impl EditorState {
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
+                    fully_constrained:  false,
                     history:            SketchHistory::new(),
                     active_tool:        DrawTool::Pointer,
                     tool_in_progress:   None,
@@ -1418,6 +1427,7 @@ impl EditorState {
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
+                    fully_constrained:    false,
                     history:              SketchHistory::new(),
                     active_tool:          DrawTool::Pointer,
                     tool_in_progress:     None,
@@ -1985,7 +1995,7 @@ impl EditorState {
         let pin_x = target.coords.dot(&u);
         let pin_y = target.coords.dot(&v);
 
-        if !sk.constraints.is_empty() && sk.points.len() >= 2 {
+        if !sk.constraints.is_empty() && !sk.points.is_empty() {
             // Save positions so we can restore if the pin conflicts with existing constraints.
             let pts_backup = sk.points.clone();
             sk.points[idx] = target;

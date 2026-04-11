@@ -363,6 +363,38 @@ pub fn apply_constraints(
     }
 }
 
+/// Compute remaining degrees of freedom for the given point/constraint system.
+///
+/// Returns `nv - rank(J)` where `nv = 2 * pts.len()`:
+/// - `0`   → fully constrained
+/// - `> 0` → under-constrained (that many free motion modes remain)
+/// - `< 0` → over-constrained (dependent/redundant constraints present)
+///
+/// The Jacobian is evaluated at the given point positions, so call this after
+/// the solver has converged to get a meaningful result.
+pub fn compute_dof(
+    pts: &[[f64; 2]],
+    constraints: &[SketchConstraint],
+    n_pts: usize,
+) -> i32 {
+    let nv = 2 * pts.len();
+    if constraints.is_empty() {
+        return nv as i32;
+    }
+    let m = count_residuals(constraints);
+    let vars: Vec<f64> = pts.iter().flat_map(|p| [p[0], p[1]]).collect();
+    let mut j_flat = vec![0.0_f64; m * nv];
+    fill_jacobian(&vars, constraints, n_pts, nv, &mut j_flat);
+    let j = DMatrix::from_row_slice(m, nv, &j_flat);
+    // Compute only singular values (skip U and V) for efficiency.
+    let svd = nalgebra::linalg::SVD::new(j, false, false);
+    let sv = &svd.singular_values;
+    let sigma_max = sv.iter().cloned().fold(0.0_f64, f64::max);
+    let threshold = 1e-6 * sigma_max.max(1.0);
+    let rank = sv.iter().filter(|&&s| s > threshold).count();
+    nv as i32 - rank as i32
+}
+
 /// For each constraint, check whether removing it allows the remaining system
 /// to converge.  Returns a parallel `Vec<bool>` — `true` means that constraint
 /// is involved in the conflict.

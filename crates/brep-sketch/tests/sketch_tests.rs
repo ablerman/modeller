@@ -588,3 +588,77 @@ fn solve_profile_only_solves_single_profile() {
     let p1 = point(&sketch, pid, PointId(1));
     assert!(approx_eq(p0.1, p1.1));
 }
+
+// ── DOF / fully-constrained detection ────────────────────────────────────────
+
+#[test]
+fn dof_unconstrained_segment() {
+    // 2 points, no constraints → 4 DOF.
+    let mut sketch = Sketch::new(Plane::xy(), "test");
+    let pid = sketch.add_polyline_profile(false);
+    sketch.push_point(pid, (0.0, 0.0)).unwrap();
+    sketch.push_point(pid, (1.0, 0.0)).unwrap();
+    let report = sketch.solve();
+    assert!(report.converged);
+    assert_eq!(report.dof, Some(4));
+}
+
+#[test]
+fn dof_fully_constrained_segment() {
+    // Both endpoints fixed → DOF = 0 (fully constrained).
+    let mut sketch = Sketch::new(Plane::xy(), "test");
+    let pid = sketch.add_polyline_profile(false);
+    let p0 = sketch.push_point(pid, (0.0, 0.0)).unwrap();
+    let p1 = sketch.push_point(pid, (1.0, 0.0)).unwrap();
+    sketch.add_constraint(Constraint::PointFixed { profile: pid, pt: p0, u: 0.0, v: 0.0 }).unwrap();
+    sketch.add_constraint(Constraint::PointFixed { profile: pid, pt: p1, u: 1.0, v: 0.0 }).unwrap();
+    let report = sketch.solve();
+    assert!(report.converged);
+    assert_eq!(report.dof, Some(0));
+}
+
+#[test]
+fn dof_one_free_variable() {
+    // p0 fixed + Horizontal → p1.v determined, p1.u still free → DOF = 1.
+    let mut sketch = Sketch::new(Plane::xy(), "test");
+    let pid = sketch.add_polyline_profile(false);
+    let p0 = sketch.push_point(pid, (0.0, 0.0)).unwrap();
+    sketch.push_point(pid, (1.0, 0.5)).unwrap();
+    sketch.add_constraint(Constraint::PointFixed { profile: pid, pt: p0, u: 0.0, v: 0.0 }).unwrap();
+    sketch.add_constraint(Constraint::Horizontal { profile: pid, seg: 0 }).unwrap();
+    let report = sketch.solve();
+    assert!(report.converged);
+    assert_eq!(report.dof, Some(1));
+}
+
+#[test]
+fn dof_rigid_triangle() {
+    // Closed 3-point polyline with 3 FixedLength constraints.
+    // Rigid body has 3 DOF (translation x2 + rotation).
+    let mut sketch = Sketch::new(Plane::xy(), "test");
+    let pid = sketch.add_polyline_profile(true); // closed
+    sketch.push_point(pid, (0.0, 0.0)).unwrap();
+    sketch.push_point(pid, (1.0, 0.0)).unwrap();
+    sketch.push_point(pid, (0.5, 0.866)).unwrap();
+    sketch.add_constraint(Constraint::FixedLength { profile: pid, seg: 0, value: 1.0 }).unwrap();
+    sketch.add_constraint(Constraint::FixedLength { profile: pid, seg: 1, value: 1.0 }).unwrap();
+    sketch.add_constraint(Constraint::FixedLength { profile: pid, seg: 2, value: 1.0 }).unwrap();
+    let report = sketch.solve();
+    assert!(report.converged);
+    assert_eq!(report.dof, Some(3));
+}
+
+#[test]
+fn dof_none_on_conflict() {
+    // Two conflicting PointFixed constraints → not converged → dof is None.
+    let mut sketch = Sketch::new(Plane::xy(), "test");
+    let pid = sketch.add_polyline_profile(false);
+    let p0 = sketch.push_point(pid, (0.0, 0.0)).unwrap();
+    sketch.push_point(pid, (1.0, 0.0)).unwrap();
+    // Pin the same point to two different positions — conflict.
+    sketch.add_constraint(Constraint::PointFixed { profile: pid, pt: p0, u: 0.0, v: 0.0 }).unwrap();
+    sketch.add_constraint(Constraint::PointFixed { profile: pid, pt: p0, u: 5.0, v: 5.0 }).unwrap();
+    let report = sketch.solve();
+    assert!(!report.converged);
+    assert_eq!(report.dof, None);
+}

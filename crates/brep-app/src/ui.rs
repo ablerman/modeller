@@ -62,6 +62,7 @@ pub fn build_ui(
                     });
 
                     draw_conflict_badge(ui, sk);
+                    draw_fully_constrained_badge(ui, sk);
 
                     // Active constraints list.
                     if !sk.constraints.is_empty() {
@@ -230,7 +231,11 @@ pub fn build_ui(
     }
 
     // ── Sketch info panel (top-left of viewport, sketch mode only) ────────────
-    actions.extend(draw_sketch_info_panel(ctx, editor));
+    actions.extend(draw_sketch_info_panel(
+        ctx, editor,
+        snap_vertex, snap_segment,
+        snap_committed, snap_committed_curve, snap_committed_seg,
+    ));
 
     // ── Sketch viewport toolbar (floating, top-center of canvas) ─────────────
     actions.extend(draw_sketch_viewport_toolbar(ctx, editor));
@@ -993,8 +998,39 @@ pub(crate) fn snap_to_viewport(pos: egui::Pos2, size: egui::Vec2, viewport: egui
     p
 }
 
+/// Returns the point indices and segment indices referenced by a constraint.
+fn constraint_element_refs(c: &SketchConstraint) -> (Vec<usize>, Vec<usize>) {
+    match c {
+        SketchConstraint::Horizontal { seg }            => (vec![], vec![*seg]),
+        SketchConstraint::Vertical { seg }              => (vec![], vec![*seg]),
+        SketchConstraint::FixedLength { seg, .. }       => (vec![], vec![*seg]),
+        SketchConstraint::Parallel { seg_a, seg_b }     => (vec![], vec![*seg_a, *seg_b]),
+        SketchConstraint::Perpendicular { seg_a, seg_b }=> (vec![], vec![*seg_a, *seg_b]),
+        SketchConstraint::EqualLength { seg_a, seg_b }  => (vec![], vec![*seg_a, *seg_b]),
+        SketchConstraint::Angle { seg_a, seg_b, .. }    => (vec![], vec![*seg_a, *seg_b]),
+        SketchConstraint::PointOnOrigin { pt }          => (vec![*pt], vec![]),
+        SketchConstraint::PointOnXAxis { pt }           => (vec![*pt], vec![]),
+        SketchConstraint::PointOnYAxis { pt }           => (vec![*pt], vec![]),
+        SketchConstraint::PointFixed { pt, .. }         => (vec![*pt], vec![]),
+        SketchConstraint::Coincident { pt_a, pt_b }     => (vec![*pt_a, *pt_b], vec![]),
+        SketchConstraint::PointOnLine { pt, seg }       => (vec![*pt], vec![*seg]),
+        SketchConstraint::PointDistance { pt_a, pt_b, .. } => (vec![*pt_a, *pt_b], vec![]),
+        SketchConstraint::PointOnCircle { pt, .. }      => (vec![*pt], vec![]),
+        SketchConstraint::HorizontalPair { pt_a, pt_b, .. } => (vec![*pt_a, *pt_b], vec![]),
+        SketchConstraint::VerticalPair { pt_a, pt_b, .. }   => (vec![*pt_a, *pt_b], vec![]),
+    }
+}
+
 /// Floating sketch configuration panel — resizable, draggable, constrained to the viewport.
-fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAction> {
+fn draw_sketch_info_panel(
+    ctx: &egui::Context,
+    editor: &EditorState,
+    snap_vertex: Option<usize>,
+    snap_segment: Option<usize>,
+    snap_committed: Option<(usize, usize)>,
+    snap_committed_curve: Option<usize>,
+    snap_committed_seg: Option<(usize, usize)>,
+) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
     let Some(sk) = &editor.sketch else { return actions };
 
@@ -1076,6 +1112,18 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
 
                 // Elements list takes all remaining space above the constraints section.
                 // Use a fixed-ratio split: ~40% of window height for elements.
+                // Collect elements highlighted by selected constraints.
+                let mut constraint_hi_pts:  std::collections::HashSet<usize> = Default::default();
+                let mut constraint_hi_segs: std::collections::HashSet<usize> = Default::default();
+                for &ci in &sk.constraint_selection {
+                    if let Some(c) = sk.constraints.get(ci) {
+                        let (pts, segs) = constraint_element_refs(c);
+                        constraint_hi_pts.extend(pts);
+                        constraint_hi_segs.extend(segs);
+                    }
+                }
+                let highlight_color = egui::Color32::from_rgb(255, 160, 60);
+
                 egui::ScrollArea::vertical()
                     .id_salt("sketch_elements_scroll")
                     .max_height(f32::INFINITY)
@@ -1085,10 +1133,12 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         for i in 0..n {
                             let p = &sk.points[i];
                             let selected = sk.sel_pts().any(|s| s == i);
-                            let resp = ui.selectable_label(
-                                selected,
-                                format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z),
+                            let is_hi = !selected && (snap_vertex == Some(i) || constraint_hi_pts.contains(&i));
+                            let text = egui::RichText::new(
+                                format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z)
                             );
+                            let text = if is_hi { text.color(highlight_color) } else { text };
+                            let resp = ui.selectable_label(selected, text);
                             if resp.clicked() {
                                 actions.push(UiAction::SketchPanelSelectVertex(i));
                             }
@@ -1097,10 +1147,10 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         for i in 0..n_segs {
                             let j = (i + 1) % n;
                             let selected = sk.sel_segs().any(|s| s == i);
-                            let resp = ui.selectable_label(
-                                selected,
-                                format!("Segment {}  ({} → {})", i, i, j),
-                            );
+                            let is_hi = !selected && (snap_segment == Some(i) || constraint_hi_segs.contains(&i));
+                            let text = egui::RichText::new(format!("Segment {}  ({} → {})", i, i, j));
+                            let text = if is_hi { text.color(highlight_color) } else { text };
+                            let resp = ui.selectable_label(selected, text);
                             if resp.clicked() {
                                 actions.push(UiAction::SketchPanelSelectSegment(i));
                             }
@@ -1113,7 +1163,14 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
                             let label = cp.shape.label(pi);
                             let is_sel = sk.sel_committed_profile() == Some(pi);
-                            let resp = ui.selectable_label(is_sel, label);
+                            let is_hi = !is_sel && (
+                                snap_committed_curve == Some(pi)
+                                || snap_committed.map(|(p, _)| p) == Some(pi)
+                                || snap_committed_seg.map(|(p, _)| p) == Some(pi)
+                            );
+                            let text = egui::RichText::new(label);
+                            let text = if is_hi { text.color(highlight_color) } else { text };
+                            let resp = ui.selectable_label(is_sel, text);
                             if resp.clicked() {
                                 let new_sel = if is_sel { None } else { Some(pi) };
                                 actions.push(UiAction::SketchSelectCommitted(new_sel));
@@ -1143,32 +1200,31 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                             let is_violated =
                                 sk.violated_constraints.get(i).copied().unwrap_or(false);
                             let is_selected = sk.constraint_selection.contains(&i);
-                            ui.horizontal(|ui| {
-                                ui.add(list_icon(constraint_icon(c)));
-                                let label_text = if is_violated {
-                                    egui::RichText::new(constraint_text(c))
-                                        .color(egui::Color32::RED)
-                                } else {
-                                    egui::RichText::new(constraint_text(c))
-                                };
-                                let resp = ui.selectable_label(is_selected, label_text);
-                                if resp.clicked() {
-                                    actions.push(UiAction::SketchSelectConstraint(i));
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.add_space(12.0); // keep clear of the scrollbar
-                                        let trash = egui::ImageButton::new(
-                                            egui::Image::new(icon_trash())
-                                                .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                                                .tint(egui::Color32::from_rgb(210, 60, 60)),
-                                        );
-                                        if ui.add(trash).on_hover_text("Remove constraint").clicked() {
-                                            remove_idx = Some(i);
-                                        }
-                                    },
+                            // Right-to-left so the trash button is placed first on the far right,
+                            // then the label+icon fill the remaining width with a wide click area.
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(12.0); // keep clear of the scrollbar
+                                let trash = egui::ImageButton::new(
+                                    egui::Image::new(icon_trash())
+                                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                        .tint(egui::Color32::from_rgb(210, 60, 60)),
                                 );
+                                if ui.add(trash).on_hover_text("Remove constraint").clicked() {
+                                    remove_idx = Some(i);
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(list_icon(constraint_icon(c)));
+                                    let label_text = if is_violated {
+                                        egui::RichText::new(constraint_text(c))
+                                            .color(egui::Color32::RED)
+                                    } else {
+                                        egui::RichText::new(constraint_text(c))
+                                    };
+                                    let resp = ui.selectable_label(is_selected, label_text);
+                                    if resp.clicked() {
+                                        actions.push(UiAction::SketchSelectConstraint(i));
+                                    }
+                                });
                             });
                         }
                         if let Some(i) = remove_idx {
@@ -1377,6 +1433,19 @@ fn draw_conflict_badge(ui: &mut egui::Ui, sk: &SketchState) {
                 .weak(),
         );
     });
+}
+
+fn draw_fully_constrained_badge(ui: &mut egui::Ui, sk: &SketchState) {
+    if !sk.fully_constrained { return; }
+    let badge = ui.add(
+        egui::Label::new(
+            egui::RichText::new("✓ fully constrained")
+                .color(egui::Color32::from_rgb(80, 200, 120))
+                .strong(),
+        )
+        .sense(egui::Sense::hover()),
+    );
+    badge.on_hover_text("All degrees of freedom are constrained.");
 }
 
 // ── Sketch viewport toolbar ───────────────────────────────────────────────────

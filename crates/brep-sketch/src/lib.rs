@@ -51,4 +51,4 @@ pub use sketch::{ConstraintStatus, FullSolveReport, Sketch, SketchError, SketchR
 
 // ── Low-level re-exports (backward-compatible) ────────────────────────────────
 pub use constraints::SketchConstraint;
-pub use solver::{apply_constraints, ApplyResult, solve_constraints, SolveResult};
+pub use solver::{apply_constraints, ApplyResult, compute_dof, solve_constraints, SolveResult};

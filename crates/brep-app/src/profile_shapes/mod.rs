@@ -44,9 +44,12 @@ impl ProfileShape {
 
     /// Whether control point `vi` is individually selectable for constraints.
     /// Arc and Polyline: every vertex is individually selectable.
-    /// Circle uses whole-profile selection.
-    pub fn vertex_selectable(&self, _vi: usize) -> bool {
-        matches!(self, ProfileShape::Arc | ProfileShape::Polyline)
+    /// Circle: only vi=0 (center) is selectable; vi=1 (radius handle) uses whole-profile selection.
+    pub fn vertex_selectable(&self, vi: usize) -> bool {
+        match self {
+            ProfileShape::Arc | ProfileShape::Polyline => true,
+            ProfileShape::Circle => vi == 0,
+        }
     }
 
     /// Test whether the cursor is within `threshold_px` of a segment of this shape.

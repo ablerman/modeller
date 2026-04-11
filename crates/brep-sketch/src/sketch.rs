@@ -7,7 +7,7 @@ use crate::arc::project_center_to_arc_bisector;
 use crate::constraints::{to_sketch_constraint, Constraint, SketchConstraint};
 use crate::geometry::Plane;
 use crate::profile::{ConstraintId, GlobalPointId, PointId, Profile, ProfileId, ProfileShape};
-use crate::solver::{apply_constraints, solve_constraints, SolveResult};
+use crate::solver::{apply_constraints, compute_dof, solve_constraints, SolveResult};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -55,6 +55,17 @@ pub struct FullSolveReport {
     pub converged: bool,
     /// Per-constraint violation info (only populated when `converged == false`).
     pub constraint_statuses: Vec<ConstraintStatus>,
+    /// Remaining degrees of freedom after solving.
+    ///
+    /// - `Some(0)`  → fully constrained.
+    /// - `Some(n)`  where `n > 0` → `n` free motion modes remain.
+    /// - `Some(n)`  where `n < 0` → over-constrained (dependent constraints present).
+    /// - `None`     → not computed because `converged == false` (DOF is undefined
+    ///                at a conflicted or unconverged state).
+    ///
+    /// Note: cross-profile constraints are not included in this count; the
+    /// value may be conservatively high for multi-profile sketches that use them.
+    pub dof: Option<i32>,
 }
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────
@@ -505,20 +516,31 @@ impl Sketch {
             }
         }
 
-        FullSolveReport { converged: all_converged, constraint_statuses: statuses }
+        let dof = if all_converged { Some(self.compute_sketch_dof()) } else { None };
+        FullSolveReport { converged: all_converged, constraint_statuses: statuses, dof }
     }
 
     /// Run the solver for a single profile's local constraints only.
     ///
     /// Useful when only one profile has been mutated and a full re-solve
     /// would be wasteful.
-    pub fn solve_profile_only(&mut self, profile: ProfileId) -> SketchResult<FullSolveReport> {
-        if self.profile_pos(profile).is_none() {
-            return Err(SketchError::NoSuchProfile(profile));
+    pub fn solve_profile_only(&mut self, profile_id: ProfileId) -> SketchResult<FullSolveReport> {
+        if self.profile_pos(profile_id).is_none() {
+            return Err(SketchError::NoSuchProfile(profile_id));
         }
         let mut statuses = Vec::new();
-        let converged = self.solve_profile_impl(profile, &mut statuses);
-        Ok(FullSolveReport { converged, constraint_statuses: statuses })
+        let converged = self.solve_profile_impl(profile_id, &mut statuses);
+        let dof = if converged {
+            let profile = self.profile(profile_id).unwrap();
+            let n = profile.points.len();
+            let local_scs: Vec<SketchConstraint> = self.constraints.iter()
+                .filter_map(|(_, c)| to_sketch_constraint(c, profile_id))
+                .collect();
+            Some(compute_dof(&profile.points, &local_scs, n))
+        } else {
+            None
+        };
+        Ok(FullSolveReport { converged, constraint_statuses: statuses, dof })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -695,6 +717,26 @@ impl Sketch {
         all_ok
     }
 
+    /// Compute the total DOF across all profiles using single-profile constraints only.
+    ///
+    /// Cross-profile constraints are excluded; the result is a conservative upper
+    /// bound for multi-profile sketches that use them.
+    fn compute_sketch_dof(&self) -> i32 {
+        let mut total = 0i32;
+        for &(pid, ref profile) in &self.profiles {
+            let n = profile.points.len();
+            if n < 2 {
+                total += 2 * n as i32;
+                continue;
+            }
+            let local_scs: Vec<SketchConstraint> = self.constraints.iter()
+                .filter_map(|(_, c)| to_sketch_constraint(c, pid))
+                .collect();
+            total += compute_dof(&profile.points, &local_scs, n);
+        }
+        total
+    }
+
     /// Solve a cross-profile constraint using a 4-point synthetic array.
     /// Segment `seg_a` of `profile_a` maps to indices 0–1; `seg_b` of `profile_b` to 2–3.
     fn solve_4pt_cross(
@@ -774,7 +816,7 @@ impl Sketch {
         profile_seg_a: ProfileId, seg_a: usize,
         profile_seg_b: ProfileId, seg_b: usize,
         profile_pt:    ProfileId, pt: PointId,
-        all_ok: &mut bool,
+        _all_ok: &mut bool,
     ) {
         let (ai0, ai1) = match self.profile(profile_seg_a)
             .and_then(|p| p.segment_point_indices(seg_a))
