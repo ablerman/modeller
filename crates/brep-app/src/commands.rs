@@ -469,8 +469,7 @@ pub fn has_coincident_target(ed: &EditorState) -> bool {
                 cp.shape.supports_point_on_curve()
             })
         }))
-        || (sk.committed_pt_selection.len() == 2 && n_pts == 0 && n_sel == 0
-            && sk.committed_pt_selection[0].0 == sk.committed_pt_selection[1].0)
+        || (sk.committed_pt_selection.len() == 2 && n_pts == 0 && n_sel == 0)
         || (sk.committed_pt_selection.len() == 1 && sk.committed_seg_selection.len() == 1
             && n_pts == 0 && n_sel == 0
             && sk.committed_pt_selection[0].0 == sk.committed_seg_selection[0].0)
