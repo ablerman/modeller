@@ -964,7 +964,7 @@ impl EditorState {
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
                     history:            SketchHistory::new(),
-                    active_tool:        DrawTool::Polyline,
+                    active_tool:        DrawTool::Pointer,
                     tool_in_progress:   None,
                     committed_profiles: Vec::new(),
                     committed_selection: None,
@@ -1028,7 +1028,7 @@ impl EditorState {
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
                     history:              SketchHistory::new(),
-                    active_tool:          DrawTool::Polyline,
+                    active_tool:          DrawTool::Pointer,
                     tool_in_progress:     None,
                     committed_profiles,
                     committed_selection:    None,
@@ -1097,22 +1097,28 @@ impl EditorState {
             }
             UiAction::SketchAbortActive => {
                 if let Some(sk) = &mut self.sketch {
-                    // If aborting a polyline chain, remove all profiles and global points
-                    // added since the chain started.
-                    if let Some(ToolInProgress::PolylineChain {
-                        chain_start_profile, chain_start_global_pt_idx, ..
-                    }) = sk.tool_in_progress {
-                        sk.committed_profiles.truncate(chain_start_profile);
-                        sk.global_points.truncate(chain_start_global_pt_idx);
+                    let has_work = sk.tool_in_progress.is_some() || !sk.points.is_empty();
+                    if has_work {
+                        // If aborting a polyline chain, remove all profiles and global points
+                        // added since the chain started.
+                        if let Some(ToolInProgress::PolylineChain {
+                            chain_start_profile, chain_start_global_pt_idx, ..
+                        }) = sk.tool_in_progress {
+                            sk.committed_profiles.truncate(chain_start_profile);
+                            sk.global_points.truncate(chain_start_global_pt_idx);
+                        }
+                        sk.tool_in_progress = None;
+                        sk.points.clear();
+                        sk.closed = false;
+                        sk.seg_selection.clear();
+                        sk.pt_selection.clear();
+                        sk.committed_selection = None;
+                        sk.committed_pt_selection.clear();
+                        sk.committed_seg_selection.clear();
+                    } else {
+                        // Nothing in progress — revert to pointer tool.
+                        sk.active_tool = DrawTool::Pointer;
                     }
-                    sk.tool_in_progress = None;
-                    sk.points.clear();
-                    sk.closed = false;
-                    sk.seg_selection.clear();
-                    sk.pt_selection.clear();
-                    sk.committed_selection = None;
-                    sk.committed_pt_selection.clear();
-                    sk.committed_seg_selection.clear();
                 }
                 false
             }
