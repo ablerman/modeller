@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 nalgebra.workspace = true
+faer.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 serde = { workspace = true }
 

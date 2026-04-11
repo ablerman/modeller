@@ -5,9 +5,16 @@
 //! constraints using Gauss-Newton iteration with Levenberg-Marquardt
 //! damping.
 
+use faer::prelude::Solve as _;
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 
 use crate::constraints::SketchConstraint;
+
+/// Below this variable count use the nalgebra (dense) path; at or above use
+/// the faer + sparse-accumulation path. Tuned from benchmarks: crossover is
+/// between nv=8 (4 pts) and nv=24 (12 pts).
+const LARGE_NV_THRESHOLD: usize = 20; // ≈ 10 points
 
 // ── Geometric propagation ─────────────────────────────────────────────────────
 
@@ -243,35 +250,68 @@ pub fn solve_constraints(
 
     // Pre-allocated working buffers — reused across iterations.
     let mut r = vec![0.0_f64; m];
-    let mut j_flat = vec![0.0_f64; m * nv]; // row-major J[m × nv]
 
-    for _ in 0..MAX_ITER {
-        fill_residuals(&vars, constraints, n_pts, &mut r);
-        let norm_sq: f64 = r.iter().map(|x| x * x).sum();
-        if norm_sq.sqrt() < CONVERGENCE_TOL {
-            break;
+    if nv < LARGE_NV_THRESHOLD {
+        // ── Small sketch: nalgebra dense path ─────────────────────────────────
+        // nalgebra's BLAS-optimised tr_mul beats faer's per-call overhead at
+        // small matrix sizes (nv < ~20).
+        let mut j_flat = vec![0.0_f64; m * nv];
+
+        for _ in 0..MAX_ITER {
+            fill_residuals(&vars, constraints, n_pts, &mut r);
+            let norm_sq: f64 = r.iter().map(|x| x * x).sum();
+            if norm_sq.sqrt() < CONVERGENCE_TOL {
+                break;
+            }
+
+            j_flat.fill(0.0);
+            fill_jacobian(&vars, constraints, n_pts, nv, &mut j_flat);
+
+            let j = DMatrix::from_row_slice(m, nv, &j_flat);
+            let r_vec = DVector::from_row_slice(&r);
+            let jt_r: DVector<f64> = j.tr_mul(&r_vec);
+            let mut jt_j: DMatrix<f64> = j.tr_mul(&j);
+            for i in 0..nv {
+                jt_j[(i, i)] += LAMBDA;
+            }
+
+            let Some(chol) = nalgebra::linalg::Cholesky::new(jt_j) else { break };
+            let delta = chol.solve(&jt_r);
+            for i in 0..nv {
+                vars[i] -= delta[i];
+            }
         }
+    } else {
+        // ── Large sketch: sparse accumulation + faer Cholesky ─────────────────
+        // Direct outer-product accumulation avoids the dense m×nv Jacobian and
+        // the O(m·nv²) matrix multiply. faer's SIMD Cholesky wins at nv ≥ ~20.
+        let mut jtj = vec![0.0_f64; nv * nv];
+        let mut jtr = vec![0.0_f64; nv];
 
-        // Build analytical Jacobian.
-        j_flat.fill(0.0);
-        fill_jacobian(&vars, constraints, n_pts, nv, &mut j_flat);
+        for _ in 0..MAX_ITER {
+            fill_residuals(&vars, constraints, n_pts, &mut r);
+            let norm_sq: f64 = r.iter().map(|x| x * x).sum();
+            if norm_sq.sqrt() < CONVERGENCE_TOL {
+                break;
+            }
 
-        // JᵀJ + λI and Jᵀr via nalgebra (optimised BLAS path).
-        let j = DMatrix::from_row_slice(m, nv, &j_flat);
-        let r_vec = DVector::from_row_slice(&r);
-        let jt_r: DVector<f64> = j.tr_mul(&r_vec);
-        let mut jt_j: DMatrix<f64> = j.tr_mul(&j);
-        for i in 0..nv {
-            jt_j[(i, i)] += LAMBDA;
-        }
+            jtj.fill(0.0);
+            jtr.fill(0.0);
+            accumulate_jtj_jtr(&vars, constraints, n_pts, nv, &r, LAMBDA, &mut jtj, &mut jtr);
 
-        // JᵀJ + λI is symmetric positive definite; Cholesky is ~2× faster
-        // than full inversion and avoids computing the n×n inverse matrix.
-        let Some(chol) = nalgebra::linalg::Cholesky::new(jt_j) else { break };
-        let delta = chol.solve(&jt_r);
-
-        for i in 0..nv {
-            vars[i] -= delta[i];
+            // faer LLT (Cholesky) solve. J^T J is symmetric; row-major ==
+            // col-major for symmetric matrices.
+            let jtj_mat = faer::Mat::from_fn(nv, nv, |i, j| jtj[i * nv + j]);
+            let Ok(chol) = faer::linalg::solvers::Llt::new(jtj_mat.as_ref(), faer::Side::Lower)
+            else {
+                break;
+            };
+            let mut rhs = faer::Mat::from_fn(nv, 1, |i, _| jtr[i]);
+            chol.solve_in_place(&mut rhs);
+            let delta = rhs.col_as_slice(0);
+            for i in 0..nv {
+                vars[i] -= delta[i];
+            }
         }
     }
 
@@ -331,15 +371,13 @@ fn find_conflicting_constraints(
     constraints: &[SketchConstraint],
     n_pts: usize,
 ) -> Vec<bool> {
-    constraints
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
+    (0..constraints.len())
+        .into_par_iter()
+        .map(|i| {
             let reduced: Vec<SketchConstraint> = constraints
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, c)| c.clone())
+                .filter_map(|(j, c)| if j != i { Some(c.clone()) } else { None })
                 .collect();
             if reduced.is_empty() {
                 return true;
@@ -495,6 +533,201 @@ fn fill_residuals(
                 r[row] = du * du + dv * dv - radius * radius;
                 row += 1;
             }
+        }
+    }
+}
+
+/// Accumulate J^T J (row-major nv×nv) and J^T r (len nv) directly from the
+/// sparse constraint structure. Avoids allocating a dense m×nv Jacobian.
+/// `lambda` is added to the diagonal (Levenberg-Marquardt damping).
+fn accumulate_jtj_jtr(
+    vars: &[f64],
+    constraints: &[SketchConstraint],
+    n: usize,
+    nv: usize,
+    r: &[f64],
+    lambda: f64,
+    jtj: &mut [f64],
+    jtr: &mut [f64],
+) {
+    let pt = |i: usize| -> (f64, f64) { (vars[2 * i], vars[2 * i + 1]) };
+    let seg_dir = |s: usize| -> (f64, f64) {
+        let sn = (s + 1) % n;
+        (vars[2 * sn] - vars[2 * s], vars[2 * sn + 1] - vars[2 * s + 1])
+    };
+
+    let mut row = 0usize;
+    for c in constraints {
+        match c {
+            SketchConstraint::Horizontal { seg } => {
+                let s = *seg; let sn = (s + 1) % n;
+                add_outer_product(jtj, jtr, nv, &[(2*s+1, -1.0), (2*sn+1, 1.0)], r[row]);
+                row += 1;
+            }
+            SketchConstraint::Vertical { seg } => {
+                let s = *seg; let sn = (s + 1) % n;
+                add_outer_product(jtj, jtr, nv, &[(2*s, -1.0), (2*sn, 1.0)], r[row]);
+                row += 1;
+            }
+            SketchConstraint::Parallel { seg_a, seg_b } => {
+                let a = *seg_a; let an = (a + 1) % n;
+                let b = *seg_b; let bn = (b + 1) % n;
+                let (dxa, dya) = seg_dir(a);
+                let (dxb, dyb) = seg_dir(b);
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*a,     -dyb), (2*an,     dyb),
+                    (2*a+1,   dxb),  (2*an+1,  -dxb),
+                    (2*b,     dya),  (2*bn,    -dya),
+                    (2*b+1,  -dxa),  (2*bn+1,   dxa),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::Perpendicular { seg_a, seg_b } => {
+                let a = *seg_a; let an = (a + 1) % n;
+                let b = *seg_b; let bn = (b + 1) % n;
+                let (dxa, dya) = seg_dir(a);
+                let (dxb, dyb) = seg_dir(b);
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*a,     -dxb), (2*an,     dxb),
+                    (2*a+1,  -dyb),  (2*an+1,   dyb),
+                    (2*b,    -dxa),  (2*bn,      dxa),
+                    (2*b+1,  -dya),  (2*bn+1,   dya),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::Angle { seg_a, seg_b, degrees: _ } => {
+                let a = *seg_a; let an = (a + 1) % n;
+                let b = *seg_b; let bn = (b + 1) % n;
+                let (dxa, dya) = seg_dir(a);
+                let (dxb, dyb) = seg_dir(b);
+                let la2 = dxa * dxa + dya * dya;
+                let lb2 = dxb * dxb + dyb * dyb;
+                let la = la2.sqrt().max(1e-12);
+                let lb = lb2.sqrt().max(1e-12);
+                let dot = dxa * dxb + dya * dyb;
+                let la3lb = la2 * la * lb;
+                let lalb3 = la * lb2 * lb;
+                let lalb = la * lb;
+                let d_dxa = dxb / lalb - dot * dxa / la3lb;
+                let d_dya = dyb / lalb - dot * dya / la3lb;
+                let d_dxb = dxa / lalb - dot * dxb / lalb3;
+                let d_dyb = dya / lalb - dot * dyb / lalb3;
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*a,     -d_dxa), (2*an,     d_dxa),
+                    (2*a+1,  -d_dya),  (2*an+1,   d_dya),
+                    (2*b,    -d_dxb),  (2*bn,      d_dxb),
+                    (2*b+1,  -d_dyb),  (2*bn+1,   d_dyb),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::EqualLength { seg_a, seg_b } => {
+                let a = *seg_a; let an = (a + 1) % n;
+                let b = *seg_b; let bn = (b + 1) % n;
+                let (dxa, dya) = seg_dir(a);
+                let (dxb, dyb) = seg_dir(b);
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*a,    -2.0*dxa), (2*an,    2.0*dxa),
+                    (2*a+1,  -2.0*dya), (2*an+1,  2.0*dya),
+                    (2*b,     2.0*dxb), (2*bn,   -2.0*dxb),
+                    (2*b+1,   2.0*dyb), (2*bn+1, -2.0*dyb),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::Coincident { pt_a, pt_b } => {
+                let a = *pt_a; let b = *pt_b;
+                add_outer_product(jtj, jtr, nv, &[(2*a, 1.0), (2*b, -1.0)], r[row]);
+                add_outer_product(jtj, jtr, nv, &[(2*a+1, 1.0), (2*b+1, -1.0)], r[row+1]);
+                row += 2;
+            }
+            SketchConstraint::PointOnLine { pt: pi, seg } => {
+                let p = *pi; let s = *seg; let sn = (s + 1) % n;
+                let (u_p, v_p) = pt(p);
+                let (u_a, v_a) = pt(s);
+                let (dx, dy) = seg_dir(s);
+                let px = u_p - u_a; let py = v_p - v_a;
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*p,       dy),  (2*p+1,    -dx),
+                    (2*s,    -dy+py), (2*s+1,  -px+dx),
+                    (2*sn,     -py),  (2*sn+1,    px),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::FixedLength { seg, value: _ } => {
+                let s = *seg; let sn = (s + 1) % n;
+                let (dx, dy) = seg_dir(s);
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*s,    -2.0*dx), (2*sn,    2.0*dx),
+                    (2*s+1,  -2.0*dy), (2*sn+1,  2.0*dy),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::PointDistance { pt_a, pt_b, value: _ } => {
+                let a = *pt_a; let b = *pt_b;
+                let (ax, ay) = pt(a); let (bx, by) = pt(b);
+                let dx = bx - ax; let dy = by - ay;
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*a,    -2.0*dx), (2*b,     2.0*dx),
+                    (2*a+1,  -2.0*dy), (2*b+1,   2.0*dy),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::PointFixed { pt: pi, .. } => {
+                let p = *pi;
+                add_outer_product(jtj, jtr, nv, &[(2*p, 1.0)], r[row]);
+                add_outer_product(jtj, jtr, nv, &[(2*p+1, 1.0)], r[row+1]);
+                row += 2;
+            }
+            SketchConstraint::PointOnOrigin { pt: pi } => {
+                let p = *pi;
+                add_outer_product(jtj, jtr, nv, &[(2*p, 1.0)], r[row]);
+                add_outer_product(jtj, jtr, nv, &[(2*p+1, 1.0)], r[row+1]);
+                row += 2;
+            }
+            SketchConstraint::PointOnXAxis { pt: pi } => {
+                add_outer_product(jtj, jtr, nv, &[(2**pi+1, 1.0)], r[row]);
+                row += 1;
+            }
+            SketchConstraint::PointOnYAxis { pt: pi } => {
+                add_outer_product(jtj, jtr, nv, &[(2**pi, 1.0)], r[row]);
+                row += 1;
+            }
+            SketchConstraint::HorizontalPair { pt_a, pt_b, perp_u, perp_v }
+            | SketchConstraint::VerticalPair { pt_a, pt_b, perp_u, perp_v } => {
+                let a = *pt_a; let b = *pt_b;
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*a,   -*perp_u), (2*a+1, -*perp_v),
+                    (2*b,    *perp_u), (2*b+1,  *perp_v),
+                ], r[row]);
+                row += 1;
+            }
+            SketchConstraint::PointOnCircle { pt: pi, center_u, center_v, .. } => {
+                let p = *pi; let (pu, pv) = pt(p);
+                add_outer_product(jtj, jtr, nv, &[
+                    (2*p,   2.0*(pu-center_u)),
+                    (2*p+1, 2.0*(pv-center_v)),
+                ], r[row]);
+                row += 1;
+            }
+        }
+    }
+
+    for i in 0..nv {
+        jtj[i * nv + i] += lambda;
+    }
+}
+
+#[inline(always)]
+fn add_outer_product(
+    jtj: &mut [f64],
+    jtr: &mut [f64],
+    nv: usize,
+    grads: &[(usize, f64)],
+    r_val: f64,
+) {
+    for &(ci, gi) in grads {
+        jtr[ci] += gi * r_val;
+        for &(cj, gj) in grads {
+            jtj[ci * nv + cj] += gi * gj;
         }
     }
 }

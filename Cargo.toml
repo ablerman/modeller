@@ -24,6 +24,7 @@ repository = "https://github.com/placeholder/brep-kernel"
 [workspace.dependencies]
 # Math
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
+faer = "0.22"
 
 # Arena / data structures
 slotmap = { version = "1.0", features = ["serde"] }
