@@ -328,13 +328,14 @@ pub fn build_ui(
             } else {
                 edge_stroke
             };
-            draw_committed_profile(&painter, cp, &proj, cp_stroke);
+            let pts = crate::editor::resolved_points(cp, &sk.global_points);
+            draw_committed_profile(&painter, &pts, cp, &proj, cp_stroke);
         }
         // Snap highlight on committed profile vertices.
         if let Some((snap_pi, snap_vi)) = snap_committed {
             if let Some(cp) = sk.committed_profiles.get(snap_pi) {
-                if let Some(&snap_pt) = cp.points.get(snap_vi) {
-                    if let Some(p) = proj(snap_pt) {
+                if let Some(&gi) = cp.point_indices.get(snap_vi) {
+                    if let Some(p) = proj(sk.global_points[gi]) {
                         painter.circle_stroke(p, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
                         painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
                     }
@@ -344,8 +345,8 @@ pub fn build_ui(
         // Selected committed points — highlighted as orange dots.
         for &(sel_pi, sel_vi) in &sk.committed_pt_selection {
             if let Some(cp) = sk.committed_profiles.get(sel_pi) {
-                if let Some(&sel_pt) = cp.points.get(sel_vi) {
-                    if let Some(p) = proj(sel_pt) {
+                if let Some(&gi) = cp.point_indices.get(sel_vi) {
+                    if let Some(p) = proj(sk.global_points[gi]) {
                         painter.circle_filled(p, 6.0, egui::Color32::from_rgb(255, 160, 60));
                     }
                 }
@@ -354,9 +355,11 @@ pub fn build_ui(
         // Hovered committed polyline segment — blue highlight over the base rendering.
         if let Some((hov_pi, hov_si)) = snap_committed_seg {
             if let Some(cp) = sk.committed_profiles.get(hov_pi) {
-                let cn = cp.points.len();
+                let cn = cp.point_indices.len();
                 if hov_si < cn {
-                    if let (Some(a), Some(b)) = (proj(cp.points[hov_si]), proj(cp.points[(hov_si + 1) % cn])) {
+                    let a_pt = sk.global_points[cp.point_indices[hov_si]];
+                    let b_pt = sk.global_points[cp.point_indices[(hov_si + 1) % cn]];
+                    if let (Some(a), Some(b)) = (proj(a_pt), proj(b_pt)) {
                         painter.line_segment(
                             [a, b],
                             egui::Stroke::new(edge_stroke.width + 1.5, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 210)),
@@ -368,9 +371,11 @@ pub fn build_ui(
         // Selected committed polyline segments — orange highlight.
         for &(sel_pi, sel_si) in &sk.committed_seg_selection {
             if let Some(cp) = sk.committed_profiles.get(sel_pi) {
-                let cn = cp.points.len();
+                let cn = cp.point_indices.len();
                 if sel_si < cn {
-                    if let (Some(a), Some(b)) = (proj(cp.points[sel_si]), proj(cp.points[(sel_si + 1) % cn])) {
+                    let a_pt = sk.global_points[cp.point_indices[sel_si]];
+                    let b_pt = sk.global_points[cp.point_indices[(sel_si + 1) % cn]];
+                    if let (Some(a), Some(b)) = (proj(a_pt), proj(b_pt)) {
                         painter.line_segment(
                             [a, b],
                             egui::Stroke::new(edge_stroke.width + 1.5, egui::Color32::from_rgb(255, 160, 60)),
@@ -425,9 +430,18 @@ pub fn build_ui(
 
             match &sk.tool_in_progress {
                 None => {
-                    // Polyline (or idle): line from last committed point to cursor.
+                    // Active polyline: line from last active-profile point to cursor.
                     if let (Some(last), Some(cur)) = (sk.points.last(), cursor_snapped) {
                         if let (Some(a), Some(b)) = (proj(*last), proj(cur)) {
+                            painter.line_segment([a, b], preview_stroke);
+                        }
+                    }
+                }
+                Some(ToolInProgress::PolylineChain { pen_global_idx, .. }) => {
+                    // Per-segment polyline chain: line from pen point to cursor.
+                    if let Some(cur) = cursor_snapped {
+                        let pen = sk.global_points[*pen_global_idx];
+                        if let (Some(a), Some(b)) = (proj(pen), proj(cur)) {
                             painter.line_segment([a, b], preview_stroke);
                         }
                     }
@@ -539,7 +553,7 @@ pub fn build_ui(
                 }
                 // Draw extra profiles (circles, arcs, rectangles, etc.).
                 for cp in &sk.extra_profiles {
-                    draw_committed_profile(&painter, cp, &proj, stroke);
+                    draw_committed_profile(&painter, &cp.points, cp, &proj, stroke);
                 }
                 if is_selected {
                     for &pt in &sk.points {
@@ -814,14 +828,14 @@ fn draw_orientation_cube(ctx: &egui::Context, editor: &EditorState) -> Option<Ui
                 [ 1., 1., 1.], [-1., 1., 1.],
             ];
 
-            // Each face: [corner indices CCW], face normal, label, snap (az,el), fill rgb.
-            let faces: [([usize;4], [f32;3], &str, (f64,f64), [u8;3]); 6] = [
-                ([1,2,6,5], [ 1., 0., 0.], "Right",  (0.,         0.),    [200,60,60]),
-                ([0,4,7,3], [-1., 0., 0.], "Left",   (PI,         0.),    [160,40,40]),
-                ([2,3,7,6], [ 0., 1., 0.], "Back",   (FRAC_PI_2,  0.),    [60,180,60]),
-                ([0,1,5,4], [ 0.,-1., 0.], "Front",  (-FRAC_PI_2, 0.),    [40,130,40]),
-                ([4,5,6,7], [ 0., 0., 1.], "Top",    (0., FRAC_PI_2-0.05),[60,100,220]),
-                ([0,3,2,1], [ 0., 0.,-1.], "Bottom", (0.,-(FRAC_PI_2-0.05)),[40,70,160]),
+            // Each face: [corner indices CCW], face normal, label, snap (az,el), fill rgb, face right (world).
+            let faces: [([usize;4], [f32;3], &str, (f64,f64), [u8;3], [f32;3]); 6] = [
+                ([1,2,6,5], [ 1., 0., 0.], "Right",  (0.,         0.),    [200,60,60],  [ 0., 1., 0.]),
+                ([0,4,7,3], [-1., 0., 0.], "Left",   (PI,         0.),    [160,40,40],  [ 0.,-1., 0.]),
+                ([2,3,7,6], [ 0., 1., 0.], "Back",   (FRAC_PI_2,  0.),    [60,180,60],  [-1., 0., 0.]),
+                ([0,1,5,4], [ 0.,-1., 0.], "Front",  (-FRAC_PI_2, 0.),    [40,130,40],  [ 1., 0., 0.]),
+                ([4,5,6,7], [ 0., 0., 1.], "Top",    (0., FRAC_PI_2-0.05),[60,100,220], [ 0., 1., 0.]),
+                ([0,3,2,1], [ 0., 0.,-1.], "Bottom", (0.,-(FRAC_PI_2-0.05)),[40,70,160],[ 0., 1., 0.]),
             ];
 
             // Each corner: [neighbor indices (flip one coord each)], snap (az,el).
@@ -878,7 +892,7 @@ fn draw_orientation_cube(ctx: &egui::Context, editor: &EditorState) -> Option<Ui
             for (_, is_corner, idx) in &items {
                 if !is_corner {
                     let fi = *idx;
-                    let (_, normal, label, (snap_az, snap_el), rgb) = faces[fi];
+                    let (_, normal, label, (snap_az, snap_el), rgb, face_right) = faces[fi];
                     let facing = dot3(normal, fwd) < 0.0;
                     let poly = chamfer_poly(fi);
                     let alpha = if facing { 235u8 } else { 80 };
@@ -888,8 +902,37 @@ fn draw_orientation_cube(ctx: &egui::Context, editor: &EditorState) -> Option<Ui
 
                     if facing {
                         let fc = poly.iter().fold(egui::Vec2::ZERO, |a,p| a+p.to_vec2()) / poly.len() as f32;
-                        painter.text(fc.to_pos2(), egui::Align2::CENTER_CENTER, label,
-                            egui::FontId::proportional(9.0), egui::Color32::WHITE);
+
+                        let fr_screen = egui::vec2(dot3(r, face_right), -dot3(up, face_right));
+                        let angle = {
+                            let mut a = if fr_screen.length() > 0.001 {
+                                fr_screen.y.atan2(fr_screen.x)
+                            } else {
+                                0.0f32
+                            };
+                            // Clamp to (-π/2, π/2) so text always reads left-to-right.
+                            // Values outside this range mean face_right projects backwards,
+                            // which makes the text appear reversed and detached from the face.
+                            if a > std::f32::consts::FRAC_PI_2 {
+                                a -= std::f32::consts::PI;
+                            } else if a < -std::f32::consts::FRAC_PI_2 {
+                                a += std::f32::consts::PI;
+                            }
+                            a
+                        };
+                        let galley = ctx.fonts(|f| f.layout_no_wrap(
+                            label.to_string(),
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        ));
+                        let hw = galley.size().x * 0.5;
+                        let hh = galley.size().y * 0.5;
+                        let (sa, ca) = (angle.sin(), angle.cos());
+                        let text_pos = fc.to_pos2() - egui::vec2(hw * ca - hh * sa, hw * sa + hh * ca);
+                        let mut ts = egui::epaint::TextShape::new(text_pos, galley, egui::Color32::WHITE);
+                        ts.angle = angle;
+                        painter.add(egui::Shape::Text(ts));
+
                         if let Some(click) = click_pos {
                             if point_in_polygon2d(click, &poly) {
                                 snap = Some(UiAction::SnapCamera { azimuth: snap_az, elevation: snap_el });
@@ -986,8 +1029,8 @@ fn constraint_text(c: &SketchConstraint) -> String {
         SketchConstraint::PointOnYAxis { pt }     => format!("On Y-axis  pt {pt}"),
         SketchConstraint::HorizontalPair { pt_a, pt_b, .. } => format!("Horizontal  pt {pt_a}–{pt_b}"),
         SketchConstraint::VerticalPair   { pt_a, pt_b, .. } => format!("Vertical  pt {pt_a}–{pt_b}"),
-        SketchConstraint::PointOnLine { pt, seg }           => format!("On Line  pt {pt} on seg {seg}"),
-        SketchConstraint::PointOnCircle { pt, .. }          => format!("On Circle  pt {pt}"),
+        SketchConstraint::PointOnLine { pt, seg }           => format!("Coincident  pt {pt} on seg {seg}"),
+        SketchConstraint::PointOnCircle { pt, .. }          => format!("Coincident  pt {pt} on curve"),
     }
 }
 
@@ -1151,7 +1194,12 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
         .frame(egui::Frame::popup(ctx.style().as_ref()))
         .show(ctx, |ui| {
             // ── Finish Sketch button ──────────────────────────────────
-            ui.add_enabled_ui(sk.points.len() >= 3, |ui| {
+            let can_finish = sk.points.len() >= 3
+                || sk.committed_profiles.iter().any(|cp| {
+                    cp.shape != crate::editor::ProfileShape::Polyline
+                        || cp.point_indices.len() >= 2
+                });
+            ui.add_enabled_ui(can_finish, |ui| {
                 if ui.button("✓  Finish Sketch").clicked() {
                     actions.push(UiAction::SketchFinish);
                 }
@@ -1291,6 +1339,45 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         }
                     });
             }
+
+            ui.separator();
+
+            // ── Actions ───────────────────────────────────────────────
+            ui.strong("Actions");
+            if sk.history.undo_stack.is_empty() {
+                ui.label(egui::RichText::new("(none)").italics().weak());
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("sketch_actions_scroll")
+                    .max_height(f32::INFINITY)
+                    .min_scrolled_height(60.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let mut delete_idx: Option<usize> = None;
+                        for (i, entry) in sk.history.undo_stack.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&entry.label).monospace());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(12.0);
+                                        let trash = egui::ImageButton::new(
+                                            egui::Image::new(icon_trash())
+                                                .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                                .tint(egui::Color32::from_rgb(210, 60, 60)),
+                                        );
+                                        if ui.add(trash).on_hover_text("Undo to before this action").clicked() {
+                                            delete_idx = Some(i);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        if let Some(i) = delete_idx {
+                            actions.push(UiAction::SketchDeleteHistoryEntry(i));
+                        }
+                    });
+            }
         });
 
     // Persist the window position after each frame so snap logic has fresh data.
@@ -1336,11 +1423,12 @@ fn show_history_op(ui: &mut egui::Ui, node: &ObjectHistory) {
 /// Render a committed profile (circle, arc, or polyline) using its stored shape.
 fn draw_committed_profile(
     painter: &egui::Painter,
+    pts: &[Point3],
     cp: &crate::editor::CommittedProfile,
     proj: &impl Fn(Point3) -> Option<egui::Pos2>,
     stroke: egui::Stroke,
 ) {
-    cp.shape.draw(&cp.points, cp.closed, cp.plane, painter, proj, stroke);
+    cp.shape.draw(pts, cp.closed, cp.plane, painter, proj, stroke);
 }
 
 // ── Constraint conflict badge ─────────────────────────────────────────────────

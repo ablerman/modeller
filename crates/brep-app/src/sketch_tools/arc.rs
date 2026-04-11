@@ -43,7 +43,7 @@
 use brep_core::Point3;
 use crate::editor::{
     CommittedProfile, ProfileShape, SketchState, ToolInProgress,
-    project_center_to_arc_bisector, sketch_snapshot, tessellate_arc_from_center,
+    project_center_to_arc_bisector, push_to_global, sketch_snapshot, tessellate_arc_from_center,
 };
 
 /// Advance the arc state machine by one click at point `p`.
@@ -57,13 +57,15 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
         }
         Some(ToolInProgress::Arc2 { start, end_pt }) => {
             let center = project_center_to_arc_bisector(start, end_pt, p, sk.plane);
-            sk.history.push(sketch_snapshot(sk));
+            sk.history.push("Draw arc", sketch_snapshot(sk));
+            let point_indices = push_to_global(&[start, end_pt, center], &mut sk.global_points);
             sk.committed_profiles.push(CommittedProfile {
-                points:      vec![start, end_pt, center],
-                closed:      false,
-                shape:       ProfileShape::Arc,
-                plane:       Some(sk.plane),
-                constraints: Vec::new(),
+                points:        Vec::new(),
+                point_indices,
+                closed:        false,
+                shape:         ProfileShape::Arc,
+                plane:         Some(sk.plane),
+                constraints:   Vec::new(),
             });
         }
         _ => {}

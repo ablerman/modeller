@@ -757,11 +757,15 @@ impl ApplicationHandler for App {
                                     .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
                                 if is_pointer && state.snap_committed.is_some() {
                                     state.drag_committed = state.snap_committed;
+                                    // Push history before the first drag move so the action
+                                    // is undoable.  (The snapshot captures pre-drag state.)
+                                    state.editor.apply(UiAction::SketchSaveDragHistory);
                                 } else if is_pointer && state.snap_committed_curve.is_some() {
                                     state.drag_committed_curve = state.snap_committed_curve;
                                 } else if state.snap_vertex.is_some() {
                                     // Begin active-profile vertex drag.
                                     state.drag_vertex = state.snap_vertex;
+                                    state.editor.apply(UiAction::SketchSaveDragHistory);
                                 }
                             }
                         }
@@ -814,8 +818,11 @@ impl ApplicationHandler for App {
                                         } else {
                                             // Drawing tool: click on committed vertex → add point there (snap to it).
                                             let pt = state.editor.sketch.as_ref()
-                                                .and_then(|sk| sk.committed_profiles.get(pi))
-                                                .and_then(|cp| cp.points.get(vi).copied());
+                                                .and_then(|sk| {
+                                                    let cp = sk.committed_profiles.get(pi)?;
+                                                    let gi = cp.point_indices.get(vi)?;
+                                                    sk.global_points.get(*gi).copied()
+                                                });
                                             if let Some(p) = pt {
                                                 state.editor.apply(UiAction::SketchAddPoint(p));
                                             }
@@ -871,6 +878,49 @@ impl ApplicationHandler for App {
                                                     state.editor.apply(UiAction::SketchCloseLoop);
                                                 } else {
                                                     state.editor.apply(UiAction::SketchSelectVertex(vi));
+                                                }
+                                            } else if let Some((snap_pi, snap_vi)) = state.snap_committed {
+                                                // Clicking the chain's first vertex while drawing closes the loop.
+                                                let can_close_chain = state.editor.sketch.as_ref()
+                                                    .map_or(false, |sk| {
+                                                        if let Some(editor::ToolInProgress::PolylineChain {
+                                                            chain_start_profile,
+                                                            segment_count,
+                                                            ..
+                                                        }) = &sk.tool_in_progress {
+                                                            *segment_count >= 2
+                                                                && snap_pi == *chain_start_profile
+                                                                && snap_vi == 0
+                                                        } else {
+                                                            false
+                                                        }
+                                                    });
+                                                if can_close_chain {
+                                                    state.editor.apply(UiAction::SketchCloseLoop);
+                                                } else {
+                                                    let is_pointer = state.editor.sketch.as_ref()
+                                                        .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                                    if is_pointer {
+                                                        let shape = state.editor.sketch.as_ref()
+                                                            .and_then(|sk| sk.committed_profiles.get(snap_pi))
+                                                            .map(|cp| cp.shape.clone());
+                                                        if shape.as_ref().map_or(false, |s| s.vertex_selectable(snap_vi)) {
+                                                            state.editor.apply(UiAction::SketchSelectCommittedPoint(Some((snap_pi, snap_vi))));
+                                                        } else {
+                                                            state.editor.apply(UiAction::SketchSelectCommitted(Some(snap_pi)));
+                                                        }
+                                                    } else {
+                                                        // Snap to committed vertex as next drawing point.
+                                                        let pt = state.editor.sketch.as_ref()
+                                                            .and_then(|sk| {
+                                                                let cp = sk.committed_profiles.get(snap_pi)?;
+                                                                let gi = cp.point_indices.get(snap_vi)?;
+                                                                sk.global_points.get(*gi).copied()
+                                                            });
+                                                        if let Some(p) = pt {
+                                                            state.editor.apply(UiAction::SketchAddPoint(p));
+                                                        }
+                                                    }
                                                 }
                                             } else if let Some(r) = state.snap_ref {
                                                 state.editor.apply(UiAction::SketchSelectRef(r));
@@ -982,9 +1032,15 @@ impl ApplicationHandler for App {
                         if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
                             if let Some(cursor_pt) = state.sketch_cursor {
                                 if let Some(sk) = &mut state.editor.sketch {
-                                    if let Some(cp) = sk.committed_profiles.get_mut(pi) {
+                                    if let Some(cp) = sk.committed_profiles.get(pi).cloned() {
                                         let plane = cp.plane;
-                        cp.shape.apply_vertex_drag(&mut cp.points, vi, cursor_pt, plane);
+                                        let mut pts: Vec<_> = cp.point_indices.iter()
+                                            .map(|&gi| sk.global_points[gi])
+                                            .collect();
+                                        cp.shape.apply_vertex_drag(&mut pts, vi, cursor_pt, plane);
+                                        for (&gi, p) in cp.point_indices.iter().zip(pts.iter()) {
+                                            sk.global_points[gi] = *p;
+                                        }
                                     }
                                 }
                             }
@@ -996,9 +1052,15 @@ impl ApplicationHandler for App {
                         if state.mouse_pressed == Some(MouseButton::Left) && has_moved {
                             if let Some(cursor_pt) = state.sketch_cursor {
                                 if let Some(sk) = &mut state.editor.sketch {
-                                    if let Some(cp) = sk.committed_profiles.get_mut(pi) {
+                                    if let Some(cp) = sk.committed_profiles.get(pi).cloned() {
                                         let plane = cp.plane;
-                        cp.shape.apply_curve_drag(&mut cp.points, cursor_pt, plane);
+                                        let mut pts: Vec<_> = cp.point_indices.iter()
+                                            .map(|&gi| sk.global_points[gi])
+                                            .collect();
+                                        cp.shape.apply_curve_drag(&mut pts, cursor_pt, plane);
+                                        for (&gi, p) in cp.point_indices.iter().zip(pts.iter()) {
+                                            sk.global_points[gi] = *p;
+                                        }
                                     }
                                 }
                             }
@@ -1024,7 +1086,8 @@ impl ApplicationHandler for App {
                     // Snap to committed profile vertices (for pointer tool drag / constraint target).
                     let mut snap_comm = None;
                     'outer: for (pi, cp) in sk.committed_profiles.iter().enumerate() {
-                        for (vi, &pt) in cp.points.iter().enumerate() {
+                        for (vi, &gi) in cp.point_indices.iter().enumerate() {
+                            let pt = sk.global_points[gi];
                             if let Some((px, py)) = state.editor.camera.project_to_screen(pt, w, h) {
                                 let dx = px - cur.0;
                                 let dy = py - cur.1;
@@ -1042,8 +1105,9 @@ impl ApplicationHandler for App {
                     let mut snap_curve: Option<usize> = None;
                     if snap_comm.is_none() {
                         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            let pts: Vec<_> = cp.point_indices.iter().map(|&gi| sk.global_points[gi]).collect();
                             if cp.shape.hit_test_curve(
-                                &cp.points, cp.plane, cur, CURVE_SNAP_PX,
+                                &pts, cp.plane, cur, CURVE_SNAP_PX,
                                 &|pt| state.editor.camera.project_to_screen(pt, w, h),
                             ) {
                                 snap_curve = Some(pi);
@@ -1057,8 +1121,9 @@ impl ApplicationHandler for App {
                     let mut snap_seg: Option<(usize, usize)> = None;
                     if snap_comm.is_none() && snap_curve.is_none() {
                         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
+                            let pts: Vec<_> = cp.point_indices.iter().map(|&gi| sk.global_points[gi]).collect();
                             if let Some(si) = cp.shape.hit_test_segment(
-                                &cp.points, cp.closed, cur, CURVE_SNAP_PX,
+                                &pts, cp.closed, cur, CURVE_SNAP_PX,
                                 &|pt| state.editor.camera.project_to_screen(pt, w, h),
                             ) {
                                 snap_seg = Some((pi, si));

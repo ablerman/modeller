@@ -1,47 +1,78 @@
 //! # Polyline tool
 //!
-//! The Polyline tool builds an open or closed polygon by placing vertices one click at a time.
-//! It is the only tool that accumulates points directly in `sk.points`; all other multi-step
-//! tools (Arc, Rectangle, Circle) bypass `sk.points` and commit directly to
-//! `sk.committed_profiles`.
-//!
-//! ## Drawing
-//! Each left-click appends a new vertex to `sk.points` and immediately re-solves geometric
-//! constraints via `apply_constraints`. There is no `ToolInProgress` state — the tool is always
-//! "ready" for the next click.
+//! Each left-click places one point.  The *first* click stores the start position and enters
+//! `ToolInProgress::PolylineChain`; every subsequent click commits a 2-point
+//! `CommittedProfile` (one segment) whose start point is shared with the previous segment via
+//! the `global_points` store.  Adjacent segments therefore share the exact same `Point3` index,
+//! so they stay physically connected without requiring a separate Coincident constraint.
 //!
 //! ## Closing the loop
-//! When the active profile has ≥ 3 points and is not yet closed, clicking back on vertex 0
-//! triggers `SketchCloseLoop` rather than adding a duplicate point. The first vertex is rendered
-//! with a distinct orange hint circle while this is possible, giving the user a visual cue.
-//! Alternatively the user can press Enter or click the "Close" toolbar button.
+//! When ≥ 2 segments have been drawn the user can click back on the chain's first vertex
+//! (detected in `main.rs` via `snap_committed`) to dispatch `SketchCloseLoop`, which commits
+//! one final segment and sets `tool_in_progress = None`.
 //!
 //! ## Preview
-//! A single line segment is drawn from the last placed vertex to the current cursor position
-//! on every frame, showing where the next segment will go. This is rendered inline in `ui.rs`
-//! (inside the `None` arm of the `tool_in_progress` match) rather than via a `draw_preview`
-//! function.
-//!
-//! ## Dragging
-//! While using the Polyline tool, dragging an existing vertex (snap highlight on `snap_vertex`)
-//! repositions it without adding a new point. On release with < 4 px movement:
-//! - Clicking vertex 0 when ≥ 3 points exist → `SketchCloseLoop`.
-//! - Clicking any other vertex → `SketchSelectVertex(vi)`.
+//! A single line segment is drawn from `PolylineChain::pen_global_idx` to the cursor position
+//! on every frame (rendered in `ui.rs`).
 //!
 //! ## Undo
-//! `SketchUndoPoint` (Backspace) removes the last placed vertex from `sk.points`. If the
-//! profile is closed it first opens it (removes the `closed` flag); further backspaces remove
-//! vertices one at a time.
+//! `SketchUndoPoint` (Backspace) handled in `editor.rs`:
+//! - `segment_count == 0`: remove the pen point from `global_points` and clear
+//!   `tool_in_progress`.
+//! - `segment_count > 0`: pop the last committed profile, pop the end global point, decrement
+//!   `segment_count`, and reset `pen_global_idx` to the previous segment's start.
 
 use brep_core::Point3;
-use crate::editor::{SketchState, apply_constraints, sketch_snapshot};
+use crate::editor::{
+    CommittedProfile, ProfileShape, SketchState, ToolInProgress,
+    apply_constraints, push_to_global, sketch_snapshot,
+};
 
-/// Append `p` to the active profile and re-solve constraints.
-///
-/// A snapshot is pushed to history before the point is added so the operation can be undone
-/// with `SketchUndoPoint`.
+/// Handle a left-click at `p` while the Polyline tool is active.
 pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
-    sk.history.push(sketch_snapshot(sk));
-    sk.points.push(p);
-    apply_constraints(sk);
+    match sk.tool_in_progress.take() {
+        None => {
+            // First click: push the start point into global_points and enter chain mode.
+            let chain_start_global_pt_idx = sk.global_points.len();
+            sk.global_points.push(p);
+            let pen_global_idx = chain_start_global_pt_idx;
+            sk.tool_in_progress = Some(ToolInProgress::PolylineChain {
+                chain_start_profile: sk.committed_profiles.len(),
+                chain_start_global_pt_idx,
+                pen_global_idx,
+                segment_count: 0,
+            });
+            // No history push — first click doesn't create a segment yet.
+        }
+        Some(ToolInProgress::PolylineChain {
+            chain_start_profile,
+            chain_start_global_pt_idx,
+            pen_global_idx,
+            segment_count,
+        }) => {
+            // Subsequent click: commit a 2-point segment sharing `pen_global_idx`.
+            sk.history.push("Draw segment", sketch_snapshot(sk));
+            let end_indices = push_to_global(&[p], &mut sk.global_points);
+            let end_idx = end_indices[0];
+            sk.committed_profiles.push(CommittedProfile {
+                points:        Vec::new(),
+                point_indices: vec![pen_global_idx, end_idx],
+                closed:        false,
+                shape:         ProfileShape::Polyline,
+                plane:         Some(sk.plane),
+                constraints:   Vec::new(),
+            });
+            sk.tool_in_progress = Some(ToolInProgress::PolylineChain {
+                chain_start_profile,
+                chain_start_global_pt_idx,
+                pen_global_idx: end_idx,
+                segment_count: segment_count + 1,
+            });
+            apply_constraints(sk);
+        }
+        other => {
+            // Restore any other tool state we accidentally took.
+            sk.tool_in_progress = other;
+        }
+    }
 }

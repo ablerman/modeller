@@ -36,7 +36,7 @@
 use brep_core::Point3;
 use crate::editor::{
     CommittedProfile, ProfileShape, SketchState, ToolInProgress,
-    sketch_snapshot, tessellate_circle,
+    push_to_global, sketch_snapshot, tessellate_circle,
 };
 
 /// Advance the circle state machine by one click at point `p`.
@@ -46,13 +46,15 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
             sk.tool_in_progress = Some(ToolInProgress::CircleCenter { center: p });
         }
         Some(ToolInProgress::CircleCenter { center }) => {
-            sk.history.push(sketch_snapshot(sk));
+            sk.history.push("Draw circle", sketch_snapshot(sk));
+            let point_indices = push_to_global(&[center, p], &mut sk.global_points);
             sk.committed_profiles.push(CommittedProfile {
-                points:      vec![center, p],
-                closed:      true,
-                shape:       ProfileShape::Circle,
-                plane:       Some(sk.plane),
-                constraints: Vec::new(),
+                points:        Vec::new(),
+                point_indices,
+                closed:        true,
+                shape:         ProfileShape::Circle,
+                plane:         Some(sk.plane),
+                constraints:   Vec::new(),
             });
         }
         _ => {}

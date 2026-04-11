@@ -194,7 +194,8 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
         let constraint = (|| -> Option<SketchConstraint> {
             let &(ci, vi) = sk.committed_pt_selection.first()?;
             let cp = sk.committed_profiles.get(ci)?;
-            let p = cp.points.get(vi)?;
+            let &gi = cp.point_indices.get(vi)?;
+            let p = sk.global_points.get(gi)?;
             let (u_axis, v_axis) = sk.plane.uv_axes();
             let u = p.coords.dot(&u_axis);
             let v = p.coords.dot(&v_axis);
@@ -209,7 +210,8 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
         let constraint = (|| -> Option<SketchConstraint> {
             let ci = sk.committed_selection?;
             let cp = sk.committed_profiles.get(ci)?;
-            cp.shape.point_on_curve_constraint(&cp.points, sk.pt_selection[0], sk.plane)
+            let pts = crate::editor::resolved_points(cp, &sk.global_points);
+            cp.shape.point_on_curve_constraint(&pts, sk.pt_selection[0], sk.plane)
         })();
         match constraint {
             Some(c) => c,

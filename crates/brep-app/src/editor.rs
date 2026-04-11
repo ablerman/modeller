@@ -84,7 +84,7 @@ impl SketchPlane {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DrawTool { Pointer, Polyline, Arc, Rectangle, Circle }
 
-/// Intermediate state accumulated by multi-click drawing tools (Arc/Rect/Circle).
+/// Intermediate state accumulated by multi-click drawing tools (Arc/Rect/Circle/Polyline).
 /// Stored in `SketchState`; cleared when the tool operation is committed or cancelled.
 #[derive(Clone, Debug)]
 pub enum ToolInProgress {
@@ -96,6 +96,18 @@ pub enum ToolInProgress {
     CircleCenter { center: Point3 },
     /// Rectangle tool: first corner has been placed; waiting for opposite corner.
     RectFirst { corner: Point3 },
+    /// Polyline tool: one or more points have been placed.  Each completed segment
+    /// lives in `committed_profiles`; `pen_global_idx` is the last placed point.
+    PolylineChain {
+        /// Index of the first CommittedProfile belonging to this chain.
+        chain_start_profile: usize,
+        /// Index into `SketchState::global_points` at which this chain's points begin.
+        chain_start_global_pt_idx: usize,
+        /// Index into `global_points` of the current "pen" (last placed point).
+        pen_global_idx: usize,
+        /// Number of segments committed so far (0 = only the start point was placed).
+        segment_count: usize,
+    },
 }
 
 /// What a length constraint applies to — used for the modal dialog.
@@ -172,6 +184,9 @@ pub struct SketchState {
     /// Selected segments within committed polylines (profile_idx, segment_idx).
     /// Supports up to 2 simultaneous selections (like active-profile seg_selection).
     pub committed_seg_selection: Vec<(usize, usize)>,
+    /// Flat store of all 3-D points belonging to committed profiles.
+    /// `CommittedProfile::point_indices` holds indices into this vec.
+    pub global_points: Vec<Point3>,
 }
 
 pub use crate::profile_shapes::ProfileShape;
@@ -179,17 +194,25 @@ pub use crate::profile_shapes::ProfileShape;
 /// A single sub-profile within a sketch (e.g. one circle, one rectangle, or one
 /// closed polyline).  A `SketchState` can accumulate many of these alongside the active
 /// open profile being drawn.
+///
+/// During a live sketch session `point_indices` (into `SketchState::global_points`) is
+/// the authoritative source; `points` is only populated when serialising to/from disk.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommittedProfile {
-    pub points:      Vec<Point3>,
-    pub closed:      bool,
-    /// Geometric interpretation of `points`.  Defaults to `Polyline` for backward compat.
+    /// Populated only when serialising / deserialising.  Empty during an active sketch session.
     #[serde(default)]
-    pub shape:       ProfileShape,
+    pub points:        Vec<Point3>,
+    /// Indices into `SketchState::global_points`.  Not serialised; reconstructed on load.
+    #[serde(skip)]
+    pub point_indices: Vec<usize>,
+    pub closed:        bool,
+    /// Geometric interpretation of `points`/`point_indices`.  Defaults to `Polyline`.
+    #[serde(default)]
+    pub shape:         ProfileShape,
     /// The sketch plane this profile lives on (needed for arc tessellation during rendering).
     #[serde(default)]
-    pub plane:       Option<SketchPlane>,
-    pub constraints: Vec<SketchConstraint>,
+    pub plane:         Option<SketchPlane>,
+    pub constraints:   Vec<SketchConstraint>,
 }
 
 /// A sketch stored in the operations list.  Contains one or more profiles.
@@ -453,32 +476,41 @@ pub(crate) struct SketchSnapshot {
     constraints:        Vec<SketchConstraint>,
     closed:             bool,
     committed_profiles: Vec<CommittedProfile>,
+    global_points:      Vec<Point3>,
+}
+
+/// One entry in the sketch action log: the label displayed to the user and the
+/// snapshot of sketch state captured *before* the action was applied.
+#[derive(Clone, Debug)]
+pub struct SketchHistoryEntry {
+    pub label:    String,
+    pub snapshot: SketchSnapshot,
 }
 
 #[derive(Clone, Debug)]
 pub struct SketchHistory {
-    undo_stack: Vec<SketchSnapshot>,
-    redo_stack: Vec<SketchSnapshot>,
+    pub undo_stack: Vec<SketchHistoryEntry>,
+    pub redo_stack: Vec<SketchHistoryEntry>,
 }
 
 impl SketchHistory {
     fn new() -> Self { Self { undo_stack: Vec::new(), redo_stack: Vec::new() } }
 
-    pub(crate) fn push(&mut self, snapshot: SketchSnapshot) {
-        self.undo_stack.push(snapshot);
+    pub(crate) fn push(&mut self, label: impl Into<String>, snapshot: SketchSnapshot) {
+        self.undo_stack.push(SketchHistoryEntry { label: label.into(), snapshot });
         self.redo_stack.clear();
     }
 
-    fn undo(&mut self, current: SketchSnapshot) -> Option<SketchSnapshot> {
+    fn undo(&mut self, label: impl Into<String>, current: SketchSnapshot) -> Option<SketchSnapshot> {
         let prev = self.undo_stack.pop()?;
-        self.redo_stack.push(current);
-        Some(prev)
+        self.redo_stack.push(SketchHistoryEntry { label: label.into(), snapshot: current });
+        Some(prev.snapshot)
     }
 
-    fn redo(&mut self, current: SketchSnapshot) -> Option<SketchSnapshot> {
+    fn redo(&mut self, label: impl Into<String>, current: SketchSnapshot) -> Option<SketchSnapshot> {
         let next = self.redo_stack.pop()?;
-        self.undo_stack.push(current);
-        Some(next)
+        self.undo_stack.push(SketchHistoryEntry { label: label.into(), snapshot: current });
+        Some(next.snapshot)
     }
 
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
@@ -571,6 +603,12 @@ pub enum UiAction {
     SketchSelectCommittedSeg(Option<(usize, usize)>),
     /// Add a constraint to a specific committed profile and re-solve it.
     SketchAddCommittedConstraint(usize, SketchConstraint),
+    /// Delete the action-log entry at the given index, restoring the sketch to
+    /// the state captured before that action (discards all subsequent actions).
+    SketchDeleteHistoryEntry(usize),
+    /// Push the current sketch state onto the history stack with label "Move point".
+    /// Called at the start of a vertex drag so the move is undoable.
+    SketchSaveDragHistory,
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -628,22 +666,74 @@ pub(crate) fn apply_constraints(sk: &mut SketchState) {
     }
 }
 
-/// Run the constraint solver on a committed profile, updating its point positions in place.
-/// `plane` is the sketch plane the profile lives on (used for 3D↔2D conversion).
-pub(crate) fn apply_committed_profile_constraints(cp: &mut CommittedProfile, plane: SketchPlane) {
-    if cp.constraints.is_empty() || cp.points.len() < 2 { return; }
+/// Run the constraint solver on a committed profile, writing updated positions
+/// back into `global_points`.  Uses local (0-based) constraint indices.
+pub(crate) fn apply_committed_profile_constraints(
+    cp: &CommittedProfile,
+    global_points: &mut Vec<Point3>,
+    plane: SketchPlane,
+) {
+    if cp.constraints.is_empty() || cp.point_indices.len() < 2 { return; }
     let (u, v) = plane.uv_axes();
-    let mut pts2d: Vec<[f64; 2]> = cp.points.iter()
-        .map(|p| [p.coords.dot(&u), p.coords.dot(&v)])
+    let mut pts2d: Vec<[f64; 2]> = cp.point_indices.iter()
+        .map(|&gi| { let p = global_points[gi]; [p.coords.dot(&u), p.coords.dot(&v)] })
         .collect();
     let n = pts2d.len();
     if solve_constraints(&mut pts2d, &cp.constraints, n) == SolveResult::Ok {
-        for (i, p) in cp.points.iter_mut().enumerate() {
-            *p = Point3::origin() + u * pts2d[i][0] + v * pts2d[i][1];
+        for (&gi, p2) in cp.point_indices.iter().zip(pts2d.iter()) {
+            global_points[gi] = Point3::origin() + u * p2[0] + v * p2[1];
         }
     }
 }
 
+/// Resolve a committed profile's point indices to a `Vec<Point3>` for read-only use
+/// (rendering, hit-testing, constraint building).
+pub(crate) fn resolved_points(cp: &CommittedProfile, global_points: &[Point3]) -> Vec<Point3> {
+    cp.point_indices.iter().map(|&gi| global_points[gi]).collect()
+}
+
+/// Push `pts` into `global_points` and return their (new) indices.
+pub(crate) fn push_to_global(pts: &[Point3], global_points: &mut Vec<Point3>) -> Vec<usize> {
+    let start = global_points.len();
+    global_points.extend_from_slice(pts);
+    (start..global_points.len()).collect()
+}
+
+/// Attempt to assemble a simple head-to-tail chain of 2-point Polyline profiles into
+/// a single ordered point list (suitable for extrusion).  Returns an empty Vec if the
+/// profiles cannot be arranged into an unambiguous linear or closed chain.
+pub(crate) fn assemble_polyline_chain(profiles: &[CommittedProfile]) -> Vec<Point3> {
+    // Collect only 2-point Polyline segments that have their serialised points populated.
+    let segs: Vec<&CommittedProfile> = profiles.iter()
+        .filter(|cp| cp.shape == ProfileShape::Polyline && cp.points.len() == 2)
+        .collect();
+    if segs.len() < 2 { return Vec::new(); }
+
+    // Find a start segment: one whose start point is not the end point of any other segment.
+    let start_idx = segs.iter().position(|s| {
+        !segs.iter().any(|o| std::ptr::eq(*o, *s) == false
+            && (o.points[1] - s.points[0]).norm() < 1e-9)
+    });
+    let Some(start) = start_idx else { return Vec::new(); };
+
+    let mut ordered: Vec<&CommittedProfile> = vec![segs[start]];
+    let mut used = vec![false; segs.len()];
+    used[start] = true;
+    loop {
+        let last_end = ordered.last().unwrap().points[1];
+        let next = segs.iter().enumerate().find(|(i, s)| {
+            !used[*i] && (s.points[0] - last_end).norm() < 1e-9
+        });
+        match next {
+            Some((i, s)) => { used[i] = true; ordered.push(s); }
+            None => break,
+        }
+    }
+    if ordered.len() != segs.len() { return Vec::new(); }
+    let mut pts: Vec<Point3> = ordered.iter().map(|s| s.points[0]).collect();
+    pts.push(ordered.last().unwrap().points[1]);
+    pts
+}
 
 pub(crate) fn sketch_snapshot(sk: &SketchState) -> SketchSnapshot {
     SketchSnapshot {
@@ -651,6 +741,30 @@ pub(crate) fn sketch_snapshot(sk: &SketchState) -> SketchSnapshot {
         constraints:        sk.constraints.clone(),
         closed:             sk.closed,
         committed_profiles: sk.committed_profiles.clone(),
+        global_points:      sk.global_points.clone(),
+    }
+}
+
+/// Short human-readable label for a constraint type, used in the action log.
+pub(crate) fn constraint_action_label(c: &SketchConstraint) -> &'static str {
+    match c {
+        SketchConstraint::Parallel { .. }       => "Parallel",
+        SketchConstraint::Perpendicular { .. }  => "Perpendicular",
+        SketchConstraint::Angle { .. }          => "Angle",
+        SketchConstraint::Horizontal { .. }     => "Horizontal",
+        SketchConstraint::Vertical { .. }       => "Vertical",
+        SketchConstraint::EqualLength { .. }    => "Equal length",
+        SketchConstraint::Coincident { .. }     => "Coincident",
+        SketchConstraint::PointOnLine { .. }    => "Coincident",
+        SketchConstraint::FixedLength { .. }    => "Fixed length",
+        SketchConstraint::PointDistance { .. }  => "Point distance",
+        SketchConstraint::PointFixed { .. }     => "Fixed point",
+        SketchConstraint::PointOnOrigin { .. }  => "On origin",
+        SketchConstraint::PointOnXAxis { .. }   => "On X-axis",
+        SketchConstraint::PointOnYAxis { .. }   => "On Y-axis",
+        SketchConstraint::HorizontalPair { .. } => "Horizontal pair",
+        SketchConstraint::VerticalPair { .. }   => "Vertical pair",
+        SketchConstraint::PointOnCircle { .. }  => "Coincident",
     }
 }
 
@@ -772,12 +886,14 @@ impl EditorState {
             UiAction::Undo => {
                 if let Some(sk) = &mut self.sketch {
                     if sk.history.can_undo() {
+                        let label = sk.history.undo_stack.last().map(|e| e.label.clone()).unwrap_or_default();
                         let current = sketch_snapshot(sk);
-                        if let Some(prev) = sk.history.undo(current) {
+                        if let Some(prev) = sk.history.undo(label, current) {
                             sk.points              = prev.points;
                             sk.constraints         = prev.constraints;
                             sk.closed              = prev.closed;
                             sk.committed_profiles  = prev.committed_profiles;
+                            sk.global_points       = prev.global_points;
                             sk.tool_in_progress    = None;
                             apply_constraints(sk);
                         }
@@ -795,12 +911,14 @@ impl EditorState {
             UiAction::Redo => {
                 if let Some(sk) = &mut self.sketch {
                     if sk.history.can_redo() {
+                        let label = sk.history.redo_stack.last().map(|e| e.label.clone()).unwrap_or_default();
                         let current = sketch_snapshot(sk);
-                        if let Some(next) = sk.history.redo(current) {
+                        if let Some(next) = sk.history.redo(label, current) {
                             sk.points              = next.points;
                             sk.constraints         = next.constraints;
                             sk.closed              = next.closed;
                             sk.committed_profiles  = next.committed_profiles;
+                            sk.global_points       = next.global_points;
                             sk.tool_in_progress    = None;
                             apply_constraints(sk);
                         }
@@ -852,6 +970,7 @@ impl EditorState {
                     committed_selection: None,
                     committed_pt_selection: Vec::new(),
                     committed_seg_selection: Vec::new(),
+                    global_points: Vec::new(),
                 });
                 self.selection.clear();
                 // Animate the camera to look at the chosen plane with axes oriented
@@ -885,9 +1004,16 @@ impl EditorState {
                 self.entries.remove(i);
                 self.selection.clear();
                 let plane = raw.plane;
-                // Backfill the plane for any committed profiles that predate the field.
+                // Rebuild global_points from serialised profile points and set point_indices.
+                let mut global_points: Vec<Point3> = Vec::new();
                 let committed_profiles: Vec<_> = raw.extra_profiles.into_iter()
-                    .map(|mut cp| { if cp.plane.is_none() { cp.plane = Some(plane); } cp })
+                    .map(|mut cp| {
+                        if cp.plane.is_none() { cp.plane = Some(plane); }
+                        // Migrate: move owned points into global store.
+                        cp.point_indices = push_to_global(&cp.points, &mut global_points);
+                        cp.points.clear();
+                        cp
+                    })
                     .collect();
                 self.sketch = Some(SketchState {
                     name:                 raw.name,
@@ -908,6 +1034,7 @@ impl EditorState {
                     committed_selection:    None,
                     committed_pt_selection: Vec::new(),
                     committed_seg_selection: Vec::new(),
+                    global_points,
                 });
                 // Animate camera to face the sketch plane.
                 let (az, el) = match raw.plane {
@@ -970,6 +1097,14 @@ impl EditorState {
             }
             UiAction::SketchAbortActive => {
                 if let Some(sk) = &mut self.sketch {
+                    // If aborting a polyline chain, remove all profiles and global points
+                    // added since the chain started.
+                    if let Some(ToolInProgress::PolylineChain {
+                        chain_start_profile, chain_start_global_pt_idx, ..
+                    }) = sk.tool_in_progress {
+                        sk.committed_profiles.truncate(chain_start_profile);
+                        sk.global_points.truncate(chain_start_global_pt_idx);
+                    }
                     sk.tool_in_progress = None;
                     sk.points.clear();
                     sk.closed = false;
@@ -984,17 +1119,19 @@ impl EditorState {
             UiAction::SketchCommitPolyline => {
                 if let Some(sk) = &mut self.sketch {
                     if sk.points.len() >= 2 && sk.tool_in_progress.is_none() {
-                        sk.history.push(sketch_snapshot(sk));
+                        sk.history.push("Commit polyline", sketch_snapshot(sk));
                         let pts = std::mem::take(&mut sk.points);
                         let constraints = std::mem::take(&mut sk.constraints);
                         sk.closed = false;
                         sk.seg_selection.clear();
                         sk.pt_selection.clear();
+                        let point_indices = push_to_global(&pts, &mut sk.global_points);
                         sk.committed_profiles.push(CommittedProfile {
-                            points:      pts,
-                            closed:      false,
-                            shape:       ProfileShape::Polyline,
-                            plane:       None,
+                            points:        Vec::new(),
+                            point_indices,
+                            closed:        false,
+                            shape:         ProfileShape::Polyline,
+                            plane:         None,
                             constraints,
                         });
                     }
@@ -1064,19 +1201,55 @@ impl EditorState {
                             // Step back: forget end_pt, keep start.
                             sk.tool_in_progress = Some(ToolInProgress::Arc1 { start });
                         }
+                        Some(ToolInProgress::PolylineChain {
+                            chain_start_profile,
+                            chain_start_global_pt_idx,
+                            pen_global_idx,
+                            segment_count,
+                        }) => {
+                            if segment_count == 0 {
+                                // Only the start point was placed — remove it.
+                                sk.global_points.truncate(chain_start_global_pt_idx);
+                                // tool_in_progress already taken (None).
+                            } else {
+                                // Remove the last segment and its endpoint.
+                                let prev_pen = sk.committed_profiles.last()
+                                    .and_then(|cp| cp.point_indices.first().copied())
+                                    .unwrap_or(pen_global_idx);
+                                sk.committed_profiles.pop();
+                                // Remove the end point that was added for this segment.
+                                sk.global_points.pop();
+                                sk.tool_in_progress = Some(ToolInProgress::PolylineChain {
+                                    chain_start_profile,
+                                    chain_start_global_pt_idx,
+                                    pen_global_idx: prev_pen,
+                                    segment_count: segment_count - 1,
+                                });
+                            }
+                        }
                         Some(_) => {
                             // Arc1, RectFirst, CircleCenter: cancel back to idle.
                         }
                         None => {
                             // No tool in progress: undo the last committed point or profile.
-                            sk.history.push(sketch_snapshot(sk));
+                            sk.history.push("Undo point", sketch_snapshot(sk));
                             if sk.closed {
                                 sk.closed = false;
                             } else if !sk.points.is_empty() {
                                 sk.points.pop();
                             } else {
                                 // Active profile is empty — remove the last committed profile.
-                                sk.committed_profiles.pop();
+                                if let Some(cp) = sk.committed_profiles.pop() {
+                                    // If the removed profile owned the tail of global_points, shrink it.
+                                    if let Some(&last_gi) = cp.point_indices.last() {
+                                        // Only trim if these indices are at the tail and not shared.
+                                        let shared = sk.committed_profiles.iter()
+                                            .any(|o| o.point_indices.iter().any(|&gi| gi == last_gi));
+                                        if !shared && last_gi + 1 == sk.global_points.len() {
+                                            sk.global_points.pop();
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1084,10 +1257,38 @@ impl EditorState {
                 false
             }
             UiAction::SketchCloseLoop => {
-                // Only close when no multi-step tool is in progress.
                 if let Some(sk) = &mut self.sketch {
-                    if sk.points.len() >= 3 && sk.tool_in_progress.is_none() {
-                        sk.history.push(sketch_snapshot(sk));
+                    if let Some(ToolInProgress::PolylineChain {
+                        chain_start_profile,
+                        chain_start_global_pt_idx,
+                        pen_global_idx,
+                        segment_count,
+                    }) = sk.tool_in_progress.take() {
+                        if segment_count >= 2 {
+                            sk.history.push("Close loop", sketch_snapshot(sk));
+                            let chain_start_pt_idx =
+                                sk.committed_profiles[chain_start_profile].point_indices[0];
+                            sk.committed_profiles.push(CommittedProfile {
+                                points:        Vec::new(),
+                                point_indices: vec![pen_global_idx, chain_start_pt_idx],
+                                closed:        false,
+                                shape:         ProfileShape::Polyline,
+                                plane:         Some(sk.plane),
+                                constraints:   Vec::new(),
+                            });
+                            // tool_in_progress = None (already taken).
+                        } else {
+                            // Not enough segments to close — put state back.
+                            sk.tool_in_progress = Some(ToolInProgress::PolylineChain {
+                                chain_start_profile,
+                                chain_start_global_pt_idx,
+                                pen_global_idx,
+                                segment_count,
+                            });
+                        }
+                    } else if sk.points.len() >= 3 && sk.tool_in_progress.is_none() {
+                        // Legacy path: close the active profile.
+                        sk.history.push("Close loop", sketch_snapshot(sk));
                         sk.closed = true;
                     }
                 }
@@ -1101,8 +1302,15 @@ impl EditorState {
                     self.sketch = Some(sk);
                     return false;
                 }
-                // Build the full list of profiles to save.
-                let mut extra_profiles = sk.committed_profiles;
+                // Resolve global_points back into CommittedProfile.points for serialisation.
+                let mut serialisable: Vec<CommittedProfile> = sk.committed_profiles.iter()
+                    .map(|cp| {
+                        let mut out = cp.clone();
+                        out.points = resolved_points(cp, &sk.global_points);
+                        out.point_indices.clear();
+                        out
+                    })
+                    .collect();
                 let (primary_points, primary_constraints) = if has_active {
                     let persistent: Vec<_> = sk.constraints.iter()
                         .filter(|c| !matches!(c, SketchConstraint::PointFixed { .. }))
@@ -1110,9 +1318,17 @@ impl EditorState {
                         .collect();
                     (sk.points, persistent)
                 } else {
-                    // No active profile — promote first committed as primary.
-                    let first = extra_profiles.remove(0);
-                    (first.points, first.constraints)
+                    // No active profile — try to find a contiguous polyline chain first.
+                    let chain = assemble_polyline_chain(&serialisable);
+                    if chain.len() >= 3 {
+                        // Remove all segments that form a simple chain and use assembled points.
+                        serialisable.retain(|cp| cp.shape != ProfileShape::Polyline || cp.points.len() != 2);
+                        (chain, Vec::new())
+                    } else {
+                        // Promote first committed as primary.
+                        let first = serialisable.remove(0);
+                        (first.points, first.constraints)
+                    }
                 };
                 let id = self.alloc_id();
                 let name = sk.name.clone();
@@ -1122,7 +1338,7 @@ impl EditorState {
                     plane:          sk.plane,
                     points:         primary_points,
                     constraints:    primary_constraints,
-                    extra_profiles,
+                    extra_profiles: serialisable,
                     id,
                 }));
                 // Sketch entries are not "selected" (no solid to operate on).
@@ -1164,7 +1380,8 @@ impl EditorState {
             }
             UiAction::SketchAddConstraint(c) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.history.push(sketch_snapshot(sk));
+                    let label = constraint_action_label(&c);
+                    sk.history.push(label, sketch_snapshot(sk));
                     sk.constraints.push(c);
                     apply_constraints(sk);
                 }
@@ -1179,7 +1396,7 @@ impl EditorState {
             UiAction::SketchRemoveConstraint(idx) => {
                 if let Some(sk) = &mut self.sketch {
                     if idx < sk.constraints.len() {
-                        sk.history.push(sketch_snapshot(sk));
+                        sk.history.push("Remove constraint", sketch_snapshot(sk));
                         sk.constraints.remove(idx);
                         if !sk.violated_constraints.is_empty() {
                             sk.violated_constraints.remove(idx);
@@ -1192,10 +1409,35 @@ impl EditorState {
             UiAction::SketchAddCommittedConstraint(pi, c) => {
                 if let Some(sk) = &mut self.sketch {
                     if pi < sk.committed_profiles.len() {
-                        sk.history.push(sketch_snapshot(sk));
+                        let label = constraint_action_label(&c);
+                        sk.history.push(label, sketch_snapshot(sk));
                         let plane = sk.committed_profiles[pi].plane.unwrap_or(sk.plane);
                         sk.committed_profiles[pi].constraints.push(c);
-                        apply_committed_profile_constraints(&mut sk.committed_profiles[pi], plane);
+                        let cp = &sk.committed_profiles[pi];
+                        apply_committed_profile_constraints(cp, &mut sk.global_points, plane);
+                    }
+                }
+                false
+            }
+            UiAction::SketchSaveDragHistory => {
+                if let Some(sk) = &mut self.sketch {
+                    sk.history.push("Move point", sketch_snapshot(sk));
+                }
+                false
+            }
+            UiAction::SketchDeleteHistoryEntry(idx) => {
+                if let Some(sk) = &mut self.sketch {
+                    if idx < sk.history.undo_stack.len() {
+                        let snap = sk.history.undo_stack[idx].snapshot.clone();
+                        sk.history.undo_stack.truncate(idx);
+                        sk.history.redo_stack.clear();
+                        sk.points             = snap.points;
+                        sk.constraints        = snap.constraints;
+                        sk.closed             = snap.closed;
+                        sk.committed_profiles = snap.committed_profiles;
+                        sk.global_points      = snap.global_points;
+                        sk.tool_in_progress   = None;
+                        apply_constraints(sk);
                     }
                 }
                 false

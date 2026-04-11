@@ -38,7 +38,7 @@
 use brep_core::Point3;
 use crate::editor::{
     CommittedProfile, ProfileShape, SketchState, ToolInProgress,
-    rect_corners, sketch_snapshot,
+    push_to_global, rect_corners, sketch_snapshot,
 };
 
 /// Advance the rectangle state machine by one click at point `p`.
@@ -49,13 +49,15 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
         }
         Some(ToolInProgress::RectFirst { corner }) => {
             let corners = rect_corners(corner, p, sk.plane);
-            sk.history.push(sketch_snapshot(sk));
+            sk.history.push("Draw rectangle", sketch_snapshot(sk));
+            let point_indices = push_to_global(&corners, &mut sk.global_points);
             sk.committed_profiles.push(CommittedProfile {
-                points:      corners.to_vec(),
-                closed:      true,
-                shape:       ProfileShape::Polyline,
-                plane:       None,
-                constraints: Vec::new(),
+                points:        Vec::new(),
+                point_indices,
+                closed:        true,
+                shape:         ProfileShape::Polyline,
+                plane:         None,
+                constraints:   Vec::new(),
             });
         }
         _ => {}
