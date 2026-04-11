@@ -96,6 +96,65 @@ pub fn solve_constraints(
     SolveResult::Ok
 }
 
+// ── High-level apply ──────────────────────────────────────────────────────────
+
+/// Result of [`apply_constraints`].
+pub struct ApplyResult {
+    /// `true` if the solver could not satisfy all constraints.
+    pub conflict: bool,
+    /// Parallel to the constraint slice — `true` for each constraint that
+    /// contributed to the conflict.  Empty when `conflict` is `false`.
+    pub violated: Vec<bool>,
+}
+
+/// Run the constraint solver and, on failure, identify the conflicting constraints.
+///
+/// On success the `pts` array is updated in place.
+/// On conflict `pts` is left unchanged and `violated` identifies culprits.
+pub fn apply_constraints(
+    pts: &mut Vec<[f64; 2]>,
+    constraints: &[SketchConstraint],
+    n_pts: usize,
+) -> ApplyResult {
+    if constraints.is_empty() || pts.len() < 2 {
+        return ApplyResult { conflict: false, violated: vec![] };
+    }
+    match solve_constraints(pts, constraints, n_pts) {
+        SolveResult::Ok => ApplyResult { conflict: false, violated: vec![] },
+        SolveResult::Conflict => {
+            let violated = find_conflicting_constraints(pts, constraints, n_pts);
+            ApplyResult { conflict: true, violated }
+        }
+    }
+}
+
+/// For each constraint, check whether removing it allows the remaining system
+/// to converge.  Returns a parallel `Vec<bool>` — `true` means that constraint
+/// is involved in the conflict.
+fn find_conflicting_constraints(
+    pts: &[[f64; 2]],
+    constraints: &[SketchConstraint],
+    n_pts: usize,
+) -> Vec<bool> {
+    constraints
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let reduced: Vec<SketchConstraint> = constraints
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, c)| c.clone())
+                .collect();
+            if reduced.is_empty() {
+                return true;
+            }
+            let mut pts_copy: Vec<[f64; 2]> = pts.to_vec();
+            solve_constraints(&mut pts_copy, &reduced, n_pts) == SolveResult::Ok
+        })
+        .collect()
+}
+
 /// Number of scalar residuals for the given constraint list.
 /// `Coincident` produces 2; every other constraint produces 1.
 fn count_residuals(constraints: &[SketchConstraint]) -> usize {

@@ -6,7 +6,7 @@ use std::time::Instant;
 use brep_algo::bvh::{Bvh, Ray};
 use brep_bool::{boolean_op, BooleanKind};
 use brep_core::{Point3, Vec3};
-use brep_sketch::{solve_constraints, SketchConstraint, SolveResult};
+use brep_sketch::{apply_constraints as sketch_apply, solve_constraints, SketchConstraint, SolveResult};
 use brep_topo::{
     primitives::{make_box, make_cone, make_cylinder, make_sphere},
     store::ShapeStore,
@@ -614,23 +614,17 @@ pub struct EditorState {
 pub(crate) fn apply_constraints(sk: &mut SketchState) {
     if sk.constraints.is_empty() || sk.points.len() < 2 { return; }
     let (u, v) = sk.plane.uv_axes();
-    // Map Point3 → [f64; 2] in plane coordinates.
     let mut pts2d: Vec<[f64; 2]> = sk.points.iter()
         .map(|p| [p.coords.dot(&u), p.coords.dot(&v)])
         .collect();
     let n = pts2d.len();
-    let result = solve_constraints(&mut pts2d, &sk.constraints, n);
-    sk.constraints_conflict = result == SolveResult::Conflict;
-    if result == SolveResult::Ok {
-        sk.violated_constraints.clear();
+    let result = sketch_apply(&mut pts2d, &sk.constraints, n);
+    sk.constraints_conflict = result.conflict;
+    sk.violated_constraints = result.violated;
+    if !result.conflict {
         for (i, p) in sk.points.iter_mut().enumerate() {
             *p = Point3::origin() + u * pts2d[i][0] + v * pts2d[i][1];
         }
-    } else {
-        // Identify which constraints are involved in the conflict: try removing
-        // each one in turn — if removal makes the system solvable, that constraint
-        // is a contributor.
-        sk.violated_constraints = find_conflicting_constraints(&pts2d, &sk.constraints, n);
     }
 }
 
@@ -650,34 +644,6 @@ pub(crate) fn apply_committed_profile_constraints(cp: &mut CommittedProfile, pla
     }
 }
 
-/// For each constraint, check whether removing it allows the remaining system to
-/// converge.  Returns a parallel `Vec<bool>` — `true` means that constraint is
-/// involved in the conflict.
-fn find_conflicting_constraints(
-    pts: &[[f64; 2]],
-    constraints: &[SketchConstraint],
-    n_pts: usize,
-) -> Vec<bool> {
-    constraints
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let reduced: Vec<&SketchConstraint> = constraints
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, c)| c)
-                .collect();
-            if reduced.is_empty() {
-                // Removing the only constraint always succeeds.
-                return true;
-            }
-            let reduced_owned: Vec<SketchConstraint> = reduced.into_iter().cloned().collect();
-            let mut pts_copy: Vec<[f64; 2]> = pts.to_vec();
-            solve_constraints(&mut pts_copy, &reduced_owned, n_pts) == SolveResult::Ok
-        })
-        .collect()
-}
 
 pub(crate) fn sketch_snapshot(sk: &SketchState) -> SketchSnapshot {
     SketchSnapshot {

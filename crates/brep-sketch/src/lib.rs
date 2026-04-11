@@ -14,8 +14,9 @@
 //! // pts[0] and pts[1] now have the same y coordinate.
 //! ```
 
+pub mod arc;
 pub mod constraints;
 pub mod solver;
 
 pub use constraints::SketchConstraint;
-pub use solver::{solve_constraints, SolveResult};
+pub use solver::{apply_constraints, ApplyResult, solve_constraints, SolveResult};

@@ -218,16 +218,8 @@ pub(crate) fn project_center_to_arc_bisector(
     let s = world_to_plane(start,  plane);
     let e = world_to_plane(end_pt, plane);
     let c = world_to_plane(center, plane);
-    let mx = (s.0 + e.0) * 0.5;
-    let my = (s.1 + e.1) * 0.5;
-    let chord_dx = e.0 - s.0;
-    let chord_dy = e.1 - s.1;
-    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
-    if chord_len < 1e-10 { return center; }
-    let px = -chord_dy / chord_len;
-    let py =  chord_dx / chord_len;
-    let t = (c.0 - mx) * px + (c.1 - my) * py;
-    plane_to_world(mx + t * px, my + t * py, plane)
+    let (pu, pv) = brep_sketch::arc::project_center_to_arc_bisector(s, e, c);
+    plane_to_world(pu, pv, plane)
 }
 
 /// Tessellate a circular arc defined by start, end, and a center hint.
@@ -243,20 +235,8 @@ pub(crate) fn tessellate_arc_from_center(
 
     // Project the center onto the perpendicular bisector so both endpoints
     // are exactly at `radius` from `c`, regardless of where the click landed.
-    let mx = (s.0 + e.0) * 0.5;
-    let my = (s.1 + e.1) * 0.5;
-    let chord_dx = e.0 - s.0;
-    let chord_dy = e.1 - s.1;
-    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
     let c_raw = world_to_plane(center, plane);
-    let c = if chord_len < 1e-10 {
-        c_raw
-    } else {
-        let px = -chord_dy / chord_len;
-        let py =  chord_dx / chord_len;
-        let t = (c_raw.0 - mx) * px + (c_raw.1 - my) * py;
-        (mx + t * px, my + t * py)
-    };
+    let c = brep_sketch::arc::project_center_to_arc_bisector(s, e, c_raw);
 
     let radius = ((s.0 - c.0).powi(2) + (s.1 - c.1).powi(2)).sqrt();
     if radius < 1e-10 { return vec![start, end_pt]; }
