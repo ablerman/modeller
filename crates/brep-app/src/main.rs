@@ -115,6 +115,10 @@ struct AppState {
     drag_committed_curve: Option<usize>,
     /// (profile_idx, segment_idx) of committed polyline segment the cursor is hovering over.
     snap_committed_seg: Option<(usize, usize)>,
+    /// Time of the most recent click (for double-click detection).
+    last_click_time: Option<std::time::Instant>,
+    /// Screen position of the most recent click (for double-click detection).
+    last_click_pos: Option<(f32, f32)>,
 }
 
 impl AppState {
@@ -222,6 +226,8 @@ impl AppState {
             snap_committed_curve: None,
             drag_committed_curve: None,
             snap_committed_seg: None,
+            last_click_time: None,
+            last_click_pos: None,
         }
     }
 
@@ -847,67 +853,98 @@ impl ApplicationHandler for App {
                                     // Otherwise the drag already updated the positions;
                                     // nothing more to do on release.
                                 } else if is_click {
-                                    if let Some(_cur) = state.last_cursor {
-                                        let w = state.surface_config.width;
-                                        let h = state.surface_config.height;
-                                        if state.editor.sketch.is_some() {
-                                            let tool_busy = state.editor.sketch.as_ref()
-                                                .map_or(false, |sk| sk.tool_in_progress.is_some());
-                                            if tool_busy {
-                                                // Multi-step tool: all clicks add a point.
-                                                // Snap to a hovered vertex if available.
-                                                let pt = state.snap_vertex
-                                                    .and_then(|vi| state.editor.sketch.as_ref()
-                                                        .and_then(|sk| sk.points.get(vi).copied()))
-                                                    .or(state.sketch_cursor);
-                                                if let Some(p) = pt {
-                                                    state.editor.apply(UiAction::SketchAddPoint(p));
-                                                }
-                                            } else if let Some(vi) = state.snap_vertex {
-                                                // Clicking vertex 0 with ≥3 pts closes the polyline loop.
-                                                let can_close = state.editor.sketch.as_ref()
-                                                    .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
-                                                if vi == 0 && can_close {
-                                                    state.editor.apply(UiAction::SketchCloseLoop);
-                                                } else {
-                                                    state.editor.apply(UiAction::SketchSelectVertex(vi));
-                                                }
-                                            } else if let Some(r) = state.snap_ref {
-                                                state.editor.apply(UiAction::SketchSelectRef(r));
-                                            } else if let Some(ci) = state.snap_constraint {
-                                                state.editor.apply(UiAction::SketchSelectConstraint(ci));
-                                            } else if let Some(seg) = state.snap_segment {
-                                                state.editor.apply(UiAction::SketchSelectSegment(seg));
-                                            } else {
-                                                let is_pointer = state.editor.sketch.as_ref()
-                                                    .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
-                                                if is_pointer {
-                                                    if let Some(pi) = state.snap_committed_curve {
-                                                        // Pointer + click on circle/arc curve → select it.
-                                                        state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
-                                                    } else {
-                                                        // Pointer tool: clicking empty space clears committed selection.
-                                                        state.editor.apply(UiAction::SketchSelectCommitted(None));
-                                                    }
-                                                } else if let Some(p) = state.sketch_cursor {
-                                                    state.editor.apply(UiAction::SketchAddPoint(p));
-                                                }
-                                            }
+                                    let is_double_click = if let (Some(t), Some(pos)) = (state.last_click_time, state.last_click_pos) {
+                                        let cur = state.last_cursor.unwrap_or(pos);
+                                        t.elapsed().as_millis() < 400
+                                            && (cur.0 - pos.0).abs() < 8.0
+                                            && (cur.1 - pos.1).abs() < 8.0
+                                    } else {
+                                        false
+                                    };
+
+                                    let handled_as_double_click = if is_double_click {
+                                        let should_commit = state.editor.sketch.as_ref().map_or(false, |sk| {
+                                            sk.active_tool == editor::DrawTool::Polyline
+                                                && sk.tool_in_progress.is_none()
+                                                && !sk.points.is_empty()
+                                        });
+                                        if should_commit {
+                                            state.editor.apply(UiAction::SketchCommitPolyline);
+                                            state.last_click_time = None;
+                                            state.last_click_pos = None;
+                                            true
                                         } else {
-                                            let cur = _cur;
-                                            let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
-                                            if let Some(idx) = state.editor.pick_at_screen(cur.0, cur.1, w, h) {
-                                                if shift {
-                                                    state.editor.apply(UiAction::ToggleSelectObject(idx));
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+
+                                    if !handled_as_double_click {
+                                        if let Some(_cur) = state.last_cursor {
+                                            let w = state.surface_config.width;
+                                            let h = state.surface_config.height;
+                                            if state.editor.sketch.is_some() {
+                                                let tool_busy = state.editor.sketch.as_ref()
+                                                    .map_or(false, |sk| sk.tool_in_progress.is_some());
+                                                if tool_busy {
+                                                    // Multi-step tool: all clicks add a point.
+                                                    // Snap to a hovered vertex if available.
+                                                    let pt = state.snap_vertex
+                                                        .and_then(|vi| state.editor.sketch.as_ref()
+                                                            .and_then(|sk| sk.points.get(vi).copied()))
+                                                        .or(state.sketch_cursor);
+                                                    if let Some(p) = pt {
+                                                        state.editor.apply(UiAction::SketchAddPoint(p));
+                                                    }
+                                                } else if let Some(vi) = state.snap_vertex {
+                                                    // Clicking vertex 0 with ≥3 pts closes the polyline loop.
+                                                    let can_close = state.editor.sketch.as_ref()
+                                                        .map_or(false, |sk| !sk.closed && sk.points.len() >= 3);
+                                                    if vi == 0 && can_close {
+                                                        state.editor.apply(UiAction::SketchCloseLoop);
+                                                    } else {
+                                                        state.editor.apply(UiAction::SketchSelectVertex(vi));
+                                                    }
+                                                } else if let Some(r) = state.snap_ref {
+                                                    state.editor.apply(UiAction::SketchSelectRef(r));
+                                                } else if let Some(ci) = state.snap_constraint {
+                                                    state.editor.apply(UiAction::SketchSelectConstraint(ci));
+                                                } else if let Some(seg) = state.snap_segment {
+                                                    state.editor.apply(UiAction::SketchSelectSegment(seg));
                                                 } else {
-                                                    state.editor.apply(UiAction::SelectObject(idx));
+                                                    let is_pointer = state.editor.sketch.as_ref()
+                                                        .map_or(false, |sk| sk.active_tool == editor::DrawTool::Pointer);
+                                                    if is_pointer {
+                                                        if let Some(pi) = state.snap_committed_curve {
+                                                            // Pointer + click on circle/arc curve → select it.
+                                                            state.editor.apply(UiAction::SketchSelectCommitted(Some(pi)));
+                                                        } else {
+                                                            // Pointer tool: clicking empty space clears committed selection.
+                                                            state.editor.apply(UiAction::SketchSelectCommitted(None));
+                                                        }
+                                                    } else if let Some(p) = state.sketch_cursor {
+                                                        state.editor.apply(UiAction::SketchAddPoint(p));
+                                                    }
                                                 }
-                                                state.editor.scene_dirty = true;
-                                            } else if !shift {
-                                                state.editor.apply(UiAction::ClearSelection);
-                                                state.editor.scene_dirty = true;
+                                            } else {
+                                                let cur = _cur;
+                                                let shift = state.egui_ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                                                if let Some(idx) = state.editor.pick_at_screen(cur.0, cur.1, w, h) {
+                                                    if shift {
+                                                        state.editor.apply(UiAction::ToggleSelectObject(idx));
+                                                    } else {
+                                                        state.editor.apply(UiAction::SelectObject(idx));
+                                                    }
+                                                    state.editor.scene_dirty = true;
+                                                } else if !shift {
+                                                    state.editor.apply(UiAction::ClearSelection);
+                                                    state.editor.scene_dirty = true;
+                                                }
                                             }
                                         }
+                                        state.last_click_time = Some(std::time::Instant::now());
+                                        state.last_click_pos = state.last_cursor;
                                     }
                                 }
                             }
