@@ -674,4 +674,209 @@ mod tests {
         assert_eq!(solve_constraints(&mut pts, &[], 2), SolveResult::Ok);
         assert_eq!(pts, orig);
     }
+
+    // ── Coincident ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn coincident_merges_two_points() {
+        let mut pts = vec![[0.0, 0.0], [1.0, 1.0]];
+        let cs = vec![SketchConstraint::Coincident { pt_a: 0, pt_b: 1 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], pts[1][0]), "u coords should match");
+        assert!(approx_eq(pts[0][1], pts[1][1]), "v coords should match");
+    }
+
+    // ── PointOnLine ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn point_on_line_collinear() {
+        // seg 0: [0,0]→[2,0] (horizontal).  pt 2 starts off the line; should land on it.
+        let mut pts = vec![[0.0, 0.0], [2.0, 0.0], [1.0, 0.5]];
+        let cs = vec![SketchConstraint::PointOnLine { pt: 2, seg: 0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 3), SolveResult::Ok);
+        // Residual: (u_p - u_a)*(v_b - v_a) - (v_p - v_a)*(u_b - u_a) = 0
+        let r = (pts[2][0] - pts[0][0]) * (pts[1][1] - pts[0][1])
+            - (pts[2][1] - pts[0][1]) * (pts[1][0] - pts[0][0]);
+        assert!(r.abs() < 1e-5, "residual should be ~0, got {r}");
+    }
+
+    // ── PointFixed ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn point_fixed_pins_position() {
+        let mut pts = vec![[0.5, 0.5], [2.0, 2.0]];
+        let cs = vec![SketchConstraint::PointFixed { pt: 0, x: 1.0, y: 3.0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 1.0), "u should be 1.0, got {}", pts[0][0]);
+        assert!(approx_eq(pts[0][1], 3.0), "v should be 3.0, got {}", pts[0][1]);
+    }
+
+    // ── PointOnOrigin / PointOnXAxis / PointOnYAxis ───────────────────────────
+
+    #[test]
+    fn point_on_origin() {
+        let mut pts = vec![[0.4, 0.7], [1.0, 1.0]];
+        let cs = vec![SketchConstraint::PointOnOrigin { pt: 0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 0.0), "u should be 0, got {}", pts[0][0]);
+        assert!(approx_eq(pts[0][1], 0.0), "v should be 0, got {}", pts[0][1]);
+    }
+
+    #[test]
+    fn point_on_x_axis() {
+        let mut pts = vec![[2.0, 0.8], [3.0, 1.0]];
+        let cs = vec![SketchConstraint::PointOnXAxis { pt: 0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][1], 0.0), "v should be 0, got {}", pts[0][1]);
+    }
+
+    #[test]
+    fn point_on_y_axis() {
+        let mut pts = vec![[0.8, 2.0], [1.0, 3.0]];
+        let cs = vec![SketchConstraint::PointOnYAxis { pt: 0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 0.0), "u should be 0, got {}", pts[0][0]);
+    }
+
+    // ── HorizontalPair / VerticalPair ─────────────────────────────────────────
+
+    #[test]
+    fn horizontal_pair_aligns_points() {
+        // perp = (0, 1): standard Y-up camera, "horizontal" means same v.
+        let mut pts = vec![[0.0, 0.0], [1.0, 0.5]];
+        let cs = vec![SketchConstraint::HorizontalPair {
+            pt_a: 0, pt_b: 1, perp_u: 0.0, perp_v: 1.0,
+        }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        // Residual: perp_u*(u[b]-u[a]) + perp_v*(v[b]-v[a]) = v[b] - v[a] = 0
+        assert!(approx_eq(pts[0][1], pts[1][1]), "v coords should match");
+    }
+
+    #[test]
+    fn vertical_pair_aligns_points() {
+        // perp = (1, 0): "vertical" means same u.
+        let mut pts = vec![[0.0, 0.0], [0.5, 1.0]];
+        let cs = vec![SketchConstraint::VerticalPair {
+            pt_a: 0, pt_b: 1, perp_u: 1.0, perp_v: 0.0,
+        }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], pts[1][0]), "u coords should match");
+    }
+
+    // ── PointOnCircle ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn point_on_circle_lands_on_circumference() {
+        // Circle centered at (2, 2), radius 1. Point starts at (3.5, 2) — outside.
+        let mut pts = vec![[3.5, 2.0], [0.0, 0.0]];
+        let cs = vec![SketchConstraint::PointOnCircle {
+            pt: 0, center_u: 2.0, center_v: 2.0, radius: 1.0,
+        }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        let du = pts[0][0] - 2.0;
+        let dv = pts[0][1] - 2.0;
+        let r = (du * du + dv * dv).sqrt();
+        assert!(approx_eq(r, 1.0), "point should be at radius 1.0, got {r}");
+    }
+
+    // ── Angle (non-90°) ───────────────────────────────────────────────────────
+
+    #[test]
+    fn angle_45_degrees() {
+        use std::f64::consts::PI;
+        let mut pts = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 2.0]];
+        let cs = vec![SketchConstraint::Angle { seg_a: 0, seg_b: 1, degrees: 45.0 }];
+        assert_eq!(solve_constraints(&mut pts, &cs, 3), SolveResult::Ok);
+        let (ax, ay) = dir(&pts, 0);
+        let (bx, by) = dir(&pts, 1);
+        let la = (ax * ax + ay * ay).sqrt();
+        let lb = (bx * bx + by * by).sqrt();
+        let cos_actual = (ax * bx + ay * by) / (la * lb);
+        let cos_target = (45.0_f64 * PI / 180.0).cos();
+        assert!(
+            (cos_actual - cos_target).abs() < 1e-4,
+            "cos(angle) should be {cos_target:.4}, got {cos_actual:.4}"
+        );
+    }
+
+    // ── Combined constraints ──────────────────────────────────────────────────
+
+    #[test]
+    fn horizontal_and_fixed_length_together() {
+        // Constrain seg 0 to be horizontal AND have length 3.0.
+        let mut pts = vec![[0.0, 0.0], [2.0, 0.4]];
+        let cs = vec![
+            SketchConstraint::Horizontal { seg: 0 },
+            SketchConstraint::FixedLength { seg: 0, value: 3.0 },
+        ];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        let (dx, dy) = dir(&pts, 0);
+        let len = (dx * dx + dy * dy).sqrt();
+        assert!(dy.abs() < 1e-5, "should be horizontal, dy={dy}");
+        assert!(approx_eq(len, 3.0), "length should be 3.0, got {len}");
+    }
+
+    #[test]
+    fn coincident_and_fixed_point() {
+        // Pin pt 0, then force pt 1 to coincide with it.
+        let mut pts = vec![[0.0, 0.0], [5.0, 5.0]];
+        let cs = vec![
+            SketchConstraint::PointFixed { pt: 0, x: 1.0, y: 2.0 },
+            SketchConstraint::Coincident { pt_a: 0, pt_b: 1 },
+        ];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 1.0));
+        assert!(approx_eq(pts[0][1], 2.0));
+        assert!(approx_eq(pts[1][0], 1.0));
+        assert!(approx_eq(pts[1][1], 2.0));
+    }
+
+    // ── apply_constraints: conflict detection ─────────────────────────────────
+
+    #[test]
+    fn conflicting_constraints_detected() {
+        // Force pt 0 to origin AND to (5, 5) simultaneously — impossible.
+        let mut pts = vec![[1.0, 1.0], [2.0, 2.0]];
+        let cs = vec![
+            SketchConstraint::PointOnOrigin { pt: 0 },
+            SketchConstraint::PointFixed { pt: 0, x: 5.0, y: 5.0 },
+        ];
+        let result = apply_constraints(&mut pts, &cs, 2);
+        assert!(result.conflict, "contradictory pin constraints should conflict");
+    }
+
+    #[test]
+    fn conflict_leaves_points_unchanged() {
+        let orig = vec![[1.0, 1.0], [2.0, 2.0]];
+        let mut pts = orig.clone();
+        let cs = vec![
+            SketchConstraint::PointOnOrigin { pt: 0 },
+            SketchConstraint::PointFixed { pt: 0, x: 5.0, y: 5.0 },
+        ];
+        apply_constraints(&mut pts, &cs, 2);
+        assert_eq!(pts, orig, "pts must not be modified on conflict");
+    }
+
+    #[test]
+    fn violated_vec_identifies_culprits() {
+        // Both constraints are culprits — removing either one resolves the conflict.
+        let mut pts = vec![[1.0, 1.0], [2.0, 2.0]];
+        let cs = vec![
+            SketchConstraint::PointOnOrigin { pt: 0 },
+            SketchConstraint::PointFixed { pt: 0, x: 5.0, y: 5.0 },
+        ];
+        let result = apply_constraints(&mut pts, &cs, 2);
+        assert_eq!(result.violated.len(), 2);
+        assert!(result.violated[0], "PointOnOrigin should be flagged");
+        assert!(result.violated[1], "PointFixed should be flagged");
+    }
+
+    #[test]
+    fn non_conflicting_constraints_have_empty_violated() {
+        let mut pts = vec![[0.0, 0.0], [1.0, 0.3]];
+        let cs = vec![SketchConstraint::Horizontal { seg: 0 }];
+        let result = apply_constraints(&mut pts, &cs, 2);
+        assert!(!result.conflict);
+        assert!(result.violated.is_empty());
+    }
 }
