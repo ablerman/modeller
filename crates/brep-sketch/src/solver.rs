@@ -9,6 +9,194 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::constraints::SketchConstraint;
 
+// ── Geometric propagation ─────────────────────────────────────────────────────
+
+/// Tracks how much of a point's position is known from direct constraints.
+#[derive(Clone, Copy)]
+enum Determined {
+    Free,
+    U(f64),         // u fixed (e.g. PointOnYAxis)
+    V(f64),         // v fixed (e.g. PointOnXAxis)
+    Both(f64, f64), // fully determined
+}
+
+impl Determined {
+    fn known_u(self) -> Option<f64> {
+        match self {
+            Determined::U(u) | Determined::Both(u, _) => Some(u),
+            _ => None,
+        }
+    }
+
+    fn known_v(self) -> Option<f64> {
+        match self {
+            Determined::V(v) | Determined::Both(_, v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Merge new knowledge into existing knowledge.
+    fn merge(self, other: Determined) -> Determined {
+        let u = self.known_u().or_else(|| other.known_u());
+        let v = self.known_v().or_else(|| other.known_v());
+        match (u, v) {
+            (Some(u), Some(v)) => Determined::Both(u, v),
+            (Some(u), None)    => Determined::U(u),
+            (None,    Some(v)) => Determined::V(v),
+            (None,    None)    => Determined::Free,
+        }
+    }
+}
+
+/// Apply one pass over the constraint list, resolving any constraint whose
+/// result can be computed directly from already-determined points.
+/// Returns `true` if at least one constraint was newly applied.
+fn propagate_once(
+    pts: &mut Vec<[f64; 2]>,
+    constraints: &[SketchConstraint],
+    n: usize,
+    det: &mut Vec<Determined>,
+) -> bool {
+    let mut progress = false;
+
+    for c in constraints {
+        match c {
+            SketchConstraint::PointFixed { pt, x, y } => {
+                // Skip if already fully determined to a different value — conflict
+                // for Newton to detect.  Only apply if free or already matching.
+                match det[*pt] {
+                    Determined::Both(u, v) if u == *x && v == *y => {} // already done
+                    Determined::Both(_, _) => {}                        // conflict, skip
+                    _ => {
+                        pts[*pt] = [*x, *y];
+                        det[*pt] = Determined::Both(*x, *y);
+                        progress = true;
+                    }
+                }
+            }
+            SketchConstraint::PointOnOrigin { pt } => {
+                match det[*pt] {
+                    Determined::Both(u, v) if u == 0.0 && v == 0.0 => {}
+                    Determined::Both(_, _) => {} // conflict, skip
+                    _ => {
+                        pts[*pt] = [0.0, 0.0];
+                        det[*pt] = Determined::Both(0.0, 0.0);
+                        progress = true;
+                    }
+                }
+            }
+            SketchConstraint::PointOnXAxis { pt } => {
+                match det[*pt].known_v() {
+                    Some(v) if v == 0.0 => {} // already satisfied
+                    Some(_) => {}              // conflict with other V constraint, skip
+                    None => {
+                        pts[*pt][1] = 0.0;
+                        det[*pt] = det[*pt].merge(Determined::V(0.0));
+                        progress = true;
+                    }
+                }
+            }
+            SketchConstraint::PointOnYAxis { pt } => {
+                match det[*pt].known_u() {
+                    Some(u) if u == 0.0 => {}
+                    Some(_) => {}
+                    None => {
+                        pts[*pt][0] = 0.0;
+                        det[*pt] = det[*pt].merge(Determined::U(0.0));
+                        progress = true;
+                    }
+                }
+            }
+            SketchConstraint::Coincident { pt_a, pt_b } => {
+                match (det[*pt_a], det[*pt_b]) {
+                    (Determined::Both(u, v), other) => {
+                        if matches!(other, Determined::Both(bu, bv) if bu == u && bv == v) {
+                            // already matching
+                        } else if matches!(other, Determined::Both(_, _)) {
+                            // conflict, skip
+                        } else {
+                            pts[*pt_b] = [u, v];
+                            det[*pt_b] = Determined::Both(u, v);
+                            progress = true;
+                        }
+                    }
+                    (_, Determined::Both(u, v)) => {
+                        if matches!(det[*pt_a], Determined::Both(au, av) if au == u && av == v) {
+                            // already matching
+                        } else if matches!(det[*pt_a], Determined::Both(_, _)) {
+                            // conflict, skip
+                        } else {
+                            pts[*pt_a] = [u, v];
+                            det[*pt_a] = Determined::Both(u, v);
+                            progress = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SketchConstraint::Horizontal { seg } => {
+                let s = *seg;
+                let sn = (s + 1) % n;
+                match (det[s], det[sn]) {
+                    (Determined::Both(_, v), _) => match det[sn].known_v() {
+                        Some(sv) if sv == v => {}
+                        Some(_) => {} // conflict
+                        None => {
+                            pts[sn][1] = v;
+                            det[sn] = det[sn].merge(Determined::V(v));
+                            progress = true;
+                        }
+                    },
+                    (_, Determined::Both(_, v)) => match det[s].known_v() {
+                        Some(sv) if sv == v => {}
+                        Some(_) => {}
+                        None => {
+                            pts[s][1] = v;
+                            det[s] = det[s].merge(Determined::V(v));
+                            progress = true;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            SketchConstraint::Vertical { seg } => {
+                let s = *seg;
+                let sn = (s + 1) % n;
+                match (det[s], det[sn]) {
+                    (Determined::Both(u, _), _) => match det[sn].known_u() {
+                        Some(su) if su == u => {}
+                        Some(_) => {}
+                        None => {
+                            pts[sn][0] = u;
+                            det[sn] = det[sn].merge(Determined::U(u));
+                            progress = true;
+                        }
+                    },
+                    (_, Determined::Both(u, _)) => match det[s].known_u() {
+                        Some(su) if su == u => {}
+                        Some(_) => {}
+                        None => {
+                            pts[s][0] = u;
+                            det[s] = det[s].merge(Determined::U(u));
+                            progress = true;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    progress
+}
+
+/// Run propagation to a fixed point, seeding with direct constraints.
+fn propagate(pts: &mut Vec<[f64; 2]>, constraints: &[SketchConstraint], n: usize) {
+    let mut det = vec![Determined::Free; pts.len()];
+    while propagate_once(pts, constraints, n, &mut det) {}
+}
+
 /// Result of a constraint solve.
 #[derive(Debug, PartialEq)]
 pub enum SolveResult {
@@ -35,6 +223,13 @@ pub fn solve_constraints(
     if constraints.is_empty() || pts.len() < 2 {
         return SolveResult::Ok;
     }
+
+    // Save original positions so we can restore on conflict (propagation
+    // modifies pts in-place before Newton runs).
+    let pts_backup: Vec<[f64; 2]> = pts.clone();
+
+    // Geometric propagation pre-pass: resolve closed-form constraints first.
+    propagate(pts, constraints, n_pts);
 
     // Flatten [u,v] pairs into a single Vec<f64>.
     let mut vars: Vec<f64> = pts.iter().flat_map(|p| [p[0], p[1]]).collect();
@@ -85,7 +280,7 @@ pub fn solve_constraints(
     let final_norm: f64 = r.iter().map(|x| x * x).sum::<f64>().sqrt();
 
     if final_norm > 1e-4 {
-        // pts was never modified during the solve loop; no restore needed.
+        *pts = pts_backup;
         return SolveResult::Conflict;
     }
 
@@ -878,5 +1073,80 @@ mod tests {
         let result = apply_constraints(&mut pts, &cs, 2);
         assert!(!result.conflict);
         assert!(result.violated.is_empty());
+    }
+
+    // ── Propagation pre-pass tests ────────────────────────────────────────────
+
+    #[test]
+    fn propagation_only_fixed_coincident() {
+        // PointFixed + Coincident: fully resolved by propagation, Newton sees
+        // residuals already at zero on the first iteration.
+        let mut pts = vec![[0.0, 0.0], [5.0, 5.0]];
+        let cs = vec![
+            SketchConstraint::PointFixed { pt: 0, x: 3.0, y: 4.0 },
+            SketchConstraint::Coincident { pt_a: 0, pt_b: 1 },
+        ];
+        assert_eq!(solve_constraints(&mut pts, &cs, 2), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 3.0), "pt0.u should be 3, got {}", pts[0][0]);
+        assert!(approx_eq(pts[0][1], 4.0), "pt0.v should be 4, got {}", pts[0][1]);
+        assert!(approx_eq(pts[1][0], 3.0), "pt1.u should be 3, got {}", pts[1][0]);
+        assert!(approx_eq(pts[1][1], 4.0), "pt1.v should be 4, got {}", pts[1][1]);
+    }
+
+    #[test]
+    fn propagation_cascade_fixed_coincident_horizontal() {
+        // PointFixed on pt0 → Coincident pt0-pt1 → Horizontal seg1 (pt1→pt2)
+        // All three resolved by propagation cascade.
+        // pts: 0=(0,0), 1=(5,5), 2=(9,2)
+        // After: pt0=(1,2), pt1=(1,2) via Coincident, pt2.v=2 via Horizontal seg1
+        let mut pts = vec![[0.0, 0.0], [5.0, 5.0], [9.0, 2.0]];
+        let cs = vec![
+            SketchConstraint::PointFixed { pt: 0, x: 1.0, y: 2.0 },
+            SketchConstraint::Coincident { pt_a: 0, pt_b: 1 },
+            SketchConstraint::Horizontal { seg: 1 }, // seg1: pt1→pt2
+        ];
+        assert_eq!(solve_constraints(&mut pts, &cs, 3), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 1.0) && approx_eq(pts[0][1], 2.0), "pt0 should be (1,2)");
+        assert!(approx_eq(pts[1][0], 1.0) && approx_eq(pts[1][1], 2.0), "pt1 should be (1,2)");
+        assert!(approx_eq(pts[2][1], 2.0), "pt2.v should be 2 (horizontal with pt1)");
+    }
+
+    #[test]
+    fn propagation_mixed_with_newton() {
+        // PointFixed + Coincident (propagatable) + Parallel (needs Newton).
+        // Propagation handles the first two; Newton handles Parallel.
+        // seg0: pt0→pt1, seg1: pt1→pt2
+        // After: pt0=(0,0) (fixed), pt1=(0,0) (coincident with pt0),
+        //        pt2 must be parallel to seg0 direction.
+        let mut pts = vec![[0.0, 0.0], [3.0, 3.0], [5.0, 2.0]];
+        let seg0_dir_before = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]);
+        let _ = seg0_dir_before; // direction will change after coincident
+        let cs = vec![
+            SketchConstraint::PointFixed { pt: 0, x: 0.0, y: 0.0 },
+            SketchConstraint::Horizontal { seg: 0 }, // seg0 must be horizontal
+            SketchConstraint::Parallel { seg_a: 0, seg_b: 1 }, // seg1 parallel to seg0
+        ];
+        assert_eq!(solve_constraints(&mut pts, &cs, 3), SolveResult::Ok);
+        // seg0 horizontal
+        let dy0 = (pts[1][1] - pts[0][1]).abs();
+        assert!(dy0 < 1e-5, "seg0 should be horizontal, dy={dy0}");
+        // seg1 parallel to seg0 (also horizontal)
+        let dy1 = (pts[2][1] - pts[1][1]).abs();
+        assert!(dy1 < 1e-5, "seg1 should be parallel (horizontal), dy={dy1}");
+    }
+
+    #[test]
+    fn propagation_origin_and_axes() {
+        // PointOnOrigin, PointOnXAxis, PointOnYAxis resolved by propagation.
+        let mut pts = vec![[3.0, 4.0], [5.0, 7.0], [2.0, 8.0]];
+        let cs = vec![
+            SketchConstraint::PointOnOrigin { pt: 0 },
+            SketchConstraint::PointOnXAxis { pt: 1 },
+            SketchConstraint::PointOnYAxis { pt: 2 },
+        ];
+        assert_eq!(solve_constraints(&mut pts, &cs, 3), SolveResult::Ok);
+        assert!(approx_eq(pts[0][0], 0.0) && approx_eq(pts[0][1], 0.0), "pt0 should be origin");
+        assert!(approx_eq(pts[1][1], 0.0), "pt1.v should be 0 (on X axis)");
+        assert!(approx_eq(pts[2][0], 0.0), "pt2.u should be 0 (on Y axis)");
     }
 }

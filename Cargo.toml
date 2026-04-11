@@ -49,8 +49,9 @@ wide = "0.7"
 # File dialogs
 rfd = "0.15"
 
-# Testing utilities
+# Testing / benchmarking utilities
 approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 # Logging / tracing
 tracing = "0.1"
