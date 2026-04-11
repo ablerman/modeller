@@ -261,9 +261,9 @@ pub fn build_ui(
             let (u_axis, v_axis) = sk.plane.uv_axes();
             let far = 500.0_f64;
 
-            let x_selected = sk.ref_selection == Some(RefEntity::XAxis);
-            let y_selected = sk.ref_selection == Some(RefEntity::YAxis);
-            let o_selected = sk.ref_selection == Some(RefEntity::Origin);
+            let x_selected = sk.sel_ref() == Some(RefEntity::XAxis);
+            let y_selected = sk.sel_ref() == Some(RefEntity::YAxis);
+            let o_selected = sk.sel_ref() == Some(RefEntity::Origin);
 
             let x_col = if x_selected {
                 egui::Color32::from_rgb(255, 100, 100)
@@ -317,7 +317,7 @@ pub fn build_ui(
         }
 
         // Draw committed profiles (circles, arcs, rectangles, etc.) first.
-        let committed_sel = sk.committed_selection;
+        let committed_sel = sk.sel_committed_profile();
         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
             let is_sel = committed_sel == Some(pi);
             let is_curve_hovered = snap_committed_curve == Some(pi);
@@ -343,7 +343,7 @@ pub fn build_ui(
             }
         }
         // Selected committed points — highlighted as orange dots.
-        for &(sel_pi, sel_vi) in &sk.committed_pt_selection {
+        for (sel_pi, sel_vi) in sk.sel_committed_pts() {
             if let Some(cp) = sk.committed_profiles.get(sel_pi) {
                 if let Some(&gi) = cp.point_indices.get(sel_vi) {
                     if let Some(p) = proj(sk.global_points[gi]) {
@@ -369,7 +369,7 @@ pub fn build_ui(
             }
         }
         // Selected committed polyline segments — orange highlight.
-        for &(sel_pi, sel_si) in &sk.committed_seg_selection {
+        for (sel_pi, sel_si) in sk.sel_committed_segs() {
             if let Some(cp) = sk.committed_profiles.get(sel_pi) {
                 let cn = cp.point_indices.len();
                 if sel_si < cn {
@@ -408,7 +408,7 @@ pub fn build_ui(
 
         // Selected segment highlight (orange).
         let sel_stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 160, 60));
-        for &si in &sk.seg_selection {
+        for si in sk.sel_segs() {
             if si < seg_count {
                 if let (Some(a), Some(b)) = (proj(sk.points[si]), proj(sk.points[(si + 1) % n])) {
                     painter.line_segment([a, b], sel_stroke);
@@ -494,7 +494,7 @@ pub fn build_ui(
         for (i, &pt) in sk.points.iter().enumerate() {
             if let Some(p) = proj(pt) {
                 let is_snap = snap_vertex == Some(i);
-                let is_selected = sk.pt_selection.contains(&i);
+                let is_selected = sk.sel_pts().any(|s| s == i);
                 // Green ring on vertex 0 hints that clicking it will close the loop.
                 let is_close_hint = can_close && i == 0;
                 if is_selected {
@@ -619,7 +619,7 @@ pub fn build_ui(
                         LengthTarget::Segment(_) => {
                             // Apply to all currently selected segments (multi-select support).
                             let segs: Vec<usize> = editor.sketch.as_ref()
-                                .map(|sk| sk.seg_selection.clone())
+                                .map(|sk| sk.sel_segs().collect())
                                 .unwrap_or_default();
                             let segs = if segs.is_empty() {
                                 // Fallback: use the target segment directly.
@@ -1070,8 +1070,9 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                 // Detect selection changes so we can scroll the new item into view.
                 let prev_sel_id = panel_id.with("prev_seg_sel");
                 let prev_sel: Vec<usize> = ctx.data(|d| d.get_temp(prev_sel_id).unwrap_or_default());
-                let sel_changed = prev_sel != sk.seg_selection;
-                ctx.data_mut(|d| d.insert_temp(prev_sel_id, sk.seg_selection.clone()));
+                let cur_seg_sel: Vec<usize> = sk.sel_segs().collect();
+                let sel_changed = prev_sel != cur_seg_sel;
+                ctx.data_mut(|d| d.insert_temp(prev_sel_id, cur_seg_sel.clone()));
 
                 // Elements list takes all remaining space above the constraints section.
                 // Use a fixed-ratio split: ~40% of window height for elements.
@@ -1083,7 +1084,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         ui.set_min_width(ui.available_width());
                         for i in 0..n {
                             let p = &sk.points[i];
-                            let selected = sk.pt_selection.contains(&i);
+                            let selected = sk.sel_pts().any(|s| s == i);
                             let resp = ui.selectable_label(
                                 selected,
                                 format!("Point {}  ({:.2}, {:.2}, {:.2})", i, p.x, p.y, p.z),
@@ -1095,7 +1096,7 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                         let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
                         for i in 0..n_segs {
                             let j = (i + 1) % n;
-                            let selected = sk.seg_selection.contains(&i);
+                            let selected = sk.sel_segs().any(|s| s == i);
                             let resp = ui.selectable_label(
                                 selected,
                                 format!("Segment {}  ({} → {})", i, i, j),
@@ -1104,14 +1105,14 @@ fn draw_sketch_info_panel(ctx: &egui::Context, editor: &EditorState) -> Vec<UiAc
                                 actions.push(UiAction::SketchPanelSelectSegment(i));
                             }
                             // Scroll to the first newly-selected segment.
-                            if selected && sel_changed && !prev_sel.contains(&i) {
+                            if selected && sel_changed && !cur_seg_sel.contains(&i) {
                                 resp.scroll_to_me(Some(egui::Align::Center));
                             }
                         }
                         // Committed profiles (circles, arcs, rectangles).
                         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
                             let label = cp.shape.label(pi);
-                            let is_sel = sk.committed_selection == Some(pi);
+                            let is_sel = sk.sel_committed_profile() == Some(pi);
                             let resp = ui.selectable_label(is_sel, label);
                             if resp.clicked() {
                                 let new_sel = if is_sel { None } else { Some(pi) };

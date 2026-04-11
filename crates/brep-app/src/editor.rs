@@ -60,6 +60,23 @@ pub enum RefEntity {
     YAxis,
 }
 
+/// A single item in the ordered sketch selection list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SketchSelection {
+    /// Active-profile segment index.
+    Segment(usize),
+    /// Active-profile vertex index.
+    Point(usize),
+    /// Reference entity (origin / axis).
+    Ref(RefEntity),
+    /// Committed profile index (selected as a whole, for radius/PointOnCurve).
+    CommittedProfile(usize),
+    /// A control point within a committed profile: (profile_idx, vertex_idx).
+    CommittedPoint(usize, usize),
+    /// A segment within a committed profile: (profile_idx, segment_idx).
+    CommittedSegment(usize, usize),
+}
+
 /// Which principal plane the sketch lives on.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SketchPlane { XY, XZ, YZ }
@@ -142,6 +159,10 @@ pub enum CommittedCrossConstraint {
     /// Point equidistant (perpendicular distance) from two segments.
     /// `gi_p` is the global-points index of the reference point.
     Symmetric { pi_a: usize, si_a: usize, pi_b: usize, si_b: usize, gi_p: usize },
+    /// Three-point symmetry: dist(P_a, P_c) == dist(P_b, P_c).
+    /// P_c is the constrained point; P_a and P_b are the reference points.
+    /// vi_* are local vertex indices within their respective committed profiles.
+    SymmetricPoints { pi_a: usize, vi_a: usize, pi_b: usize, vi_b: usize, pi_c: usize, vi_c: usize },
 }
 
 impl CommittedCrossConstraint {
@@ -154,6 +175,7 @@ impl CommittedCrossConstraint {
             CommittedCrossConstraint::HorizontalPair { .. } => "Horizontal",
             CommittedCrossConstraint::VerticalPair   { .. } => "Vertical",
             CommittedCrossConstraint::Symmetric      { .. } => "Symmetric",
+            CommittedCrossConstraint::SymmetricPoints { .. } => "Symmetric (points)",
         }
     }
 }
@@ -201,12 +223,9 @@ pub struct SketchState {
     pub closed:               bool,
     /// Active geometric constraints on this sketch.
     pub constraints:          Vec<SketchConstraint>,
-    /// Indices of currently selected segments (max 2).
-    pub seg_selection:        Vec<usize>,
-    /// Indices of currently selected vertices (max 2, for length/distance constraints).
-    pub pt_selection:         Vec<usize>,
-    /// Selected reference entity (origin / axis), if any.
-    pub ref_selection:        Option<RefEntity>,
+    /// Ordered selection list — preserves insertion order so constraint builders can
+    /// inspect which item was selected first / last.
+    pub selection:            Vec<SketchSelection>,
     /// Set when the last constraint solve did not converge.
     pub constraints_conflict: bool,
     /// Parallel to `constraints`: `true` if removing that constraint would let
@@ -226,19 +245,83 @@ pub struct SketchState {
     /// rectangle or circle).  The active `points`/`closed`/`constraints` represent
     /// the profile currently being drawn.
     pub committed_profiles: Vec<CommittedProfile>,
-    /// Index of the committed profile currently selected (for constraints like PointOnCircle).
-    pub committed_selection: Option<usize>,
-    /// Selected control points within committed profiles (profile_idx, vertex_idx).
-    /// Supports up to 2 simultaneous selections (like active-profile pt_selection).
-    pub committed_pt_selection: Vec<(usize, usize)>,
-    /// Selected segments within committed polylines (profile_idx, segment_idx).
-    /// Supports up to 2 simultaneous selections (like active-profile seg_selection).
-    pub committed_seg_selection: Vec<(usize, usize)>,
     /// Flat store of all 3-D points belonging to committed profiles.
     /// `CommittedProfile::point_indices` holds indices into this vec.
     pub global_points: Vec<Point3>,
     /// Constraints that span two different committed profiles.
     pub cross_constraints: Vec<CommittedCrossConstraint>,
+}
+
+impl SketchState {
+    // ── Selection helpers ──────────────────────────────────────────────────────
+
+    /// Active-profile selected segment indices in insertion order.
+    pub fn sel_segs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.selection.iter().filter_map(|s| match s {
+            SketchSelection::Segment(i) => Some(*i),
+            _ => None,
+        })
+    }
+
+    /// Active-profile selected point indices in insertion order.
+    pub fn sel_pts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.selection.iter().filter_map(|s| match s {
+            SketchSelection::Point(i) => Some(*i),
+            _ => None,
+        })
+    }
+
+    /// Selected reference entity, if any.
+    pub fn sel_ref(&self) -> Option<RefEntity> {
+        self.selection.iter().find_map(|s| match s {
+            SketchSelection::Ref(r) => Some(*r),
+            _ => None,
+        })
+    }
+
+    /// Selected committed profile index, if any.
+    pub fn sel_committed_profile(&self) -> Option<usize> {
+        self.selection.iter().find_map(|s| match s {
+            SketchSelection::CommittedProfile(pi) => Some(*pi),
+            _ => None,
+        })
+    }
+
+    /// Selected committed-profile points as `(profile_idx, vertex_idx)` in insertion order.
+    pub fn sel_committed_pts(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.selection.iter().filter_map(|s| match s {
+            SketchSelection::CommittedPoint(pi, vi) => Some((*pi, *vi)),
+            _ => None,
+        })
+    }
+
+    /// Selected committed-profile segments as `(profile_idx, segment_idx)` in insertion order.
+    pub fn sel_committed_segs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.selection.iter().filter_map(|s| match s {
+            SketchSelection::CommittedSegment(pi, si) => Some((*pi, *si)),
+            _ => None,
+        })
+    }
+
+    /// Toggle `item` in the selection list.  If already present it is removed; otherwise
+    /// the oldest item of the same variant is evicted when `count >= max`, then `item` is appended.
+    pub(crate) fn toggle_and_cap(&mut self, item: SketchSelection, max: usize) {
+        if let Some(pos) = self.selection.iter().position(|s| s == &item) {
+            self.selection.remove(pos);
+            return;
+        }
+        // Evict oldest of same discriminant while over cap.
+        fn same_variant(a: &SketchSelection, b: &SketchSelection) -> bool {
+            std::mem::discriminant(a) == std::mem::discriminant(b)
+        }
+        while max < usize::MAX
+            && self.selection.iter().filter(|s| same_variant(s, &item)).count() >= max
+        {
+            let oldest = self.selection.iter().position(|s| same_variant(s, &item)).unwrap();
+            self.selection.remove(oldest);
+        }
+        self.selection.push(item);
+    }
 }
 
 pub use crate::profile_shapes::ProfileShape;
@@ -622,7 +705,7 @@ pub enum UiAction {
     SketchBeginAngleInput { seg_a: usize, seg_b: usize },
     /// Dismiss the angle-input dialog without applying.
     SketchCancelAngleInput,
-    /// Toggle-select a vertex by index (max 2 at a time, clears seg_selection).
+    /// Toggle-select a vertex by index (max 2 at a time).
     SketchSelectVertex(usize),
     /// Select (or toggle off) a reference entity (origin / axis).
     SketchSelectRef(RefEntity),
@@ -922,6 +1005,31 @@ pub(crate) fn apply_cross_constraints(sk: &mut SketchState) {
                     }
                     sk.global_points[gi_p_val] = Point3::origin() + u * px + v * py;
                 }
+                CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c } => {
+                    let Some(&gi_a) = sk.committed_profiles.get(*pi_a).and_then(|cp| cp.point_indices.get(*vi_a)) else { continue };
+                    let Some(&gi_b) = sk.committed_profiles.get(*pi_b).and_then(|cp| cp.point_indices.get(*vi_b)) else { continue };
+                    let Some(&gi_c) = sk.committed_profiles.get(*pi_c).and_then(|cp| cp.point_indices.get(*vi_c)) else { continue };
+                    if gi_a >= sk.global_points.len() || gi_b >= sk.global_points.len() || gi_c >= sk.global_points.len() { continue }
+                    let p2d = |p: Point3| -> (f64, f64) { (p.coords.dot(&u), p.coords.dot(&v)) };
+                    let (ax, ay) = p2d(sk.global_points[gi_a]);
+                    let (bx, by) = p2d(sk.global_points[gi_b]);
+                    let (mut cx, mut cy) = p2d(sk.global_points[gi_c]);
+                    // Newton iterate: minimize f = dist(A,C)² - dist(B,C)²
+                    // f  = (cx-ax)² + (cy-ay)² - (cx-bx)² - (cy-by)²
+                    // ∇f = [2(cx-ax) - 2(cx-bx), 2(cy-ay) - 2(cy-by)]
+                    for _ in 0..20 {
+                        let dax = cx - ax; let day = cy - ay;
+                        let dbx = cx - bx; let dby = cy - by;
+                        let f = dax*dax + day*day - dbx*dbx - dby*dby;
+                        if f.abs() < 1e-9 { break; }
+                        let (gx, gy) = (2.0*dax - 2.0*dbx, 2.0*day - 2.0*dby);
+                        let g2 = gx*gx + gy*gy;
+                        if g2 < 1e-12 { break; }
+                        cx -= f / g2 * gx;
+                        cy -= f / g2 * gy;
+                    }
+                    sk.global_points[gi_c] = Point3::origin() + u * cx + v * cy;
+                }
             }
         }
     }
@@ -1159,9 +1267,7 @@ impl EditorState {
                     points: Vec::new(),
                     closed: false,
                     constraints: Vec::new(),
-                    seg_selection: Vec::new(),
-                    pt_selection: Vec::new(),
-                    ref_selection: None,
+                    selection:   Vec::new(),
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
@@ -1169,9 +1275,6 @@ impl EditorState {
                     active_tool:        DrawTool::Pointer,
                     tool_in_progress:   None,
                     committed_profiles: Vec::new(),
-                    committed_selection: None,
-                    committed_pt_selection: Vec::new(),
-                    committed_seg_selection: Vec::new(),
                     global_points:      Vec::new(),
                     cross_constraints:  Vec::new(),
                 });
@@ -1224,9 +1327,7 @@ impl EditorState {
                     points:               raw.points,
                     closed:               true,
                     constraints:          raw.constraints,
-                    seg_selection:        Vec::new(),
-                    pt_selection:         Vec::new(),
-                    ref_selection:        None,
+                    selection:            Vec::new(),
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
@@ -1234,9 +1335,6 @@ impl EditorState {
                     active_tool:          DrawTool::Pointer,
                     tool_in_progress:     None,
                     committed_profiles,
-                    committed_selection:    None,
-                    committed_pt_selection: Vec::new(),
-                    committed_seg_selection: Vec::new(),
                     global_points,
                     cross_constraints:      Vec::new(),
                 });
@@ -1274,21 +1372,13 @@ impl EditorState {
             }
             UiAction::SketchPanelSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
-                        sk.seg_selection.remove(pos);
-                    } else {
-                        sk.seg_selection.push(i);
-                    }
+                    sk.toggle_and_cap(SketchSelection::Segment(i), usize::MAX);
                 }
                 false
             }
             UiAction::SketchPanelSelectVertex(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
-                        sk.pt_selection.remove(pos);
-                    } else {
-                        sk.pt_selection.push(i);
-                    }
+                    sk.toggle_and_cap(SketchSelection::Point(i), usize::MAX);
                 }
                 false
             }
@@ -1317,21 +1407,14 @@ impl EditorState {
                         sk.tool_in_progress = None;
                         sk.points.clear();
                         sk.closed = false;
-                        sk.seg_selection.clear();
-                        sk.pt_selection.clear();
-                        sk.committed_selection = None;
-                        sk.committed_pt_selection.clear();
-                        sk.committed_seg_selection.clear();
+                        // Clear everything except Ref (matches previous behaviour where
+                        // Ref was not cleared in the has-work branch).
+                        sk.selection.retain(|s| matches!(s, SketchSelection::Ref(_)));
                     } else {
                         // Nothing in progress — deselect everything and ensure pointer tool.
                         sk.active_tool = DrawTool::Pointer;
-                        sk.seg_selection.clear();
-                        sk.pt_selection.clear();
-                        sk.ref_selection = None;
+                        sk.selection.clear();
                         sk.constraint_selection.clear();
-                        sk.committed_selection = None;
-                        sk.committed_pt_selection.clear();
-                        sk.committed_seg_selection.clear();
                     }
                 }
                 false
@@ -1350,8 +1433,7 @@ impl EditorState {
                         let pts = std::mem::take(&mut sk.points);
                         let constraints = std::mem::take(&mut sk.constraints);
                         sk.closed = false;
-                        sk.seg_selection.clear();
-                        sk.pt_selection.clear();
+                        sk.selection.retain(|s| !matches!(s, SketchSelection::Segment(_) | SketchSelection::Point(_)));
                         let point_indices = push_to_global(&pts, &mut sk.global_points);
                         sk.committed_profiles.push(CommittedProfile {
                             points:        Vec::new(),
@@ -1367,49 +1449,44 @@ impl EditorState {
             }
             UiAction::SketchSelectCommitted(idx) => {
                 if let Some(sk) = &mut self.sketch {
-                    sk.committed_selection = idx;
-                    sk.committed_pt_selection.clear();
-                    sk.committed_seg_selection.clear();
+                    sk.selection.retain(|s| !matches!(
+                        s, SketchSelection::CommittedProfile(_)
+                         | SketchSelection::CommittedPoint(..)
+                         | SketchSelection::CommittedSegment(..)
+                    ));
+                    if let Some(pi) = idx {
+                        sk.selection.push(SketchSelection::CommittedProfile(pi));
+                    }
                 }
                 false
             }
             UiAction::SketchSelectCommittedPoint(idx) => {
                 if let Some(sk) = &mut self.sketch {
-                    if let Some(item) = idx {
-                        // Toggle: remove if already selected, otherwise add (cap at 2).
-                        if let Some(pos) = sk.committed_pt_selection.iter().position(|&x| x == item) {
-                            sk.committed_pt_selection.remove(pos);
-                        } else {
-                            if sk.committed_pt_selection.len() >= 2 {
-                                sk.committed_pt_selection.remove(0);
-                            }
-                            sk.committed_pt_selection.push(item);
-                        }
+                    if let Some((pi, vi)) = idx {
+                        // Toggle: cap at 3 (supports 3-point symmetry), clear profile selection.
+                        sk.toggle_and_cap(SketchSelection::CommittedPoint(pi, vi), 3);
+                        sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedProfile(_)));
                     } else {
-                        sk.committed_pt_selection.clear();
-                        sk.committed_seg_selection.clear();
+                        sk.selection.retain(|s| !matches!(
+                            s, SketchSelection::CommittedPoint(..)
+                             | SketchSelection::CommittedSegment(..)
+                        ));
                     }
-                    sk.committed_selection = None;
                 }
                 false
             }
             UiAction::SketchSelectCommittedSeg(idx) => {
                 if let Some(sk) = &mut self.sketch {
-                    if let Some(item) = idx {
-                        // Toggle: remove if already selected, otherwise add (cap at 2).
-                        if let Some(pos) = sk.committed_seg_selection.iter().position(|&x| x == item) {
-                            sk.committed_seg_selection.remove(pos);
-                        } else {
-                            if sk.committed_seg_selection.len() >= 2 {
-                                sk.committed_seg_selection.remove(0);
-                            }
-                            sk.committed_seg_selection.push(item);
-                        }
+                    if let Some((pi, si)) = idx {
+                        // Toggle: cap at 2, clear profile selection.
+                        sk.toggle_and_cap(SketchSelection::CommittedSegment(pi, si), 2);
+                        sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedProfile(_)));
                     } else {
-                        sk.committed_seg_selection.clear();
-                        sk.committed_pt_selection.clear();
+                        sk.selection.retain(|s| !matches!(
+                            s, SketchSelection::CommittedSegment(..)
+                             | SketchSelection::CommittedPoint(..)
+                        ));
                     }
-                    sk.committed_selection = None;
                 }
                 false
             }
@@ -1577,35 +1654,21 @@ impl EditorState {
             }
             UiAction::SketchSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    // Toggle segment (max 2); points are unaffected.
-                    if let Some(pos) = sk.seg_selection.iter().position(|&x| x == i) {
-                        sk.seg_selection.remove(pos);
-                    } else {
-                        if sk.seg_selection.len() >= 2 { sk.seg_selection.remove(0); }
-                        sk.seg_selection.push(i);
-                    }
+                    sk.toggle_and_cap(SketchSelection::Segment(i), 2);
                 }
                 false
             }
             UiAction::SketchSelectVertex(i) => {
                 if let Some(sk) = &mut self.sketch {
-                    // Toggle point (max 2); segments are unaffected.
-                    if let Some(pos) = sk.pt_selection.iter().position(|&x| x == i) {
-                        sk.pt_selection.remove(pos);
-                    } else {
-                        if sk.pt_selection.len() >= 2 { sk.pt_selection.remove(0); }
-                        sk.pt_selection.push(i);
-                    }
+                    sk.toggle_and_cap(SketchSelection::Point(i), 2);
                 }
                 false
             }
             UiAction::SketchSelectRef(r) => {
                 if let Some(sk) = &mut self.sketch {
-                    if sk.ref_selection == Some(r) {
-                        sk.ref_selection = None;
-                    } else {
-                        sk.ref_selection = Some(r);
-                    }
+                    let already = sk.sel_ref() == Some(r);
+                    sk.selection.retain(|s| !matches!(s, SketchSelection::Ref(_)));
+                    if !already { sk.selection.push(SketchSelection::Ref(r)); }
                 }
                 false
             }
@@ -1667,7 +1730,7 @@ impl EditorState {
                                 if *gi == gi_replace { *gi = gi_keep; }
                             }
                         }
-                        sk.committed_pt_selection.clear();
+                        sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedPoint(..)));
                         apply_constraints(sk);
                     }
                 }
@@ -1677,7 +1740,7 @@ impl EditorState {
                 if let Some(sk) = &mut self.sketch {
                     sk.history.push(cc.label(), sketch_snapshot(sk));
                     sk.cross_constraints.push(cc);
-                    sk.committed_seg_selection.clear();
+                    sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedSegment(..)));
                     apply_cross_constraints(sk);
                 }
                 false
@@ -1703,19 +1766,26 @@ impl EditorState {
                         sk.committed_profiles.remove(pi);
                         // Remove cross-constraints referencing pi; shift indices > pi.
                         sk.cross_constraints.retain(|cc| {
-                            let (a, b) = match cc {
+                            match cc {
+                                CommittedCrossConstraint::SymmetricPoints { pi_a, pi_b, pi_c, .. } =>
+                                    *pi_a != pi && *pi_b != pi && *pi_c != pi,
                                 CommittedCrossConstraint::Parallel        { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::Perpendicular { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::EqualLength   { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::Angle         { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::HorizontalPair { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::VerticalPair   { pi_a, pi_b, .. }
-                                | CommittedCrossConstraint::Symmetric      { pi_a, pi_b, .. } => (*pi_a, *pi_b),
-                            };
-                            a != pi && b != pi
+                                | CommittedCrossConstraint::Symmetric      { pi_a, pi_b, .. } =>
+                                    *pi_a != pi && *pi_b != pi,
+                            }
                         });
                         for cc in &mut sk.cross_constraints {
                             match cc {
+                                CommittedCrossConstraint::SymmetricPoints { pi_a, pi_b, pi_c, .. } => {
+                                    if *pi_a > pi { *pi_a -= 1; }
+                                    if *pi_b > pi { *pi_b -= 1; }
+                                    if *pi_c > pi { *pi_c -= 1; }
+                                }
                                 CommittedCrossConstraint::Parallel        { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::Perpendicular { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::EqualLength   { pi_a, pi_b, .. }
@@ -1728,9 +1798,11 @@ impl EditorState {
                                 }
                             }
                         }
-                        sk.committed_selection = None;
-                        sk.committed_pt_selection.clear();
-                        sk.committed_seg_selection.clear();
+                        sk.selection.retain(|s| !matches!(
+                            s, SketchSelection::CommittedProfile(_)
+                             | SketchSelection::CommittedPoint(..)
+                             | SketchSelection::CommittedSegment(..)
+                        ));
                     }
                 }
                 true

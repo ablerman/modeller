@@ -93,24 +93,24 @@ fn h_constraints(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
     let ((h_pu, h_pv), _) = ed.camera.sketch_align_dirs(sk.plane);
     let n = sk.points.len();
-    let n_pts = sk.pt_selection.len();
-    let ref_sel = sk.ref_selection;
-    if !sk.seg_selection.is_empty() {
-        sk.seg_selection.iter().map(|&s| UiAction::SketchAddConstraint(SketchConstraint::HorizontalPair {
+    let ref_sel = sk.sel_ref();
+    if sk.sel_segs().next().is_some() {
+        sk.sel_segs().map(|s| UiAction::SketchAddConstraint(SketchConstraint::HorizontalPair {
             pt_a: s, pt_b: (s + 1) % n, perp_u: h_pu, perp_v: h_pv,
         })).collect()
-    } else if !sk.committed_seg_selection.is_empty() {
-        sk.committed_seg_selection.iter().map(|&(pi, si)| UiAction::SketchAddCommittedConstraint(
+    } else if sk.sel_committed_segs().next().is_some() {
+        sk.sel_committed_segs().map(|(pi, si)| UiAction::SketchAddCommittedConstraint(
             pi, SketchConstraint::HorizontalPair { pt_a: si, pt_b: si + 1, perp_u: h_pu, perp_v: h_pv },
         )).collect()
-    } else if sk.committed_pt_selection.len() == 1
+    } else if sk.sel_committed_pts().count() == 1
         && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis))
     {
-        let (pi, vi) = sk.committed_pt_selection[0];
+        let (pi, vi) = sk.sel_committed_pts().next().unwrap();
         vec![UiAction::SketchAddCommittedConstraint(pi, SketchConstraint::PointOnXAxis { pt: vi })]
-    } else if sk.committed_pt_selection.len() >= 2 {
-        let (pi_a, vi_a) = sk.committed_pt_selection[0];
-        let (pi_b, vi_b) = sk.committed_pt_selection[1];
+    } else if sk.sel_committed_pts().count() >= 2 {
+        let mut cpts = sk.sel_committed_pts();
+        let (pi_a, vi_a) = cpts.next().unwrap();
+        let (pi_b, vi_b) = cpts.next().unwrap();
         if pi_a == pi_b {
             vec![UiAction::SketchAddCommittedConstraint(pi_a, SketchConstraint::HorizontalPair {
                 pt_a: vi_a, pt_b: vi_b, perp_u: h_pu, perp_v: h_pv,
@@ -120,14 +120,17 @@ fn h_constraints(ed: &EditorState) -> Vec<UiAction> {
                 pi_a, vi_a, pi_b, vi_b, perp_u: h_pu, perp_v: h_pv,
             })]
         }
-    } else if n_pts == 2 {
-        vec![UiAction::SketchAddConstraint(SketchConstraint::HorizontalPair {
-            pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: h_pu, perp_v: h_pv,
-        })]
-    } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)) {
-        vec![UiAction::SketchAddConstraint(SketchConstraint::PointOnXAxis { pt: sk.pt_selection[0] })]
     } else {
-        vec![]
+        let n_pts: Vec<usize> = sk.sel_pts().collect();
+        if n_pts.len() == 2 {
+            vec![UiAction::SketchAddConstraint(SketchConstraint::HorizontalPair {
+                pt_a: n_pts[0], pt_b: n_pts[1], perp_u: h_pu, perp_v: h_pv,
+            })]
+        } else if n_pts.len() == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)) {
+            vec![UiAction::SketchAddConstraint(SketchConstraint::PointOnXAxis { pt: n_pts[0] })]
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -135,24 +138,24 @@ fn v_constraints(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
     let (_, (v_pu, v_pv)) = ed.camera.sketch_align_dirs(sk.plane);
     let n = sk.points.len();
-    let n_pts = sk.pt_selection.len();
-    let ref_sel = sk.ref_selection;
-    if !sk.seg_selection.is_empty() {
-        sk.seg_selection.iter().map(|&s| UiAction::SketchAddConstraint(SketchConstraint::VerticalPair {
+    let ref_sel = sk.sel_ref();
+    if sk.sel_segs().next().is_some() {
+        sk.sel_segs().map(|s| UiAction::SketchAddConstraint(SketchConstraint::VerticalPair {
             pt_a: s, pt_b: (s + 1) % n, perp_u: v_pu, perp_v: v_pv,
         })).collect()
-    } else if !sk.committed_seg_selection.is_empty() {
-        sk.committed_seg_selection.iter().map(|&(pi, si)| UiAction::SketchAddCommittedConstraint(
+    } else if sk.sel_committed_segs().next().is_some() {
+        sk.sel_committed_segs().map(|(pi, si)| UiAction::SketchAddCommittedConstraint(
             pi, SketchConstraint::VerticalPair { pt_a: si, pt_b: si + 1, perp_u: v_pu, perp_v: v_pv },
         )).collect()
-    } else if sk.committed_pt_selection.len() == 1
+    } else if sk.sel_committed_pts().count() == 1
         && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis))
     {
-        let (pi, vi) = sk.committed_pt_selection[0];
+        let (pi, vi) = sk.sel_committed_pts().next().unwrap();
         vec![UiAction::SketchAddCommittedConstraint(pi, SketchConstraint::PointOnYAxis { pt: vi })]
-    } else if sk.committed_pt_selection.len() >= 2 {
-        let (pi_a, vi_a) = sk.committed_pt_selection[0];
-        let (pi_b, vi_b) = sk.committed_pt_selection[1];
+    } else if sk.sel_committed_pts().count() >= 2 {
+        let mut cpts = sk.sel_committed_pts();
+        let (pi_a, vi_a) = cpts.next().unwrap();
+        let (pi_b, vi_b) = cpts.next().unwrap();
         if pi_a == pi_b {
             vec![UiAction::SketchAddCommittedConstraint(pi_a, SketchConstraint::VerticalPair {
                 pt_a: vi_a, pt_b: vi_b, perp_u: v_pu, perp_v: v_pv,
@@ -162,124 +165,136 @@ fn v_constraints(ed: &EditorState) -> Vec<UiAction> {
                 pi_a, vi_a, pi_b, vi_b, perp_u: v_pu, perp_v: v_pv,
             })]
         }
-    } else if n_pts == 2 {
-        vec![UiAction::SketchAddConstraint(SketchConstraint::VerticalPair {
-            pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1], perp_u: v_pu, perp_v: v_pv,
-        })]
-    } else if n_pts == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)) {
-        vec![UiAction::SketchAddConstraint(SketchConstraint::PointOnYAxis { pt: sk.pt_selection[0] })]
     } else {
-        vec![]
+        let n_pts: Vec<usize> = sk.sel_pts().collect();
+        if n_pts.len() == 2 {
+            vec![UiAction::SketchAddConstraint(SketchConstraint::VerticalPair {
+                pt_a: n_pts[0], pt_b: n_pts[1], perp_u: v_pu, perp_v: v_pv,
+            })]
+        } else if n_pts.len() == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)) {
+            vec![UiAction::SketchAddConstraint(SketchConstraint::PointOnYAxis { pt: n_pts[0] })]
+        } else {
+            vec![]
+        }
     }
 }
 
 fn parallel_constraint(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    if sk.seg_selection.len() >= 2 {
+    let segs: Vec<usize> = sk.sel_segs().collect();
+    if segs.len() >= 2 {
         vec![UiAction::SketchAddConstraint(SketchConstraint::Parallel {
-            seg_a: sk.seg_selection[0],
-            seg_b: sk.seg_selection[1],
+            seg_a: segs[0], seg_b: segs[1],
         })]
-    } else if sk.committed_seg_selection.len() >= 2 {
-        let (pi_a, si_a) = sk.committed_seg_selection[0];
-        let (pi_b, si_b) = sk.committed_seg_selection[1];
-        if pi_a == pi_b {
-            vec![UiAction::SketchAddCommittedConstraint(
-                pi_a, SketchConstraint::Parallel { seg_a: si_a, seg_b: si_b },
-            )]
-        } else {
-            vec![UiAction::SketchAddCrossConstraint(
-                CommittedCrossConstraint::Parallel { pi_a, si_a, pi_b, si_b },
-            )]
-        }
     } else {
-        vec![]
+        let csegs: Vec<(usize, usize)> = sk.sel_committed_segs().collect();
+        if csegs.len() >= 2 {
+            let (pi_a, si_a) = csegs[0];
+            let (pi_b, si_b) = csegs[1];
+            if pi_a == pi_b {
+                vec![UiAction::SketchAddCommittedConstraint(
+                    pi_a, SketchConstraint::Parallel { seg_a: si_a, seg_b: si_b },
+                )]
+            } else {
+                vec![UiAction::SketchAddCrossConstraint(
+                    CommittedCrossConstraint::Parallel { pi_a, si_a, pi_b, si_b },
+                )]
+            }
+        } else {
+            vec![]
+        }
     }
 }
 
 fn perp_constraint(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    if sk.seg_selection.len() >= 2 {
+    let segs: Vec<usize> = sk.sel_segs().collect();
+    if segs.len() >= 2 {
         vec![UiAction::SketchAddConstraint(SketchConstraint::Perpendicular {
-            seg_a: sk.seg_selection[0],
-            seg_b: sk.seg_selection[1],
+            seg_a: segs[0], seg_b: segs[1],
         })]
-    } else if sk.committed_seg_selection.len() >= 2 {
-        let (pi_a, si_a) = sk.committed_seg_selection[0];
-        let (pi_b, si_b) = sk.committed_seg_selection[1];
-        if pi_a == pi_b {
-            vec![UiAction::SketchAddCommittedConstraint(
-                pi_a, SketchConstraint::Perpendicular { seg_a: si_a, seg_b: si_b },
-            )]
-        } else {
-            vec![UiAction::SketchAddCrossConstraint(
-                CommittedCrossConstraint::Perpendicular { pi_a, si_a, pi_b, si_b },
-            )]
-        }
     } else {
-        vec![]
+        let csegs: Vec<(usize, usize)> = sk.sel_committed_segs().collect();
+        if csegs.len() >= 2 {
+            let (pi_a, si_a) = csegs[0];
+            let (pi_b, si_b) = csegs[1];
+            if pi_a == pi_b {
+                vec![UiAction::SketchAddCommittedConstraint(
+                    pi_a, SketchConstraint::Perpendicular { seg_a: si_a, seg_b: si_b },
+                )]
+            } else {
+                vec![UiAction::SketchAddCrossConstraint(
+                    CommittedCrossConstraint::Perpendicular { pi_a, si_a, pi_b, si_b },
+                )]
+            }
+        } else {
+            vec![]
+        }
     }
 }
 
 fn equal_len_constraint(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    if sk.seg_selection.len() >= 2 {
-        (1..sk.seg_selection.len()).map(|i| UiAction::SketchAddConstraint(SketchConstraint::EqualLength {
-            seg_a: sk.seg_selection[0],
-            seg_b: sk.seg_selection[i],
+    let segs: Vec<usize> = sk.sel_segs().collect();
+    if segs.len() >= 2 {
+        (1..segs.len()).map(|i| UiAction::SketchAddConstraint(SketchConstraint::EqualLength {
+            seg_a: segs[0], seg_b: segs[i],
         })).collect()
-    } else if sk.committed_seg_selection.len() >= 2 {
-        let (pi_a, si_a) = sk.committed_seg_selection[0];
-        (1..sk.committed_seg_selection.len()).map(|i| {
-            let (pi_b, si_b) = sk.committed_seg_selection[i];
-            if pi_a == pi_b {
-                UiAction::SketchAddCommittedConstraint(
-                    pi_a, SketchConstraint::EqualLength { seg_a: si_a, seg_b: si_b },
-                )
-            } else {
-                UiAction::SketchAddCrossConstraint(
-                    CommittedCrossConstraint::EqualLength { pi_a, si_a, pi_b, si_b },
-                )
-            }
-        }).collect()
     } else {
-        vec![]
+        let csegs: Vec<(usize, usize)> = sk.sel_committed_segs().collect();
+        if csegs.len() >= 2 {
+            let (pi_a, si_a) = csegs[0];
+            (1..csegs.len()).map(|i| {
+                let (pi_b, si_b) = csegs[i];
+                if pi_a == pi_b {
+                    UiAction::SketchAddCommittedConstraint(
+                        pi_a, SketchConstraint::EqualLength { seg_a: si_a, seg_b: si_b },
+                    )
+                } else {
+                    UiAction::SketchAddCrossConstraint(
+                        CommittedCrossConstraint::EqualLength { pi_a, si_a, pi_b, si_b },
+                    )
+                }
+            }).collect()
+        } else {
+            vec![]
+        }
     }
 }
 
 fn angle_input(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    if sk.seg_selection.len() >= 2 {
-        vec![UiAction::SketchBeginAngleInput {
-            seg_a: sk.seg_selection[0],
-            seg_b: sk.seg_selection[1],
-        }]
-    } else if sk.committed_seg_selection.len() >= 2 {
-        let (pi_a, si_a) = sk.committed_seg_selection[0];
-        let (pi_b, si_b) = sk.committed_seg_selection[1];
-        let target = if pi_a == pi_b {
-            AngleDialogTarget::CommittedProfile { pi: pi_a, si_a, si_b }
-        } else {
-            AngleDialogTarget::CrossProfile { pi_a, si_a, pi_b, si_b }
-        };
-        vec![UiAction::SketchBeginCommittedAngleInput(target)]
+    let segs: Vec<usize> = sk.sel_segs().collect();
+    if segs.len() >= 2 {
+        vec![UiAction::SketchBeginAngleInput { seg_a: segs[0], seg_b: segs[1] }]
     } else {
-        vec![]
+        let csegs: Vec<(usize, usize)> = sk.sel_committed_segs().collect();
+        if csegs.len() >= 2 {
+            let (pi_a, si_a) = csegs[0];
+            let (pi_b, si_b) = csegs[1];
+            let target = if pi_a == pi_b {
+                AngleDialogTarget::CommittedProfile { pi: pi_a, si_a, si_b }
+            } else {
+                AngleDialogTarget::CrossProfile { pi_a, si_a, pi_b, si_b }
+            };
+            vec![UiAction::SketchBeginCommittedAngleInput(target)]
+        } else {
+            vec![]
+        }
     }
 }
 
 fn length_input(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    let n_sel = sk.seg_selection.len();
-    let n_pts = sk.pt_selection.len();
-    let target = if n_sel >= 1 {
-        LengthTarget::Segment(sk.seg_selection[0])
-    } else if n_pts == 2 {
-        LengthTarget::Points(sk.pt_selection[0], sk.pt_selection[1])
-    } else if !sk.committed_seg_selection.is_empty() {
-        let (pi, si) = sk.committed_seg_selection[0];
+    let segs: Vec<usize> = sk.sel_segs().collect();
+    let pts: Vec<usize> = sk.sel_pts().collect();
+    let target = if !segs.is_empty() {
+        LengthTarget::Segment(segs[0])
+    } else if pts.len() == 2 {
+        LengthTarget::Points(pts[0], pts[1])
+    } else if let Some((pi, si)) = sk.sel_committed_segs().next() {
         LengthTarget::CommittedSegment(pi, si)
-    } else if let Some(pi) = sk.committed_selection {
+    } else if let Some(pi) = sk.sel_committed_profile() {
         if sk.committed_profiles.get(pi).map_or(false, |cp| cp.shape.supports_point_on_curve()) {
             LengthTarget::CommittedRadius(pi)
         } else {
@@ -293,12 +308,26 @@ fn length_input(ed: &EditorState) -> Vec<UiAction> {
 
 fn symmetric_constraint(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    if sk.committed_seg_selection.len() != 2 || sk.committed_pt_selection.len() != 1 {
+
+    // 3-point case: dist(P1, P3) == dist(P2, P3), P3 is the last selected point.
+    let cpts: Vec<(usize, usize)> = sk.sel_committed_pts().collect();
+    if cpts.len() == 3 && sk.sel_committed_segs().next().is_none() {
+        let (pi_a, vi_a) = cpts[0];
+        let (pi_b, vi_b) = cpts[1];
+        let (pi_c, vi_c) = cpts[2];
+        return vec![UiAction::SketchAddCrossConstraint(
+            CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c }
+        )];
+    }
+
+    // 2-segment + 1-point case.
+    let csegs: Vec<(usize, usize)> = sk.sel_committed_segs().collect();
+    if csegs.len() != 2 || cpts.len() != 1 {
         return vec![];
     }
-    let (pi_a, si_a) = sk.committed_seg_selection[0];
-    let (pi_b, si_b) = sk.committed_seg_selection[1];
-    let (pi_p, vi_p) = sk.committed_pt_selection[0];
+    let (pi_a, si_a) = csegs[0];
+    let (pi_b, si_b) = csegs[1];
+    let (pi_p, vi_p) = cpts[0];
     let Some(&gi_p) = sk.committed_profiles.get(pi_p).and_then(|cp| cp.point_indices.get(vi_p)) else {
         return vec![];
     };
@@ -309,25 +338,30 @@ fn symmetric_constraint(ed: &EditorState) -> Vec<UiAction> {
 
 fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
     let Some(sk) = &ed.sketch else { return vec![] };
-    let n_sel = sk.seg_selection.len();
-    let n_pts = sk.pt_selection.len();
+    let segs: Vec<usize> = sk.sel_segs().collect();
+    let pts: Vec<usize> = sk.sel_pts().collect();
+    let n_sel = segs.len();
+    let n_pts = pts.len();
+    let ref_sel = sk.sel_ref();
+    let cpts: Vec<(usize, usize)> = sk.sel_committed_pts().collect();
+    let csegs: Vec<(usize, usize)> = sk.sel_committed_segs().collect();
     let c = if n_pts == 2 && n_sel == 0 {
-        SketchConstraint::Coincident { pt_a: sk.pt_selection[0], pt_b: sk.pt_selection[1] }
+        SketchConstraint::Coincident { pt_a: pts[0], pt_b: pts[1] }
     } else if n_sel == 1 && n_pts == 1 {
-        SketchConstraint::PointOnLine { pt: sk.pt_selection[0], seg: sk.seg_selection[0] }
-    } else if n_pts == 1 && sk.ref_selection == Some(RefEntity::Origin) {
-        SketchConstraint::PointOnOrigin { pt: sk.pt_selection[0] }
-    } else if n_pts == 1 && !sk.committed_pt_selection.is_empty() && n_sel == 0 {
+        SketchConstraint::PointOnLine { pt: pts[0], seg: segs[0] }
+    } else if n_pts == 1 && ref_sel == Some(RefEntity::Origin) {
+        SketchConstraint::PointOnOrigin { pt: pts[0] }
+    } else if n_pts == 1 && !cpts.is_empty() && n_sel == 0 {
         // Active-profile vertex pinned to an arc control point (start, end, or center).
         let constraint = (|| -> Option<SketchConstraint> {
-            let &(ci, vi) = sk.committed_pt_selection.first()?;
+            let (ci, vi) = *cpts.first()?;
             let cp = sk.committed_profiles.get(ci)?;
             let &gi = cp.point_indices.get(vi)?;
             let p = sk.global_points.get(gi)?;
             let (u_axis, v_axis) = sk.plane.uv_axes();
             let u = p.coords.dot(&u_axis);
             let v = p.coords.dot(&v_axis);
-            Some(SketchConstraint::PointFixed { pt: sk.pt_selection[0], x: u, y: v })
+            Some(SketchConstraint::PointFixed { pt: pts[0], x: u, y: v })
         })();
         match constraint {
             Some(c) => c,
@@ -336,18 +370,18 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
     } else if n_pts == 1 && n_sel == 0 {
         // Point on committed arc or circle.
         let constraint = (|| -> Option<SketchConstraint> {
-            let ci = sk.committed_selection?;
+            let ci = sk.sel_committed_profile()?;
             let cp = sk.committed_profiles.get(ci)?;
-            let pts = crate::editor::resolved_points(cp, &sk.global_points);
-            cp.shape.point_on_curve_constraint(&pts, sk.pt_selection[0], sk.plane)
+            let resolved = crate::editor::resolved_points(cp, &sk.global_points);
+            cp.shape.point_on_curve_constraint(&resolved, pts[0], sk.plane)
         })();
         match constraint {
             Some(c) => c,
             None => return vec![],
         }
-    } else if sk.committed_pt_selection.len() == 2 && sk.pt_selection.is_empty() && n_sel == 0 {
-        let (pi1, vi1) = sk.committed_pt_selection[0];
-        let (pi2, vi2) = sk.committed_pt_selection[1];
+    } else if cpts.len() == 2 && n_pts == 0 && n_sel == 0 {
+        let (pi1, vi1) = cpts[0];
+        let (pi2, vi2) = cpts[1];
         if pi1 == pi2 {
             // Same profile → per-profile Coincident constraint.
             return vec![UiAction::SketchAddCommittedConstraint(
@@ -364,20 +398,20 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
             }
             return vec![];
         }
-    } else if sk.committed_pt_selection.len() == 1 && sk.pt_selection.is_empty() && n_sel == 0
-        && sk.ref_selection == Some(RefEntity::Origin)
+    } else if cpts.len() == 1 && n_pts == 0 && n_sel == 0
+        && ref_sel == Some(RefEntity::Origin)
     {
         // Committed vertex + Origin → pin that vertex to the origin.
-        let (pi, vi) = sk.committed_pt_selection[0];
+        let (pi, vi) = cpts[0];
         return vec![UiAction::SketchAddCommittedConstraint(
             pi, SketchConstraint::PointOnOrigin { pt: vi },
         )];
-    } else if sk.committed_pt_selection.len() == 1 && sk.committed_seg_selection.len() == 1
-        && sk.pt_selection.is_empty() && n_sel == 0
+    } else if cpts.len() == 1 && csegs.len() == 1
+        && n_pts == 0 && n_sel == 0
     {
         // One committed vertex + one committed segment in the same profile → PointOnLine.
-        let (pi_pt, vi) = sk.committed_pt_selection[0];
-        let (pi_seg, si) = sk.committed_seg_selection[0];
+        let (pi_pt, vi) = cpts[0];
+        let (pi_seg, si) = csegs[0];
         if pi_pt != pi_seg { return vec![]; }
         return vec![UiAction::SketchAddCommittedConstraint(
             pi_pt, SketchConstraint::PointOnLine { pt: vi, seg: si },
@@ -574,82 +608,83 @@ pub fn resolve(spec: &CommandSpec, editor: &EditorState) -> Vec<UiAction> {
 
 pub fn h_applicable(ed: &EditorState) -> bool {
     let Some(sk) = &ed.sketch else { return false };
-    let ref_sel = sk.ref_selection;
-    !sk.seg_selection.is_empty()
-        || !sk.committed_seg_selection.is_empty()
-        || sk.committed_pt_selection.len() >= 2
-        || (sk.committed_pt_selection.len() == 1
+    let ref_sel = sk.sel_ref();
+    sk.sel_segs().next().is_some()
+        || sk.sel_committed_segs().next().is_some()
+        || sk.sel_committed_pts().count() >= 2
+        || (sk.sel_committed_pts().count() == 1
             && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)))
-        || sk.pt_selection.len() == 2
-        || (sk.pt_selection.len() == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)))
+        || sk.sel_pts().count() == 2
+        || (sk.sel_pts().count() == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::XAxis)))
 }
 
 pub fn v_applicable(ed: &EditorState) -> bool {
     let Some(sk) = &ed.sketch else { return false };
-    let ref_sel = sk.ref_selection;
-    !sk.seg_selection.is_empty()
-        || !sk.committed_seg_selection.is_empty()
-        || sk.committed_pt_selection.len() >= 2
-        || (sk.committed_pt_selection.len() == 1
+    let ref_sel = sk.sel_ref();
+    sk.sel_segs().next().is_some()
+        || sk.sel_committed_segs().next().is_some()
+        || sk.sel_committed_pts().count() >= 2
+        || (sk.sel_committed_pts().count() == 1
             && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)))
-        || sk.pt_selection.len() == 2
-        || (sk.pt_selection.len() == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)))
+        || sk.sel_pts().count() == 2
+        || (sk.sel_pts().count() == 1 && matches!(ref_sel, Some(RefEntity::Origin) | Some(RefEntity::YAxis)))
 }
 
 pub fn two_segs(ed: &EditorState) -> bool {
     ed.sketch.as_ref().map_or(false, |sk| {
-        sk.seg_selection.len() >= 2 || sk.committed_seg_selection.len() >= 2
+        sk.sel_segs().count() >= 2 || sk.sel_committed_segs().count() >= 2
     })
 }
 
 pub fn exactly_two_segs(ed: &EditorState) -> bool {
     ed.sketch.as_ref().map_or(false, |sk| {
-        sk.seg_selection.len() == 2 || sk.committed_seg_selection.len() == 2
+        sk.sel_segs().count() == 2 || sk.sel_committed_segs().count() == 2
     })
 }
 
 pub fn has_length_target(ed: &EditorState) -> bool {
     let Some(sk) = &ed.sketch else { return false };
-    sk.seg_selection.len() >= 1
-        || sk.pt_selection.len() == 2
-        || !sk.committed_seg_selection.is_empty()
-        || sk.committed_selection.map_or(false, |pi| {
+    sk.sel_segs().next().is_some()
+        || sk.sel_pts().count() == 2
+        || sk.sel_committed_segs().next().is_some()
+        || sk.sel_committed_profile().map_or(false, |pi| {
             sk.committed_profiles.get(pi).map_or(false, |cp| cp.shape.supports_point_on_curve())
         })
 }
 
 pub fn has_radius_target(ed: &EditorState) -> bool {
     let Some(sk) = &ed.sketch else { return false };
-    sk.committed_selection.map_or(false, |pi| {
+    sk.sel_committed_profile().map_or(false, |pi| {
         sk.committed_profiles.get(pi).map_or(false, |cp| cp.shape.supports_point_on_curve())
     })
 }
 
 pub fn has_symmetric_target(ed: &EditorState) -> bool {
     ed.sketch.as_ref().map_or(false, |sk| {
-        sk.committed_seg_selection.len() == 2 && sk.committed_pt_selection.len() == 1
+        (sk.sel_committed_segs().count() == 2 && sk.sel_committed_pts().count() == 1)
+            || sk.sel_committed_pts().count() == 3
     })
 }
 
 pub fn has_coincident_target(ed: &EditorState) -> bool {
     let Some(sk) = &ed.sketch else { return false };
-    let n_sel = sk.seg_selection.len();
-    let n_pts = sk.pt_selection.len();
+    let n_sel = sk.sel_segs().count();
+    let n_pts = sk.sel_pts().count();
+    let ref_sel = sk.sel_ref();
+    let n_cpts = sk.sel_committed_pts().count();
+    let n_csegs = sk.sel_committed_segs().count();
     (n_pts == 2 && n_sel == 0)
         || (n_sel == 1 && n_pts == 1)
-        || (n_pts == 1 && sk.ref_selection == Some(RefEntity::Origin))
-        || (n_pts == 1 && n_sel == 0 && !sk.committed_pt_selection.is_empty())
-        || (n_pts == 1 && n_sel == 0 && sk.committed_selection.map_or(false, |ci| {
-            sk.committed_profiles.get(ci).map_or(false, |cp| {
-                cp.shape.supports_point_on_curve()
-            })
+        || (n_pts == 1 && ref_sel == Some(RefEntity::Origin))
+        || (n_pts == 1 && n_sel == 0 && n_cpts >= 1)
+        || (n_pts == 1 && n_sel == 0 && sk.sel_committed_profile().map_or(false, |ci| {
+            sk.committed_profiles.get(ci).map_or(false, |cp| cp.shape.supports_point_on_curve())
         }))
-        || (sk.committed_pt_selection.len() == 2 && n_pts == 0 && n_sel == 0)
-        || (sk.committed_pt_selection.len() == 1 && n_pts == 0 && n_sel == 0
-            && sk.ref_selection == Some(RefEntity::Origin))
-        || (sk.committed_pt_selection.len() == 1 && sk.committed_seg_selection.len() == 1
-            && n_pts == 0 && n_sel == 0
-            && sk.committed_pt_selection[0].0 == sk.committed_seg_selection[0].0)
+        || (n_cpts == 2 && n_pts == 0 && n_sel == 0)
+        || (n_cpts == 1 && n_pts == 0 && n_sel == 0 && ref_sel == Some(RefEntity::Origin))
+        || (n_cpts == 1 && n_csegs == 1 && n_pts == 0 && n_sel == 0
+            && sk.sel_committed_pts().next().map(|(pi, _)| pi)
+                == sk.sel_committed_segs().next().map(|(pi, _)| pi))
 }
 
 pub fn two_solids_selected(ed: &EditorState) -> bool {

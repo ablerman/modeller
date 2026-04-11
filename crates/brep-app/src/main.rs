@@ -782,8 +782,8 @@ impl ApplicationHandler for App {
                             let indices: Vec<usize> = {
                                 let sk = state.editor.sketch.as_ref().unwrap();
                                 let mut set = std::collections::BTreeSet::new();
-                                if let Some(pi) = sk.committed_selection { set.insert(pi); }
-                                for &(pi, _) in &sk.committed_seg_selection { set.insert(pi); }
+                                if let Some(pi) = sk.sel_committed_profile() { set.insert(pi); }
+                                for (pi, _) in sk.sel_committed_segs() { set.insert(pi); }
                                 set.into_iter().rev().collect()
                             };
                             for pi in indices {
