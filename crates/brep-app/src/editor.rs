@@ -794,6 +794,22 @@ impl EditorState {
         s
     }
 
+    /// Construct a blank editor state with no entries and no history.
+    #[cfg(test)]
+    pub fn new_empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            selection: std::collections::HashSet::new(),
+            camera: ViewportCamera::default(),
+            history: History::new(),
+            name_counter: 0,
+            next_object_id: 0,
+            scene_dirty: false,
+            camera_anim: None,
+            sketch: None,
+        }
+    }
+
     /// Apply a UI action.  Returns `true` if the scene geometry changed.
     pub fn apply(&mut self, action: UiAction) -> bool {
         match action {
@@ -1756,5 +1772,130 @@ fn rebuild_solid(name: String, history: &ObjectHistory, next_id: &mut u64) -> Op
             let solid_id  = new_store.solid_ids().next()?;
             Some(SceneObject { store: new_store, solid_id, name, history: history.clone(), id })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn undo_restores_entry_count() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::AddPrimitive(PrimitiveKind::Box));
+        assert_eq!(ed.entries.len(), 1);
+        ed.apply(UiAction::Undo);
+        assert_eq!(ed.entries.len(), 0);
+    }
+
+    #[test]
+    fn redo_reapplies_after_undo() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::AddPrimitive(PrimitiveKind::Cylinder));
+        ed.apply(UiAction::Undo);
+        assert_eq!(ed.entries.len(), 0);
+        ed.apply(UiAction::Redo);
+        assert_eq!(ed.entries.len(), 1);
+    }
+
+    #[test]
+    fn undo_with_empty_history_returns_false() {
+        let mut ed = EditorState::new_empty();
+        assert!(!ed.apply(UiAction::Undo));
+    }
+
+    // ── Selection ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn select_object_sets_selection() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::AddPrimitive(PrimitiveKind::Box));
+        ed.apply(UiAction::SelectObject(0));
+        assert!(ed.selection.contains(&0));
+        assert_eq!(ed.selection.len(), 1);
+    }
+
+    #[test]
+    fn toggle_select_adds_then_removes() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::AddPrimitive(PrimitiveKind::Box));
+        ed.apply(UiAction::ToggleSelectObject(0));
+        assert!(ed.selection.contains(&0));
+        ed.apply(UiAction::ToggleSelectObject(0));
+        assert!(!ed.selection.contains(&0));
+    }
+
+    #[test]
+    fn delete_selected_removes_entries() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::AddPrimitive(PrimitiveKind::Box));
+        ed.apply(UiAction::SelectObject(0));
+        ed.apply(UiAction::DeleteSelected);
+        assert_eq!(ed.entries.len(), 0);
+        assert!(ed.selection.is_empty());
+    }
+
+    #[test]
+    fn delete_with_no_selection_is_noop() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::AddPrimitive(PrimitiveKind::Sphere));
+        let changed = ed.apply(UiAction::DeleteSelected);
+        assert!(!changed);
+        assert_eq!(ed.entries.len(), 1);
+    }
+
+    // ── Sketch lifecycle ──────────────────────────────────────────────────────
+
+    #[test]
+    fn enter_sketch_sets_plane() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::EnterSketch(SketchPlane::XY));
+        assert!(ed.sketch.is_some());
+        assert_eq!(ed.sketch.as_ref().unwrap().plane, SketchPlane::XY);
+    }
+
+    #[test]
+    fn exit_sketch_clears_sketch_state() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::EnterSketch(SketchPlane::XZ));
+        ed.apply(UiAction::ExitSketch);
+        assert!(ed.sketch.is_none());
+    }
+
+    #[test]
+    fn set_tool_changes_active_tool() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::EnterSketch(SketchPlane::XY));
+        ed.apply(UiAction::SketchSetTool(DrawTool::Polyline));
+        assert_eq!(ed.sketch.as_ref().unwrap().active_tool, DrawTool::Polyline);
+        ed.apply(UiAction::SketchSetTool(DrawTool::Circle));
+        assert_eq!(ed.sketch.as_ref().unwrap().active_tool, DrawTool::Circle);
+    }
+
+    #[test]
+    fn sketch_rename_updates_name() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::EnterSketch(SketchPlane::YZ));
+        ed.apply(UiAction::SketchRename("MySketch".to_string()));
+        assert_eq!(ed.sketch.as_ref().unwrap().name, "MySketch");
+    }
+
+    // ── Sketch undo ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sketch_constraint_is_undoable() {
+        let mut ed = EditorState::new_empty();
+        ed.apply(UiAction::EnterSketch(SketchPlane::XY));
+        // Place two points to create a segment.
+        ed.apply(UiAction::SketchAddPoint(Point3::new(0.0, 0.0, 0.0)));
+        ed.apply(UiAction::SketchAddPoint(Point3::new(1.0, 0.1, 0.0)));
+        // Add a constraint.
+        ed.apply(UiAction::SketchAddConstraint(SketchConstraint::Horizontal { seg: 0 }));
+        assert_eq!(ed.sketch.as_ref().unwrap().constraints.len(), 1);
+        // Undo inside the sketch: constraint should be removed.
+        ed.apply(UiAction::Undo);
+        assert_eq!(ed.sketch.as_ref().unwrap().constraints.len(), 0);
     }
 }
