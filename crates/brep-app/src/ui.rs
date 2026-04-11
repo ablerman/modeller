@@ -4,7 +4,7 @@ use brep_core::Point3;
 use brep_sketch::SketchConstraint;
 use egui::Context;
 
-use crate::editor::{AngleDialogTarget, CommittedCrossConstraint, EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
+use crate::editor::{AngleDialogTarget, CommittedCrossConstraint, DrawTool, EditorState, LengthTarget, ObjectHistory, PrimitiveKind, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction};
 use crate::icons::{icon_angle, icon_coincident, icon_equal_len, icon_horizontal, icon_length, icon_parallel, icon_perp, icon_trash, icon_vertical};
 use crate::toolbar::IconSize;
 use crate::toolbar_defs;
@@ -515,8 +515,8 @@ pub fn build_ui(
                 }
             }
         }
-        // Cursor dot — hidden while snapping.
-        if snap_vertex.is_none() {
+        // Cursor dot — only shown while actively drawing (not in pointer mode).
+        if snap_vertex.is_none() && sk.active_tool != DrawTool::Pointer {
             if let Some(c) = sketch_cursor {
                 if let Some(p) = proj(c) {
                     painter.circle_filled(p, 3.0, egui::Color32::WHITE);
