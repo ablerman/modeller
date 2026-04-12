@@ -240,6 +240,8 @@ pub struct SketchState {
     pub constraint_selection: Vec<usize>,
     /// Indices of currently selected cross-profile constraints (for highlighting).
     pub cross_constraint_selection: Vec<usize>,
+    /// Selected per-profile constraints: (profile_idx, constraint_idx within that profile).
+    pub committed_constraint_selection: Vec<(usize, usize)>,
     /// Whether the sketch is fully constrained (DOF = 0) after the last solve.
     pub fully_constrained: bool,
     /// Independent undo/redo stack for sketch edits.
@@ -733,6 +735,8 @@ pub enum UiAction {
     SketchSelectConstraint(usize),
     /// Toggle-select a cross-profile constraint by index.
     SketchSelectCrossConstraint(usize),
+    /// Toggle-select a per-profile constraint by (profile_idx, constraint_idx).
+    SketchSelectCommittedConstraint(usize, usize),
     /// Toggle-select a segment from the panel list (no max-2 cap, preserves other segs).
     SketchPanelSelectSegment(usize),
     /// Toggle-select a vertex from the panel list (no max-2 cap, preserves other pts).
@@ -1377,6 +1381,7 @@ impl EditorState {
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
                     cross_constraint_selection: Vec::new(),
+                    committed_constraint_selection: Vec::new(),
                     fully_constrained:  false,
                     history:            SketchHistory::new(),
                     active_tool:        DrawTool::Pointer,
@@ -1439,6 +1444,7 @@ impl EditorState {
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
                     cross_constraint_selection: Vec::new(),
+                    committed_constraint_selection: Vec::new(),
                     fully_constrained:    false,
                     history:              SketchHistory::new(),
                     active_tool:          DrawTool::Pointer,
@@ -1489,6 +1495,17 @@ impl EditorState {
                 }
                 false
             }
+            UiAction::SketchSelectCommittedConstraint(pi, ci) => {
+                if let Some(sk) = &mut self.sketch {
+                    let key = (pi, ci);
+                    if let Some(pos) = sk.committed_constraint_selection.iter().position(|&x| x == key) {
+                        sk.committed_constraint_selection.remove(pos);
+                    } else {
+                        sk.committed_constraint_selection.push(key);
+                    }
+                }
+                false
+            }
             UiAction::SketchPanelSelectSegment(i) => {
                 if let Some(sk) = &mut self.sketch {
                     sk.toggle_and_cap(SketchSelection::Segment(i), usize::MAX);
@@ -1535,6 +1552,7 @@ impl EditorState {
                         sk.selection.clear();
                         sk.constraint_selection.clear();
                         sk.cross_constraint_selection.clear();
+                        sk.committed_constraint_selection.clear();
                     }
                 }
                 false
