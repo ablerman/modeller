@@ -5,6 +5,7 @@ use brep_core::Point3;
 use crate::editor::{EditorState, RefEntity, SceneEntry, SketchState, ToolInProgress, UiAction, ViewportCamera};
 
 use super::constraint_helpers::draw_constraint_marker;
+use super::panel::PanelHighlights;
 
 // ── Committed profile helper ──────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ pub(super) fn draw_sketch_overlay(
     snap_committed_seg: Option<(usize, usize)>,
     sketch_cursor: Option<Point3>,
     context_menu: Option<((f32, f32), usize)>,
+    panel_hi: &PanelHighlights,
 ) -> Vec<UiAction> {
     let mut actions: Vec<UiAction> = Vec::new();
 
@@ -117,12 +119,15 @@ pub(super) fn draw_sketch_overlay(
     // Draw committed profiles first.
     let committed_sel = sk.sel_committed_profile();
     for (pi, cp) in sk.committed_profiles.iter().enumerate() {
-        let is_sel         = committed_sel == Some(pi);
-        let is_curve_hov   = snap_committed_curve == Some(pi);
+        let is_sel       = committed_sel == Some(pi);
+        let is_curve_hov = snap_committed_curve == Some(pi);
+        let is_panel_hi  = panel_hi.hi_committed.contains(&pi);
         let cp_stroke = if is_sel {
             egui::Stroke::new(edge_stroke.width + 1.0, egui::Color32::from_rgb(255, 160, 60))
         } else if is_curve_hov {
             egui::Stroke::new(edge_stroke.width + 1.0, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 210))
+        } else if is_panel_hi {
+            egui::Stroke::new(edge_stroke.width + 1.0, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 160))
         } else {
             edge_stroke
         };
@@ -203,6 +208,18 @@ pub(super) fn draw_sketch_overlay(
                 painter.line_segment(
                     [a, b],
                     egui::Stroke::new(3.5, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 210)),
+                );
+            }
+        }
+    }
+
+    // Panel-hover segment highlight (faint cyan — from hovering constraints/elements list).
+    for &si in &panel_hi.hi_segs {
+        if si < seg_count {
+            if let (Some(a), Some(b)) = (proj(sk.points[si]), proj(sk.points[(si + 1) % n])) {
+                painter.line_segment(
+                    [a, b],
+                    egui::Stroke::new(3.5, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 140)),
                 );
             }
         }
@@ -310,6 +327,18 @@ pub(super) fn draw_sketch_overlay(
                 painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
             } else {
                 painter.circle_filled(p, 4.0, egui::Color32::YELLOW);
+            }
+        }
+    }
+
+    // Panel-hover point highlight (faint ring — from hovering constraints/elements list).
+    for &vi in &panel_hi.hi_pts {
+        if let Some(pt) = sk.points.get(vi) {
+            if let Some(p) = proj(*pt) {
+                painter.circle_stroke(
+                    p, 8.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(100, 200, 255, 140)),
+                );
             }
         }
     }

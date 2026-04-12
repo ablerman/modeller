@@ -28,12 +28,12 @@ pub enum ProfileShape {
 }
 
 impl ProfileShape {
-    /// Display label for the profile panel (e.g. "Circle 0", "Arc 1", "Rectangle 2").
+    /// Display label for the profile panel (e.g. "Circle 0", "Arc 1", "Segment 2").
     pub fn label(&self, index: usize) -> String {
         match self {
             ProfileShape::Circle   => format!("Circle {index}"),
             ProfileShape::Arc      => format!("Arc {index}"),
-            ProfileShape::Polyline => format!("Rectangle {index}"),
+            ProfileShape::Polyline => format!("Segment {index}"),
         }
     }
 

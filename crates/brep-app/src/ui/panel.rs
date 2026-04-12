@@ -9,9 +9,25 @@ use super::constraint_helpers::{
 };
 use super::list_icon;
 
+// ── Panel highlights ──────────────────────────────────────────────────────────
+
+/// Elements the panel wants the viewport to highlight this frame.
+/// Populated by hovering items in the elements list or constraints list.
+#[derive(Default)]
+pub(super) struct PanelHighlights {
+    /// Active-profile point indices to highlight in the viewport.
+    pub hi_pts: std::collections::HashSet<usize>,
+    /// Active-profile segment indices to highlight in the viewport.
+    pub hi_segs: std::collections::HashSet<usize>,
+    /// Committed-profile indices to highlight in the viewport.
+    pub hi_committed: std::collections::HashSet<usize>,
+    /// Active-profile constraint indices to highlight in the constraints list.
+    pub hi_constraints: std::collections::HashSet<usize>,
+}
+
 // ── Panel ─────────────────────────────────────────────────────────────────────
 
-/// Floating sketch configuration panel — resizable, draggable, constrained to the viewport.
+/// Floating sketch configuration panel.  Returns actions and viewport highlights.
 pub(super) fn draw_sketch_info_panel(
     ctx: &egui::Context,
     editor: &EditorState,
@@ -20,15 +36,31 @@ pub(super) fn draw_sketch_info_panel(
     snap_committed: Option<(usize, usize)>,
     snap_committed_curve: Option<usize>,
     snap_committed_seg: Option<(usize, usize)>,
-) -> Vec<UiAction> {
+) -> (Vec<UiAction>, PanelHighlights) {
     let mut actions: Vec<UiAction> = Vec::new();
-    let Some(sk) = &editor.sketch else { return actions };
+    let mut hi = PanelHighlights::default();
+    let Some(sk) = &editor.sketch else { return (actions, hi) };
+
+    // Seed constraint highlights from whatever is snapped in the viewport.
+    if let Some(si) = snap_segment {
+        for (ci, c) in sk.constraints.iter().enumerate() {
+            if constraint_element_refs(c).1.contains(&si) {
+                hi.hi_constraints.insert(ci);
+            }
+        }
+    }
+    if let Some(vi) = snap_vertex {
+        for (ci, c) in sk.constraints.iter().enumerate() {
+            if constraint_element_refs(c).0.contains(&vi) {
+                hi.hi_constraints.insert(ci);
+            }
+        }
+    }
 
     let panel_id = egui::Id::new("sketch_info_panel");
     let viewport = ctx.available_rect();
     let default_pos = egui::pos2(viewport.left() + 12.0, viewport.top() + 12.0);
 
-    // Snap to viewport edge once the pointer is released.
     let is_dragging = ctx.input(|i| i.pointer.any_down());
     let win_size = egui::AreaState::load(ctx, panel_id)
         .and_then(|s| s.size)
@@ -118,6 +150,7 @@ pub(super) fn draw_sketch_info_panel(
                     .min_scrolled_height(60.0)
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
+
                         for i in 0..n {
                             let p = &sk.points[i];
                             let selected = sk.sel_pts().any(|s| s == i);
@@ -130,7 +163,17 @@ pub(super) fn draw_sketch_info_panel(
                             if resp.clicked() {
                                 actions.push(UiAction::SketchPanelSelectVertex(i));
                             }
+                            // Hovering a point highlights its constraints and marks it for viewport glow.
+                            if resp.hovered() && !selected {
+                                hi.hi_pts.insert(i);
+                                for (ci, c) in sk.constraints.iter().enumerate() {
+                                    if constraint_element_refs(c).0.contains(&i) {
+                                        hi.hi_constraints.insert(ci);
+                                    }
+                                }
+                            }
                         }
+
                         let n_segs = if sk.closed { n } else { n.saturating_sub(1) };
                         for i in 0..n_segs {
                             let j = (i + 1) % n;
@@ -142,11 +185,20 @@ pub(super) fn draw_sketch_info_panel(
                             if resp.clicked() {
                                 actions.push(UiAction::SketchPanelSelectSegment(i));
                             }
-                            // Scroll to the first newly-selected segment.
                             if selected && sel_changed && !cur_seg_sel.contains(&i) {
                                 resp.scroll_to_me(Some(egui::Align::Center));
                             }
+                            // Hovering a segment highlights its constraints and marks it for viewport glow.
+                            if resp.hovered() && !selected {
+                                hi.hi_segs.insert(i);
+                                for (ci, c) in sk.constraints.iter().enumerate() {
+                                    if constraint_element_refs(c).1.contains(&i) {
+                                        hi.hi_constraints.insert(ci);
+                                    }
+                                }
+                            }
                         }
+
                         // Committed profiles (circles, arcs, segments, etc.).
                         for (pi, cp) in sk.committed_profiles.iter().enumerate() {
                             let label = cp.shape.label(pi);
@@ -162,6 +214,10 @@ pub(super) fn draw_sketch_info_panel(
                             if resp.clicked() {
                                 let new_sel = if is_sel { None } else { Some(pi) };
                                 actions.push(UiAction::SketchSelectCommitted(new_sel));
+                            }
+                            // Hovering a committed profile marks it for viewport glow.
+                            if resp.hovered() && !is_sel {
+                                hi.hi_committed.insert(pi);
                             }
                         }
                     });
@@ -190,11 +246,14 @@ pub(super) fn draw_sketch_info_panel(
                             let is_violated =
                                 sk.violated_constraints.get(i).copied().unwrap_or(false);
                             let is_selected = sk.constraint_selection.contains(&i);
+                            let is_hi = !is_selected && hi.hi_constraints.contains(&i);
+                            let base_text = constraint_text(c);
                             let label_text = if is_violated {
-                                egui::RichText::new(constraint_text(c))
-                                    .color(egui::Color32::RED)
+                                egui::RichText::new(&base_text).color(egui::Color32::RED)
+                            } else if is_hi {
+                                egui::RichText::new(&base_text).color(egui::Color32::from_rgb(255, 160, 60))
                             } else {
-                                egui::RichText::new(constraint_text(c))
+                                egui::RichText::new(&base_text)
                             };
                             ui.horizontal(|ui| {
                                 let row_h = ui.spacing().interact_size.y;
@@ -230,6 +289,8 @@ pub(super) fn draw_sketch_info_panel(
                                     ui.visuals().selection.stroke.color
                                 } else if is_violated {
                                     egui::Color32::RED
+                                } else if is_hi {
+                                    egui::Color32::from_rgb(255, 160, 60)
                                 } else {
                                     ui.visuals().text_color()
                                 };
@@ -239,6 +300,12 @@ pub(super) fn draw_sketch_info_panel(
                                 );
                                 if resp.clicked() {
                                     actions.push(UiAction::SketchSelectConstraint(i));
+                                }
+                                // Hovering a constraint highlights its referenced elements.
+                                if resp.hovered() {
+                                    let (pts, segs) = constraint_element_refs(c);
+                                    hi.hi_pts.extend(pts);
+                                    hi.hi_segs.extend(segs);
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -401,10 +468,9 @@ pub(super) fn draw_sketch_info_panel(
             }
         });
 
-    // Persist the window position after each frame so snap logic has fresh data.
     if let Some(state) = egui::AreaState::load(ctx, panel_id) {
         ctx.data_mut(|d| d.insert_temp(panel_id, state.left_top_pos()));
     }
 
-    actions
+    (actions, hi)
 }
