@@ -244,7 +244,7 @@ pub fn build_ui(
     // ── Sketch info panel ─────────────────────────────────────────────────────
     let (panel_actions, panel_hi) = draw_sketch_info_panel(
         ctx, editor,
-        snap_vertex, snap_segment,
+        snap_vertex, snap_segment, snap_constraint,
         snap_committed, snap_committed_curve, snap_committed_seg,
     );
     actions.extend(panel_actions);

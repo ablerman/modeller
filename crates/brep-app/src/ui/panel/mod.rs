@@ -6,7 +6,7 @@ mod history;
 
 use crate::editor::{EditorState, UiAction};
 
-use super::constraint_helpers::{constraint_element_refs, snap_to_viewport};
+use super::constraint_helpers::{constraint_element_refs, cross_constraint_element_refs, snap_to_viewport};
 
 // ── Panel highlights ──────────────────────────────────────────────────────────
 
@@ -22,6 +22,10 @@ pub(super) struct PanelHighlights {
     pub hi_committed: std::collections::HashSet<usize>,
     /// Active-profile constraint indices to highlight in the constraints list.
     pub hi_constraints: std::collections::HashSet<usize>,
+    /// Per-profile constraint (profile_idx, constraint_idx) pairs to highlight.
+    pub hi_committed_constraints: std::collections::HashSet<(usize, usize)>,
+    /// Cross-profile constraint indices to highlight.
+    pub hi_cross_constraints: std::collections::HashSet<usize>,
 }
 
 // ── Panel ─────────────────────────────────────────────────────────────────────
@@ -32,6 +36,7 @@ pub(super) fn draw_sketch_info_panel(
     editor: &EditorState,
     snap_vertex: Option<usize>,
     snap_segment: Option<usize>,
+    snap_constraint: Option<usize>,
     snap_committed: Option<(usize, usize)>,
     snap_committed_curve: Option<usize>,
     snap_committed_seg: Option<(usize, usize)>,
@@ -41,9 +46,22 @@ pub(super) fn draw_sketch_info_panel(
     let Some(sk) = &editor.sketch else { return (actions, hi) };
 
     // Seed constraint highlights from whatever is snapped in the viewport.
+    if let Some(sc) = snap_constraint {
+        hi.hi_constraints.insert(sc);
+    }
     if let Some(si) = snap_segment {
+        let n = sk.points.len();
+        let pt_a = si;
+        let pt_b = (si + 1) % n;
         for (ci, c) in sk.constraints.iter().enumerate() {
-            if constraint_element_refs(c).1.contains(&si) {
+            let (pts, segs) = constraint_element_refs(c);
+            // Segment-based constraint referencing this segment directly.
+            if segs.contains(&si) {
+                hi.hi_constraints.insert(ci);
+            }
+            // Point-pair constraints (HorizontalPair / VerticalPair) whose two
+            // referenced points are the endpoints of this segment.
+            if pts.len() == 2 && pts.contains(&pt_a) && pts.contains(&pt_b) {
                 hi.hi_constraints.insert(ci);
             }
         }
@@ -52,6 +70,55 @@ pub(super) fn draw_sketch_info_panel(
         for (ci, c) in sk.constraints.iter().enumerate() {
             if constraint_element_refs(c).0.contains(&vi) {
                 hi.hi_constraints.insert(ci);
+            }
+        }
+    }
+
+    // Seed per-profile and cross-profile highlights from committed-profile snap.
+    if let Some((pi, si)) = snap_committed_seg {
+        if let Some(cp) = sk.committed_profiles.get(pi) {
+            for (ci, c) in cp.constraints.iter().enumerate() {
+                let (pts, segs) = constraint_element_refs(c);
+                if segs.contains(&si) {
+                    hi.hi_committed_constraints.insert((pi, ci));
+                }
+                // HorizontalPair / VerticalPair on a committed segment: pt_a=si, pt_b=si+1.
+                if pts.len() == 2 && pts.contains(&si) && pts.contains(&(si + 1)) {
+                    hi.hi_committed_constraints.insert((pi, ci));
+                }
+            }
+        }
+        for (i, cc) in sk.cross_constraints.iter().enumerate() {
+            if cross_constraint_element_refs(cc).1.contains(&(pi, si)) {
+                hi.hi_cross_constraints.insert(i);
+            }
+        }
+    }
+    if let Some((pi, vi)) = snap_committed {
+        if let Some(cp) = sk.committed_profiles.get(pi) {
+            for (ci, c) in cp.constraints.iter().enumerate() {
+                if constraint_element_refs(c).0.contains(&vi) {
+                    hi.hi_committed_constraints.insert((pi, ci));
+                }
+            }
+        }
+        for (i, cc) in sk.cross_constraints.iter().enumerate() {
+            if cross_constraint_element_refs(cc).0.contains(&(pi, vi)) {
+                hi.hi_cross_constraints.insert(i);
+            }
+        }
+    }
+    if let Some(pi) = snap_committed_curve {
+        // Hovering the curve itself — highlight all constraints for this profile.
+        if let Some(cp) = sk.committed_profiles.get(pi) {
+            for ci in 0..cp.constraints.len() {
+                hi.hi_committed_constraints.insert((pi, ci));
+            }
+        }
+        for (i, cc) in sk.cross_constraints.iter().enumerate() {
+            let (verts, segs) = cross_constraint_element_refs(cc);
+            if verts.iter().any(|(p, _)| *p == pi) || segs.iter().any(|(p, _)| *p == pi) {
+                hi.hi_cross_constraints.insert(i);
             }
         }
     }

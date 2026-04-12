@@ -1,7 +1,7 @@
 //! Elements list section of the sketch info panel.
 
 use crate::editor::{SketchState, UiAction};
-use crate::ui::constraint_helpers::constraint_element_refs;
+use crate::ui::constraint_helpers::{constraint_element_refs, cross_constraint_element_refs};
 
 pub(super) fn draw_elements_list(
     ui: &mut egui::Ui,
@@ -88,8 +88,15 @@ pub(super) fn draw_elements_list(
                 // Hovering a segment highlights its constraints and marks it for viewport glow.
                 if resp.hovered() && !selected {
                     hi.hi_segs.insert(i);
+                    let pt_a = i;
+                    let pt_b = (i + 1) % n;
                     for (ci, c) in sk.constraints.iter().enumerate() {
-                        if constraint_element_refs(c).1.contains(&i) {
+                        let (pts, segs) = constraint_element_refs(c);
+                        if segs.contains(&i) {
+                            hi.hi_constraints.insert(ci);
+                        }
+                        // HorizontalPair / VerticalPair reference endpoints, not segment index.
+                        if pts.len() == 2 && pts.contains(&pt_a) && pts.contains(&pt_b) {
                             hi.hi_constraints.insert(ci);
                         }
                     }
@@ -112,9 +119,19 @@ pub(super) fn draw_elements_list(
                     let new_sel = if is_sel { None } else { Some(pi) };
                     actions.push(UiAction::SketchSelectCommitted(new_sel));
                 }
-                // Hovering a committed profile marks it for viewport glow.
+                // Hovering a committed profile marks it for viewport glow and
+                // highlights all constraints referencing it.
                 if resp.hovered() && !is_sel {
                     hi.hi_committed.insert(pi);
+                    for ci in 0..cp.constraints.len() {
+                        hi.hi_committed_constraints.insert((pi, ci));
+                    }
+                    for (i, cc) in sk.cross_constraints.iter().enumerate() {
+                        let (verts, segs) = cross_constraint_element_refs(cc);
+                        if verts.iter().any(|(p, _)| *p == pi) || segs.iter().any(|(p, _)| *p == pi) {
+                            hi.hi_cross_constraints.insert(i);
+                        }
+                    }
                 }
             }
         });

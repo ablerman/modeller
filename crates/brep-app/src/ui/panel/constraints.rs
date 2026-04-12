@@ -63,6 +63,12 @@ pub(super) fn draw_constraints_list(
                             ui.visuals().widgets.hovered.rounding,
                             ui.visuals().selection.bg_fill,
                         );
+                    } else if is_hi {
+                        ui.painter().rect_filled(
+                            row_rect,
+                            ui.visuals().widgets.hovered.rounding,
+                            egui::Color32::from_rgba_unmultiplied(255, 160, 60, 30),
+                        );
                     } else if resp.hovered() {
                         ui.painter().rect_filled(
                             row_rect,
@@ -125,6 +131,7 @@ pub(super) fn draw_constraints_list(
                 let profile_label = cp.shape.label(pi);
                 for (ci, c) in cp.constraints.iter().enumerate() {
                     let is_selected = sk.committed_constraint_selection.contains(&(pi, ci));
+                    let is_hi = !is_selected && hi.hi_committed_constraints.contains(&(pi, ci));
                     ui.horizontal(|ui| {
                         let row_h = ui.spacing().interact_size.y;
                         let scrollbar_pad = 12.0;
@@ -142,6 +149,12 @@ pub(super) fn draw_constraints_list(
                                 ui.visuals().widgets.hovered.rounding,
                                 ui.visuals().selection.bg_fill,
                             );
+                        } else if is_hi {
+                            ui.painter().rect_filled(
+                                row_rect,
+                                ui.visuals().widgets.hovered.rounding,
+                                egui::Color32::from_rgba_unmultiplied(255, 160, 60, 30),
+                            );
                         } else if resp.hovered() {
                             ui.painter().rect_filled(
                                 row_rect,
@@ -157,6 +170,8 @@ pub(super) fn draw_constraints_list(
                         child.add(list_icon(constraint_icon(c)));
                         let text_color = if is_selected {
                             ui.visuals().selection.stroke.color
+                        } else if is_hi {
+                            egui::Color32::from_rgb(255, 160, 60)
                         } else {
                             ui.visuals().text_color()
                         };
@@ -196,6 +211,7 @@ pub(super) fn draw_constraints_list(
             let mut remove_cross_idx: Option<usize> = None;
             for (i, cc) in sk.cross_constraints.iter().enumerate() {
                 let is_selected = sk.cross_constraint_selection.contains(&i);
+                let is_hi = !is_selected && hi.hi_cross_constraints.contains(&i);
                 ui.horizontal(|ui| {
                     let row_h = ui.spacing().interact_size.y;
                     let scrollbar_pad = 12.0;
@@ -213,6 +229,12 @@ pub(super) fn draw_constraints_list(
                             ui.visuals().widgets.hovered.rounding,
                             ui.visuals().selection.bg_fill,
                         );
+                    } else if is_hi {
+                        ui.painter().rect_filled(
+                            row_rect,
+                            ui.visuals().widgets.hovered.rounding,
+                            egui::Color32::from_rgba_unmultiplied(255, 160, 60, 30),
+                        );
                     } else if resp.hovered() {
                         ui.painter().rect_filled(
                             row_rect,
@@ -228,6 +250,8 @@ pub(super) fn draw_constraints_list(
                     child.add(list_icon(cross_constraint_icon(cc)));
                     let text_color = if is_selected {
                         ui.visuals().selection.stroke.color
+                    } else if is_hi {
+                        egui::Color32::from_rgb(255, 160, 60)
                     } else {
                         ui.visuals().text_color()
                     };

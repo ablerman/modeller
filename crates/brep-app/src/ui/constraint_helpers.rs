@@ -79,6 +79,27 @@ pub(crate) fn constraint_text(c: &SketchConstraint) -> String {
     }
 }
 
+/// Returns (vertex refs: Vec<(pi, vi)>, segment refs: Vec<(pi, si)>) referenced by a cross-constraint.
+pub(super) fn cross_constraint_element_refs(cc: &CommittedCrossConstraint)
+    -> (Vec<(usize, usize)>, Vec<(usize, usize)>)
+{
+    match cc {
+        CommittedCrossConstraint::Parallel      { pi_a, si_a, pi_b, si_b }
+        | CommittedCrossConstraint::Perpendicular { pi_a, si_a, pi_b, si_b }
+        | CommittedCrossConstraint::EqualLength   { pi_a, si_a, pi_b, si_b } =>
+            (vec![], vec![(*pi_a, *si_a), (*pi_b, *si_b)]),
+        CommittedCrossConstraint::Angle { pi_a, si_a, pi_b, si_b, .. } =>
+            (vec![], vec![(*pi_a, *si_a), (*pi_b, *si_b)]),
+        CommittedCrossConstraint::HorizontalPair { pi_a, vi_a, pi_b, vi_b, .. }
+        | CommittedCrossConstraint::VerticalPair  { pi_a, vi_a, pi_b, vi_b, .. } =>
+            (vec![(*pi_a, *vi_a), (*pi_b, *vi_b)], vec![]),
+        CommittedCrossConstraint::Symmetric { pi_a, si_a, pi_b, si_b, .. } =>
+            (vec![], vec![(*pi_a, *si_a), (*pi_b, *si_b)]),
+        CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c } =>
+            (vec![(*pi_a, *vi_a), (*pi_b, *vi_b), (*pi_c, *vi_c)], vec![]),
+    }
+}
+
 pub(super) fn cross_constraint_text(cc: &CommittedCrossConstraint) -> String {
     match cc {
         CommittedCrossConstraint::Parallel { pi_a, si_a, pi_b, si_b } =>
