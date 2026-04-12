@@ -238,6 +238,8 @@ pub struct SketchState {
     pub violated_constraints: Vec<bool>,
     /// Indices of currently selected constraints (for highlighting).
     pub constraint_selection: Vec<usize>,
+    /// Indices of currently selected cross-profile constraints (for highlighting).
+    pub cross_constraint_selection: Vec<usize>,
     /// Whether the sketch is fully constrained (DOF = 0) after the last solve.
     pub fully_constrained: bool,
     /// Independent undo/redo stack for sketch edits.
@@ -354,6 +356,10 @@ pub struct CommittedProfile {
     #[serde(default)]
     pub plane:         Option<SketchPlane>,
     pub constraints:   Vec<SketchConstraint>,
+    /// For `ProfileShape::Arc`: whether to sweep the longer arc path instead of the shorter one.
+    /// Defaults to `false`; toggled by `UiAction::SketchReverseArc`.
+    #[serde(default)]
+    pub arc_reversed:  bool,
 }
 
 /// A sketch stored in the operations list.  Contains one or more profiles.
@@ -725,6 +731,8 @@ pub enum UiAction {
     SketchRename(String),
     /// Toggle-select a constraint by index.
     SketchSelectConstraint(usize),
+    /// Toggle-select a cross-profile constraint by index.
+    SketchSelectCrossConstraint(usize),
     /// Toggle-select a segment from the panel list (no max-2 cap, preserves other segs).
     SketchPanelSelectSegment(usize),
     /// Toggle-select a vertex from the panel list (no max-2 cap, preserves other pts).
@@ -763,6 +771,8 @@ pub enum UiAction {
     SketchBeginCommittedAngleInput(AngleDialogTarget),
     /// Remove committed profile at the given index, adjusting cross-constraint indices.
     SketchDeleteCommittedProfile(usize),
+    /// Flip the arc direction (short ↔ long path) for the committed arc at the given index.
+    SketchReverseArc(usize),
 }
 
 // ── Camera animation ──────────────────────────────────────────────────────────
@@ -1366,6 +1376,7 @@ impl EditorState {
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
+                    cross_constraint_selection: Vec::new(),
                     fully_constrained:  false,
                     history:            SketchHistory::new(),
                     active_tool:        DrawTool::Pointer,
@@ -1427,6 +1438,7 @@ impl EditorState {
                     constraints_conflict: false,
                     violated_constraints: Vec::new(),
                     constraint_selection: Vec::new(),
+                    cross_constraint_selection: Vec::new(),
                     fully_constrained:    false,
                     history:              SketchHistory::new(),
                     active_tool:          DrawTool::Pointer,
@@ -1463,6 +1475,16 @@ impl EditorState {
                         sk.constraint_selection.remove(pos);
                     } else {
                         sk.constraint_selection.push(i);
+                    }
+                }
+                false
+            }
+            UiAction::SketchSelectCrossConstraint(i) => {
+                if let Some(sk) = &mut self.sketch {
+                    if let Some(pos) = sk.cross_constraint_selection.iter().position(|&x| x == i) {
+                        sk.cross_constraint_selection.remove(pos);
+                    } else {
+                        sk.cross_constraint_selection.push(i);
                     }
                 }
                 false
@@ -1512,6 +1534,7 @@ impl EditorState {
                         sk.active_tool = DrawTool::Pointer;
                         sk.selection.clear();
                         sk.constraint_selection.clear();
+                        sk.cross_constraint_selection.clear();
                     }
                 }
                 false
@@ -1539,6 +1562,7 @@ impl EditorState {
                             shape:         ProfileShape::Polyline,
                             plane:         None,
                             constraints,
+                            arc_reversed:  false,
                         });
                     }
                 }
@@ -1679,6 +1703,7 @@ impl EditorState {
                                 shape:         ProfileShape::Polyline,
                                 plane:         Some(sk.plane),
                                 constraints:   Vec::new(),
+                                arc_reversed:  false,
                             });
                             // tool_in_progress = None (already taken).
                         } else {
@@ -1909,6 +1934,16 @@ impl EditorState {
                              | SketchSelection::CommittedPoint(..)
                              | SketchSelection::CommittedSegment(..)
                         ));
+                    }
+                }
+                true
+            }
+            UiAction::SketchReverseArc(pi) => {
+                if let Some(sk) = &mut self.sketch {
+                    if pi < sk.committed_profiles.len() {
+                        let snap = sketch_snapshot(sk);
+                        sk.history.push("Reverse arc", snap);
+                        sk.committed_profiles[pi].arc_reversed = !sk.committed_profiles[pi].arc_reversed;
                     }
                 }
                 true

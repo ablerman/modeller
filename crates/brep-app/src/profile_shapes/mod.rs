@@ -107,10 +107,11 @@ impl ProfileShape {
         cursor: (f32, f32),
         threshold_px: f32,
         project: &impl Fn(brep_core::Point3) -> Option<(f32, f32)>,
+        reversed: bool,
     ) -> bool {
         match self {
             ProfileShape::Circle   => circle::hit_test_curve(points, cursor, threshold_px, project),
-            ProfileShape::Arc      => arc::hit_test_curve(points, plane, cursor, threshold_px, project),
+            ProfileShape::Arc      => arc::hit_test_curve(points, plane, cursor, threshold_px, project, reversed),
             ProfileShape::Polyline => false,
         }
     }
@@ -139,10 +140,11 @@ impl ProfileShape {
         painter: &egui::Painter,
         proj: &impl Fn(brep_core::Point3) -> Option<egui::Pos2>,
         stroke: egui::Stroke,
+        reversed: bool,
     ) {
         match self {
             ProfileShape::Circle   => circle::draw(points, painter, proj, stroke),
-            ProfileShape::Arc      => arc::draw(points, plane, painter, proj, stroke),
+            ProfileShape::Arc      => arc::draw(points, plane, painter, proj, stroke, reversed),
             ProfileShape::Polyline => polyline::draw(points, closed, painter, proj, stroke),
         }
     }

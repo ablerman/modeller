@@ -21,13 +21,14 @@ pub(crate) fn draw(
     painter: &egui::Painter,
     proj: &impl Fn(Point3) -> Option<egui::Pos2>,
     stroke: egui::Stroke,
+    reversed: bool,
 ) {
     // points[0] = start, points[1] = end_pt, points[2] = center.
     if let (Some(&start), Some(&end_pt), Some(&center)) =
         (points.get(0), points.get(1), points.get(2))
     {
         if let Some(plane) = plane {
-            let pts = tessellate_arc_from_center(start, end_pt, center, plane);
+            let pts = tessellate_arc_from_center(start, end_pt, center, plane, reversed);
             for w in pts.windows(2) {
                 if let (Some(a), Some(b)) = (proj(w[0]), proj(w[1])) {
                     painter.line_segment([a, b], stroke);
@@ -106,11 +107,12 @@ pub(crate) fn hit_test_curve(
     cursor: (f32, f32),
     threshold_px: f32,
     project: &impl Fn(Point3) -> Option<(f32, f32)>,
+    reversed: bool,
 ) -> bool {
     if let (Some(&start), Some(&end_pt), Some(&center), Some(plane)) =
         (points.get(0), points.get(1), points.get(2), plane)
     {
-        let pts = tessellate_arc_from_center(start, end_pt, center, plane);
+        let pts = tessellate_arc_from_center(start, end_pt, center, plane, reversed);
         for pair in pts.windows(2) {
             if let (Some((ax, ay)), Some((bx, by))) = (project(pair[0]), project(pair[1])) {
                 let seg_dx = bx - ax;
@@ -225,9 +227,11 @@ pub(crate) fn project_center_to_arc_bisector(
 /// Tessellate a circular arc defined by start, end, and a center hint.
 /// The center is projected onto the perpendicular bisector of (start, end_pt)
 /// so the arc passes through both endpoints exactly.
-/// The arc sweeps the shorter path (|span| ≤ π).
+///
+/// When `reversed` is `false` the shorter path (|span| ≤ π) is swept.
+/// When `reversed` is `true` the longer path (|span| > π, the other semicircle) is swept.
 pub(crate) fn tessellate_arc_from_center(
-    start: Point3, end_pt: Point3, center: Point3, plane: SketchPlane,
+    start: Point3, end_pt: Point3, center: Point3, plane: SketchPlane, reversed: bool,
 ) -> Vec<Point3> {
     use std::f64::consts::PI;
     let s = world_to_plane(start,  plane);
@@ -244,10 +248,16 @@ pub(crate) fn tessellate_arc_from_center(
     let theta_s = (s.1 - c.1).atan2(s.0 - c.0);
     let theta_e = (e.1 - c.1).atan2(e.0 - c.0);
 
-    // Sweep the shorter arc: normalize delta to (−π, π].
+    // Normalise span to [0, 2π) then choose short or long arc.
     let mut span = theta_e - theta_s;
     span = span.rem_euclid(2.0 * PI);
-    if span > PI { span -= 2.0 * PI; }
+    if reversed {
+        // Pick the longer arc (the other semicircle).
+        if span <= PI { span -= 2.0 * PI; }
+    } else {
+        // Pick the shorter arc: normalise to (−π, π].
+        if span > PI { span -= 2.0 * PI; }
+    }
 
     let n = ((32.0 * span.abs() / (2.0 * PI)).ceil() as usize).max(4);
     // Force exact endpoints to avoid any floating-point drift.

@@ -58,6 +58,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
                 shape:         ProfileShape::Polyline,
                 plane:         None,
                 constraints:   Vec::new(),
+                arc_reversed:  false,
             });
         }
         _ => {}

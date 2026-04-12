@@ -63,6 +63,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
                 shape:         ProfileShape::Polyline,
                 plane:         Some(sk.plane),
                 constraints:   Vec::new(),
+                arc_reversed:  false,
             });
             sk.tool_in_progress = Some(ToolInProgress::PolylineChain {
                 chain_start_profile,

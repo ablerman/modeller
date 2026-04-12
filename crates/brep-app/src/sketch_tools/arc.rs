@@ -66,6 +66,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
                 shape:         ProfileShape::Arc,
                 plane:         Some(sk.plane),
                 constraints:   Vec::new(),
+                arc_reversed:  false,
             });
         }
         _ => {}
@@ -82,7 +83,7 @@ pub(crate) fn draw_preview(
     proj: &impl Fn(Point3) -> Option<egui::Pos2>,
     stroke: egui::Stroke,
 ) {
-    let pts = tessellate_arc_from_center(start, end_pt, center, plane);
+    let pts = tessellate_arc_from_center(start, end_pt, center, plane, false);
     for w in pts.windows(2) {
         if let (Some(a), Some(b)) = (proj(w[0]), proj(w[1])) {
             painter.line_segment([a, b], stroke);

@@ -123,6 +123,9 @@ struct AppState {
     /// Whether SketchSaveDragHistory has been pushed for the current drag gesture.
     /// Reset to false on mouse-press; set to true on the first actual movement.
     drag_history_saved: bool,
+    /// When `Some((screen_pos, profile_idx))`, show a right-click context menu at that position.
+    /// Cleared on left-click in the viewport or after an action is taken from the menu.
+    context_menu: Option<((f32, f32), usize)>,
 }
 
 impl AppState {
@@ -233,6 +236,7 @@ impl AppState {
             last_click_time: None,
             last_click_pos: None,
             drag_history_saved: false,
+            context_menu: None,
         }
     }
 
@@ -344,7 +348,7 @@ impl AppState {
         let length_dialog = self.length_dialog;  // Option<(LengthTarget, f64)>
         let vp = (self.surface_config.width, self.surface_config.height);
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, snap_committed, snap_committed_curve, snap_committed_seg, angle_dialog, length_dialog);
+            actions = ui::build_ui(ctx, &self.editor, vp, sketch_cursor, snap_vertex, snap_segment, snap_ref, snap_constraint, snap_committed, snap_committed_curve, snap_committed_seg, angle_dialog, length_dialog, self.context_menu);
         });
 
         let tris = egui_ctx.tessellate(full_output.shapes, egui_ctx.pixels_per_point());
@@ -402,6 +406,11 @@ impl AppState {
 
         // Apply UI actions after rendering (avoids borrow conflicts during egui run).
         let mut needs_mesh_update = false;
+        for action in &actions {
+            if matches!(action, UiAction::SketchReverseArc(_)) {
+                self.context_menu = None;
+            }
+        }
         for action in actions {
             needs_mesh_update |= self.dispatch_action(action);
         }
@@ -829,6 +838,33 @@ impl ApplicationHandler for App {
                             }
                         }
                         ElementState::Released => {
+                            // Any left click in the viewport clears the context menu.
+                            if button == MouseButton::Left {
+                                state.context_menu = None;
+                            }
+                            // Right click with little movement → arc context menu.
+                            if button == MouseButton::Right {
+                                let is_click = match (state.mouse_press_origin, state.last_cursor) {
+                                    (Some(origin), Some(cur)) => {
+                                        (cur.0 - origin.0).abs() < 4.0 && (cur.1 - origin.1).abs() < 4.0
+                                    }
+                                    _ => false,
+                                };
+                                if is_click && state.editor.sketch.is_some() {
+                                    if let Some(pi) = state.snap_committed_curve {
+                                        let is_arc = state.editor.sketch.as_ref()
+                                            .and_then(|sk| sk.committed_profiles.get(pi))
+                                            .map_or(false, |cp| matches!(cp.shape, editor::ProfileShape::Arc));
+                                        state.context_menu = if is_arc {
+                                            state.last_cursor.map(|pos| (pos, pi))
+                                        } else {
+                                            None
+                                        };
+                                    } else {
+                                        state.context_menu = None;
+                                    }
+                                }
+                            }
                             // If left button released with little movement → pick.
                             if button == MouseButton::Left {
                                 let is_click = match (state.mouse_press_origin, state.last_cursor) {
@@ -1212,6 +1248,7 @@ impl ApplicationHandler for App {
                             if cp.shape.hit_test_curve(
                                 &pts, cp.plane, cur, CURVE_SNAP_PX,
                                 &|pt| state.editor.camera.project_to_screen(pt, w, h),
+                                cp.arc_reversed,
                             ) {
                                 snap_curve = Some(pi);
                                 break;

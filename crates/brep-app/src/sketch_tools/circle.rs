@@ -55,6 +55,7 @@ pub(crate) fn add_point(sk: &mut SketchState, p: Point3) {
                 shape:         ProfileShape::Circle,
                 plane:         Some(sk.plane),
                 constraints:   Vec::new(),
+                arc_reversed:  false,
             });
         }
         _ => {}
