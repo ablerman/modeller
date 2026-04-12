@@ -388,15 +388,10 @@ fn coincident_constraint(ed: &EditorState) -> Vec<UiAction> {
                 pi1, SketchConstraint::Coincident { pt_a: vi1, pt_b: vi2 },
             )];
         } else {
-            // Cross-profile → merge the two global points structurally.
-            let gi1 = sk.committed_profiles.get(pi1)
-                .and_then(|cp| cp.point_indices.get(vi1).copied());
-            let gi2 = sk.committed_profiles.get(pi2)
-                .and_then(|cp| cp.point_indices.get(vi2).copied());
-            if let (Some(gi_keep), Some(gi_replace)) = (gi1, gi2) {
-                return vec![UiAction::SketchMergeGlobalPoints { gi_keep, gi_replace }];
-            }
-            return vec![];
+            // Cross-profile → add a solver constraint (no structural merge).
+            return vec![UiAction::SketchAddCrossConstraint(
+                CommittedCrossConstraint::CoincidentPoints { pi_a: pi1, vi_a: vi1, pi_b: pi2, vi_b: vi2 }
+            )];
         }
     } else if cpts.len() == 1 && n_pts == 0 && n_sel == 0
         && ref_sel == Some(RefEntity::Origin)

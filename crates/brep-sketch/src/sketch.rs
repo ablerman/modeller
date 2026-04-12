@@ -682,6 +682,12 @@ impl Sketch {
                     self.solve_2pt_cross(*profile_a, *pt_a, *profile_b, *pt_b, sc, &mut all_ok);
                 }
 
+                // ── Cross-profile coincident ───────────────────────────────────
+                Constraint::CrossCoincident { profile_a, pt_a, profile_b, pt_b } => {
+                    let sc = SketchConstraint::Coincident { pt_a: 0, pt_b: 1 };
+                    self.solve_2pt_cross(*profile_a, *pt_a, *profile_b, *pt_b, sc, &mut all_ok);
+                }
+
                 // ── Symmetric (perpendicular-distance equidistant) ─────────────
                 Constraint::Symmetric {
                     profile_seg_a, seg_a,

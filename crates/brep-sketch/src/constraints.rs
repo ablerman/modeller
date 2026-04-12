@@ -174,6 +174,14 @@ pub enum Constraint {
         degrees: f64,
     },
 
+    // ── Cross-profile point coincidence ──────────────────────────────────────
+
+    /// Two points in different profiles must be coincident (same position).
+    CrossCoincident {
+        profile_a: ProfileId, pt_a: PointId,
+        profile_b: ProfileId, pt_b: PointId,
+    },
+
     // ── Symmetry ───────────────────────────────────────────────────────────────
 
     /// A point is equidistant (perpendicular distance) from two line segments.
@@ -215,6 +223,7 @@ impl Constraint {
             Constraint::CrossPerpendicular { .. } => "Perpendicular",
             Constraint::CrossEqualLength { .. }   => "Equal length",
             Constraint::CrossAngle { .. }         => "Angle",
+            Constraint::CrossCoincident { .. }    => "Coincident",
             Constraint::Symmetric { .. }          => "Symmetric",
             Constraint::SymmetricPoints { .. }    => "Symmetric (points)",
         }
@@ -227,6 +236,7 @@ impl Constraint {
             | Constraint::CrossPerpendicular { .. }
             | Constraint::CrossEqualLength { .. }
             | Constraint::CrossAngle { .. }
+            | Constraint::CrossCoincident { .. }
             | Constraint::Symmetric { .. }
             | Constraint::SymmetricPoints { .. } => true,
             Constraint::HorizontalPair { profile_a, profile_b, .. }
@@ -286,7 +296,8 @@ impl Constraint {
             | Constraint::CrossParallel { profile_a, profile_b, .. }
             | Constraint::CrossPerpendicular { profile_a, profile_b, .. }
             | Constraint::CrossEqualLength { profile_a, profile_b, .. }
-            | Constraint::CrossAngle { profile_a, profile_b, .. } => {
+            | Constraint::CrossAngle { profile_a, profile_b, .. }
+            | Constraint::CrossCoincident { profile_a, profile_b, .. } => {
                 v.push(*profile_a);
                 if profile_b != profile_a { v.push(*profile_b); }
             }

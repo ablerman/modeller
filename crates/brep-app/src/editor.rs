@@ -167,6 +167,9 @@ pub enum CommittedCrossConstraint {
     /// P_c is the constrained point; P_a and P_b are the reference points.
     /// vi_* are local vertex indices within their respective committed profiles.
     SymmetricPoints { pi_a: usize, vi_a: usize, pi_b: usize, vi_b: usize, pi_c: usize, vi_c: usize },
+    /// Two vertices from different profiles that have been structurally merged
+    /// (share the same global point).  Purely display — no additional solver work needed.
+    CoincidentPoints { pi_a: usize, vi_a: usize, pi_b: usize, vi_b: usize },
 }
 
 impl CommittedCrossConstraint {
@@ -180,6 +183,7 @@ impl CommittedCrossConstraint {
             CommittedCrossConstraint::VerticalPair   { .. } => "Vertical",
             CommittedCrossConstraint::Symmetric      { .. } => "Symmetric",
             CommittedCrossConstraint::SymmetricPoints { .. } => "Symmetric (points)",
+            CommittedCrossConstraint::CoincidentPoints { .. } => "Coincident",
         }
     }
 }
@@ -762,11 +766,6 @@ pub enum UiAction {
     /// Delete the action-log entry at the given index, restoring the sketch to
     /// the state captured before that action (discards all subsequent actions).
     SketchDeleteHistoryEntry(usize),
-    /// Merge two global points: replace every occurrence of `gi_replace` in
-    /// `committed_profiles[*].point_indices` with `gi_keep`, then snap the kept
-    /// point to the average of the two positions.  Makes cross-profile endpoints
-    /// structurally coincident without a separate constraint.
-    SketchMergeGlobalPoints { gi_keep: usize, gi_replace: usize },
     /// Add a cross-profile constraint and re-solve.
     SketchAddCrossConstraint(CommittedCrossConstraint),
     /// Remove the cross-profile constraint at the given index.
@@ -965,6 +964,11 @@ fn cross_constraint_to_bconstraint(
                 profile_a: *pid_map.get(pi_a)?, pt_a: BPointId(vi_a),
                 profile_b: *pid_map.get(pi_b)?, pt_b: BPointId(vi_b),
                 profile_c: *pid_map.get(pi_c)?, pt_c: BPointId(vi_c),
+            },
+        CommittedCrossConstraint::CoincidentPoints { pi_a, vi_a, pi_b, vi_b } =>
+            BConstraint::CrossCoincident {
+                profile_a: *pid_map.get(pi_a)?, pt_a: BPointId(vi_a),
+                profile_b: *pid_map.get(pi_b)?, pt_b: BPointId(vi_b),
             },
     })
 }
@@ -1814,6 +1818,7 @@ impl EditorState {
             }
             UiAction::SketchAddConstraint(c) => {
                 if let Some(sk) = &mut self.sketch {
+                    if sk.constraints.contains(&c) { return false; }
                     let label = constraint_action_label(&c);
                     sk.history.push(label, sketch_snapshot(sk));
                     sk.constraints.push(c);
@@ -1843,6 +1848,7 @@ impl EditorState {
             UiAction::SketchAddCommittedConstraint(pi, c) => {
                 if let Some(sk) = &mut self.sketch {
                     if pi < sk.committed_profiles.len() {
+                        if sk.committed_profiles[pi].constraints.contains(&c) { return false; }
                         let label = constraint_action_label(&c);
                         sk.history.push(label, sketch_snapshot(sk));
                         sk.committed_profiles[pi].constraints.push(c);
@@ -1862,31 +1868,9 @@ impl EditorState {
                 }
                 false
             }
-            UiAction::SketchMergeGlobalPoints { gi_keep, gi_replace } => {
-                if let Some(sk) = &mut self.sketch {
-                    if gi_keep < sk.global_points.len() && gi_replace < sk.global_points.len()
-                        && gi_keep != gi_replace
-                    {
-                        sk.history.push("Merge points", sketch_snapshot(sk));
-                        // Snap gi_keep to the average of the two positions.
-                        let p_keep    = sk.global_points[gi_keep];
-                        let p_replace = sk.global_points[gi_replace];
-                        sk.global_points[gi_keep] = Point3::origin()
-                            + (p_keep.coords + p_replace.coords) * 0.5;
-                        // Repoint every profile that referenced gi_replace to gi_keep.
-                        for cp in &mut sk.committed_profiles {
-                            for gi in &mut cp.point_indices {
-                                if *gi == gi_replace { *gi = gi_keep; }
-                            }
-                        }
-                        sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedPoint(..)));
-                        apply_constraints(sk);
-                    }
-                }
-                true
-            }
             UiAction::SketchAddCrossConstraint(cc) => {
                 if let Some(sk) = &mut self.sketch {
+                    if sk.cross_constraints.contains(&cc) { return false; }
                     sk.history.push(cc.label(), sketch_snapshot(sk));
                     sk.cross_constraints.push(cc);
                     sk.selection.retain(|s| !matches!(s, SketchSelection::CommittedSegment(..)));
@@ -1924,7 +1908,8 @@ impl EditorState {
                                 | CommittedCrossConstraint::Angle         { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::HorizontalPair { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::VerticalPair   { pi_a, pi_b, .. }
-                                | CommittedCrossConstraint::Symmetric      { pi_a, pi_b, .. } =>
+                                | CommittedCrossConstraint::Symmetric      { pi_a, pi_b, .. }
+                                | CommittedCrossConstraint::CoincidentPoints { pi_a, pi_b, .. } =>
                                     *pi_a != pi && *pi_b != pi,
                             }
                         });
@@ -1941,7 +1926,8 @@ impl EditorState {
                                 | CommittedCrossConstraint::Angle         { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::HorizontalPair { pi_a, pi_b, .. }
                                 | CommittedCrossConstraint::VerticalPair   { pi_a, pi_b, .. }
-                                | CommittedCrossConstraint::Symmetric      { pi_a, pi_b, .. } => {
+                                | CommittedCrossConstraint::Symmetric      { pi_a, pi_b, .. }
+                                | CommittedCrossConstraint::CoincidentPoints { pi_a, pi_b, .. } => {
                                     if *pi_a > pi { *pi_a -= 1; }
                                     if *pi_b > pi { *pi_b -= 1; }
                                 }

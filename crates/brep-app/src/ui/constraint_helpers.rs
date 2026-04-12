@@ -42,6 +42,7 @@ pub(super) fn cross_constraint_icon(cc: &CommittedCrossConstraint) -> egui::Imag
         CommittedCrossConstraint::VerticalPair { .. }   => icon_vertical(),
         CommittedCrossConstraint::Symmetric { .. }
         | CommittedCrossConstraint::SymmetricPoints { .. } => icon_equal_len(),
+        CommittedCrossConstraint::CoincidentPoints { .. } => icon_coincident(),
     }
 }
 
@@ -68,7 +69,7 @@ pub(crate) fn constraint_text(c: &SketchConstraint) -> String {
             format!("Length  seg {seg} = {value:.3}"),
         SketchConstraint::PointDistance { pt_a, pt_b, value } =>
             format!("Distance  pt {pt_a}–{pt_b} = {value:.3}"),
-        SketchConstraint::PointFixed { .. }       => String::new(),
+        SketchConstraint::PointFixed { pt, .. }    => format!("Fixed  pt {pt}"),
         SketchConstraint::PointOnOrigin { pt }    => format!("On Origin  pt {pt}"),
         SketchConstraint::PointOnXAxis { pt }     => format!("On X-axis  pt {pt}"),
         SketchConstraint::PointOnYAxis { pt }     => format!("On Y-axis  pt {pt}"),
@@ -97,27 +98,41 @@ pub(super) fn cross_constraint_element_refs(cc: &CommittedCrossConstraint)
             (vec![], vec![(*pi_a, *si_a), (*pi_b, *si_b)]),
         CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c } =>
             (vec![(*pi_a, *vi_a), (*pi_b, *vi_b), (*pi_c, *vi_c)], vec![]),
+        CommittedCrossConstraint::CoincidentPoints { pi_a, vi_a, pi_b, vi_b } =>
+            (vec![(*pi_a, *vi_a), (*pi_b, *vi_b)], vec![]),
     }
 }
 
-pub(super) fn cross_constraint_text(cc: &CommittedCrossConstraint) -> String {
+/// Like [`cross_constraint_text`] but substitutes human-readable profile names
+/// (e.g. "Circle 0", "Segment 1") in place of the raw `P{i}` indices.
+pub(super) fn cross_constraint_label(
+    cc: &CommittedCrossConstraint,
+    profiles: &[crate::editor::CommittedProfile],
+) -> String {
+    let pl = |pi: usize| -> String {
+        profiles.get(pi)
+            .map(|cp| cp.shape.label(pi))
+            .unwrap_or_else(|| format!("P{pi}"))
+    };
     match cc {
-        CommittedCrossConstraint::Parallel { pi_a, si_a, pi_b, si_b } =>
-            format!("Parallel  P{pi_a}:{si_a} ∥ P{pi_b}:{si_b}"),
-        CommittedCrossConstraint::Perpendicular { pi_a, si_a, pi_b, si_b } =>
-            format!("Perpendicular  P{pi_a}:{si_a} ⊥ P{pi_b}:{si_b}"),
-        CommittedCrossConstraint::EqualLength { pi_a, si_a, pi_b, si_b } =>
-            format!("Equal Length  P{pi_a}:{si_a} = P{pi_b}:{si_b}"),
-        CommittedCrossConstraint::Angle { pi_a, si_a, pi_b, si_b, degrees } =>
-            format!("Angle  {degrees:.0}°  (P{pi_a}:{si_a}/P{pi_b}:{si_b})"),
-        CommittedCrossConstraint::HorizontalPair { pi_a, vi_a, pi_b, vi_b, .. } =>
-            format!("Horizontal  P{pi_a}:{vi_a} — P{pi_b}:{vi_b}"),
-        CommittedCrossConstraint::VerticalPair { pi_a, vi_a, pi_b, vi_b, .. } =>
-            format!("Vertical  P{pi_a}:{vi_a} — P{pi_b}:{vi_b}"),
-        CommittedCrossConstraint::Symmetric { pi_a, si_a, pi_b, si_b, .. } =>
-            format!("Symmetric  P{pi_a}:{si_a} / P{pi_b}:{si_b}"),
-        CommittedCrossConstraint::SymmetricPoints { pi_a, vi_a, pi_b, vi_b, pi_c, vi_c } =>
-            format!("Symmetric  P{pi_a}:{vi_a} / P{pi_b}:{vi_b} ↔ P{pi_c}:{vi_c}"),
+        CommittedCrossConstraint::Parallel { pi_a, pi_b, .. } =>
+            format!("Parallel  {} ∥ {}", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::Perpendicular { pi_a, pi_b, .. } =>
+            format!("Perpendicular  {} ⊥ {}", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::EqualLength { pi_a, pi_b, .. } =>
+            format!("Equal Length  {} = {}", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::Angle { pi_a, pi_b, degrees, .. } =>
+            format!("Angle  {degrees:.0}°  ({} / {})", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::HorizontalPair { pi_a, pi_b, .. } =>
+            format!("Horizontal  {} — {}", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::VerticalPair { pi_a, pi_b, .. } =>
+            format!("Vertical  {} — {}", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::Symmetric { pi_a, pi_b, .. } =>
+            format!("Symmetric  {} / {}", pl(*pi_a), pl(*pi_b)),
+        CommittedCrossConstraint::SymmetricPoints { pi_a, pi_b, pi_c, .. } =>
+            format!("Symmetric  {} / {} ↔ {}", pl(*pi_a), pl(*pi_b), pl(*pi_c)),
+        CommittedCrossConstraint::CoincidentPoints { pi_a, pi_b, .. } =>
+            format!("Coincident  {} — {}", pl(*pi_a), pl(*pi_b)),
     }
 }
 

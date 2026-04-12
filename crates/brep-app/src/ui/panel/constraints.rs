@@ -4,7 +4,7 @@ use crate::editor::{SketchState, UiAction};
 use crate::icons::icon_trash;
 use crate::ui::constraint_helpers::{
     constraint_element_refs, constraint_icon, constraint_text,
-    cross_constraint_icon, cross_constraint_text,
+    cross_constraint_icon, cross_constraint_label,
 };
 
 // list_icon lives in the ui module; child modules can reach parent items.
@@ -257,8 +257,9 @@ pub(super) fn draw_constraints_list(
                     };
                     child.add(
                         egui::Label::new(
-                            egui::RichText::new(cross_constraint_text(cc))
-                                .color(text_color),
+                            egui::RichText::new(
+                                cross_constraint_label(cc, &sk.committed_profiles)
+                            ).color(text_color),
                         )
                         .selectable(false),
                     );
